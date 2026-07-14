@@ -1,0 +1,11 @@
+# The vendored Clojure sources are kept byte-identical to upstream so that
+#     git diff clojure-1.12.5 -- src test
+# shows exactly our changes and nothing else.
+#
+# 15 upstream files are stored with CRLF (epl-v10.html, Sequential.java, ISeq.java, ...). This
+# machine has core.autocrlf=input, which would normalize them to LF when git hashes the working
+# tree, making those files diff as fully rewritten. -text disables all EOL conversion.
+#
+# Consequence: if you edit one of those CRLF files with an editor that saves LF, its diff will
+# balloon to the whole file. Keep CRLF in the files that already have it.
+* -text
