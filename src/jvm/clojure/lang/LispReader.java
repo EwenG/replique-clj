@@ -86,6 +86,13 @@ public class LispReader {
     this(r, DEFAULT_CHUNK_SIZE);
   }
 
+  // Reads from a Buffer someone else owns. This is how a LineNumberingPushbackReader hands us its
+  // Buffer: we tokenize out of the same characters it serves to the REPL and the Compiler, sharing
+  // one cursor, rather than draining it into a buffer of our own.
+  LispReader(Buffer buffer) {
+    this.buffer = buffer;
+  }
+
   // Internal control-flow sentinels, mirroring the original read loop.
   private static final Object READ_EOF = new Object();       // end of input
   private static final Object READ_FINISHED = new Object();  // hit the expected closing delimiter
@@ -186,10 +193,35 @@ public class LispReader {
 
   static public Object read(PushbackReader r, boolean eofIsError, Object eofValue, boolean isRecursive,
                             Object opts) {
-    // Chunk size 1: never pull more than one character past the form. Whatever lookahead is left
-    // over is pushed back below, so `r` ends up exactly where the original LispReader left it and
-    // callers that read `r` directly (clojure.main/repl-read, read-line, captureString) still work.
-    LispReader lr = new LispReader(r, 1);
+    if (r instanceof LineNumberingPushbackReader) {
+      // The fast path, and the one everything that matters takes: Compiler.load, clojure.main's
+      // REPL, and RT.readReader all hand us a LineNumberingPushbackReader. We borrow its Buffer,
+      // so reading ahead is free -- there is no second cursor to fall out of step with, and it
+      // does not matter how much we buffer. The LispReader instance is cached on the reader, so
+      // its token cache survives across every form in the file.
+      LineNumberingPushbackReader lnpr = (LineNumberingPushbackReader) r;
+      LispReader lr = lnpr.lispReader();
+      try {
+        Object o = lr.read();
+        if (o == EOF) {
+          if (eofIsError)
+            throw Util.runtimeException("EOF while reading");
+          return eofValue;
+        }
+        return o;
+      } catch (Exception e) {
+        if (isRecursive)
+          throw Util.sneakyThrow(e);
+        throw new ReaderException(lnpr.getLineNumber(), lnpr.getColumnNumber(), e);
+      }
+    }
+
+    // Compat path: a PushbackReader we do not own, e.g. user code calling
+    // (read (java.io.PushbackReader. rdr)). We cannot share a Buffer with it, and the caller may
+    // well read it directly afterwards, so we must not consume past the form: read one character
+    // at a time and push whatever lookahead is left back into it. Slow, but correct, and nothing
+    // on a hot path arrives here.
+    LispReader lr = new LispReader(new SingleCharReader(r), 1);
     try {
       Object o = lr.read();
       if (o == EOF) {
@@ -199,20 +231,47 @@ public class LispReader {
       }
       return o;
     } catch (Exception e) {
-      if (isRecursive || !(r instanceof LineNumberingPushbackReader))
-        throw Util.sneakyThrow(e);
-      LineNumberingPushbackReader rdr = (LineNumberingPushbackReader) r;
-      throw new ReaderException(rdr.getLineNumber(), rdr.getColumnNumber(), e);
+      throw Util.sneakyThrow(e);
     } finally {
       lr.pushBackLookahead(r);
     }
   }
 
+  /**
+   * Feeds a foreign Reader to a Buffer one character at a time, going through {@code read()} only.
+   *
+   * <p>Necessary because a foreign reader may not implement the array read at all.
+   * {@code clojure.repl/source-fn} passes a {@code (proxy [PushbackReader] [rdr] (read [] ...))},
+   * and a Clojure proxy routes EVERY overload of {@code read} to that single fn -- so calling
+   * {@code read(char[],int,int)} on it blows up with an ArityException. The original LispReader
+   * only ever called {@code read()}, so proxies like that worked; going through this shim keeps
+   * them working.
+   */
+  private static final class SingleCharReader extends java.io.Reader {
+    private final java.io.Reader in;
+
+    SingleCharReader(java.io.Reader in) {
+      this.in = in;
+    }
+
+    public int read(char[] cbuf, int off, int len) throws IOException {
+      if (len <= 0)
+        return 0;
+      int c = in.read();
+      if (c == -1)
+        return -1;
+      cbuf[off] = (char) c;
+      return 1;
+    }
+
+    public void close() throws IOException {
+      in.close();
+    }
+  }
+
   // Returns any buffered-but-unconsumed characters to `r`. With chunkSize 1 this is at most the
-  // couple of characters of lookahead the scanners peeked at (a token delimiter, the char after a
-  // leading +/-), which fits in even a default size-1 PushbackReader in the common case. If it
-  // does not fit, the characters are dropped rather than silently corrupting the stream, so we
-  // fail loudly instead.
+  // couple of characters of lookahead the scanners peeked at (a token delimiter, the character
+  // after a leading +/-).
   private void pushBackLookahead(PushbackReader r) {
     int n = buffer.posEnd - buffer.pos;
     if (n <= 0)

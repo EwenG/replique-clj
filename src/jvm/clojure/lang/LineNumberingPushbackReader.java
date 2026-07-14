@@ -12,153 +12,139 @@ package clojure.lang;
 
 import java.io.PushbackReader;
 import java.io.Reader;
-import java.io.LineNumberReader;
 import java.io.IOException;
 
 
+/**
+ * A facade over a single {@link Buffer}, which is the only thing that reads the underlying Reader.
+ *
+ * <p>Stock Clojure builds this out of a LineNumberReader plus a PushbackReader's pushback array,
+ * and LispReader then reads characters out of it one at a time. That left characters living in two
+ * places, which is fine only as long as the reader never buffers ahead -- and a chunked reader
+ * does nothing but buffer ahead. With two cursors, reading a chunk ahead would (a) race the line
+ * counter to the end of the chunk, so Compiler.load stamps every form with the wrong line, (b) let
+ * the capture buffer swallow text past the form, so read+string returns too much, and (c) hide
+ * those characters from clojure.main/repl-read, which reads this stream directly.
+ *
+ * <p>So there is exactly one cursor now: {@code buffer.pos}. Every method below routes to the
+ * Buffer, and {@link LispReader} tokenizes out of that same Buffer rather than draining it. None
+ * of PushbackReader's inherited machinery is used -- we still extend it only because the class is
+ * public API and callers (clojure.main, the Compiler, tooling) are typed against it.
+ *
+ * <p>Line and column come from the Buffer, which counts to the CONSUMED position rather than the
+ * buffered one, so they stay correct at any chunk size. Capture is a pin plus a slice: the source
+ * text is already sitting contiguously in the buffer, so read+string copies nothing.
+ */
 public class LineNumberingPushbackReader extends PushbackReader{
 
-// This class is a PushbackReader that wraps a LineNumberReader. The code
-// here to handle line terminators only mentions '\n' because
-// LineNumberReader collapses all occurrences of CR, LF, and CRLF into a
-// single '\n'.
+public static final int DEFAULT_CHUNK_SIZE = 4096;
 
-private static final int newline = (int) '\n';
-
-private boolean _atLineStart = true;
-private boolean _prev;
-private int _columnNumber = 1;
-private StringBuilder sb = null;
-
-// PushbackReader defaults to a one-character pushback buffer. LispReader reads through
-// read(char[],int,int) and pushes its unconsumed lookahead back in one go, so give it room.
-private static final int PUSHBACK_SIZE = 64;
+private final Buffer buffer;
+// Cached across forms so its token cache (interned symbols/keywords) survives a whole file load.
+private LispReader lispReader;
 
 public LineNumberingPushbackReader(Reader r){
-	super(new LineNumberReader(r), PUSHBACK_SIZE);
+	this(r, DEFAULT_CHUNK_SIZE);
 }
 
 public LineNumberingPushbackReader(Reader r, int size){
-	super(new LineNumberReader(r, size), PUSHBACK_SIZE);
+	// super(r) only so that close() closes the source; every read/unread below goes to `buffer`.
+	// The Buffer both counts lines and collapses CR / LF / CRLF to '\n' -- the two jobs the
+	// LineNumberReader used to do.
+	super(r, 1);
+	this.buffer = new Buffer(r, size, true, true);
+}
+
+Buffer buffer(){
+	return buffer;
+}
+
+LispReader lispReader(){
+	if(lispReader == null)
+		lispReader = new LispReader(buffer);
+	return lispReader;
 }
 
 public int getLineNumber(){
-	return ((LineNumberReader) in).getLineNumber() + 1;
+	return buffer.getLine() + 1;          // Buffer counts from 0, this API from 1
 }
 
-public void setLineNumber(int line) { ((LineNumberReader) in).setLineNumber(line - 1); }
+public void setLineNumber(int line){
+	buffer.setLine(line - 1);
+}
 
 public void captureString(){
-    this.sb = new StringBuilder();
+	buffer.pin();
 }
 
 public String getString(){
-    if(sb != null)
-        {
-        String ret = sb.toString();
-        sb = null;
-        return ret;
-        }
-    return null;
+	int start = buffer.getPin();
+	if(start < 0)
+		return null;
+	String ret = new String(buffer.buffer, start, buffer.pos - start);
+	buffer.unpin();
+	return ret;
 }
 
 public int getColumnNumber(){
-	return _columnNumber;
+	return buffer.getColumn() + 1;        // Buffer counts from 0, this API from 1
 }
 
 public int read() throws IOException{
-    int c = super.read();
-    _prev = _atLineStart;
-    if((c == newline) || (c == -1))
-        {
-        _atLineStart = true;
-        _columnNumber = 1;
-        }
-    else
-        {
-        _atLineStart = false;
-        _columnNumber++;
-        }
-    if(sb != null && c != -1)
-        sb.append((char)c);
-    return c;
+	return buffer.read();
+}
+
+public int read(char[] cbuf, int off, int len) throws IOException{
+	if(len <= 0)
+		return 0;
+	if(buffer.pos >= buffer.posEnd && !buffer.refill())
+		return -1;
+	int n = Math.min(len, buffer.posEnd - buffer.pos);
+	System.arraycopy(buffer.buffer, buffer.pos, cbuf, off, n);
+	buffer.pos += n;                      // line counting is lazy and driven off pos; nothing else to do
+	return n;
 }
 
 public void unread(int c) throws IOException{
-    super.unread(c);
-    _atLineStart = _prev;
-    _columnNumber--;
-    if(sb != null)
-        sb.deleteCharAt(sb.length()-1);
-}
-
-// LispReader reads through the array methods rather than read()/unread(int), so these must keep
-// the same column / line-start state and, crucially, feed the capture buffer that
-// captureString()/getString() (i.e. clojure.core/read+string) rely on. Without this, read+string
-// returns "" and clojure.main/renumbering-read then re-reads an empty string.
-public int read(char[] cbuf, int off, int len) throws IOException{
-    int n = super.read(cbuf, off, len);
-    if(n <= 0)
-        {
-        if(n == -1)
-            {
-            _prev = _atLineStart;
-            _atLineStart = true;
-            _columnNumber = 1;
-            }
-        return n;
-        }
-    for(int i = 0; i < n; i++)
-        {
-        _prev = _atLineStart;
-        if(cbuf[off + i] == newline)
-            {
-            _atLineStart = true;
-            _columnNumber = 1;
-            }
-        else
-            {
-            _atLineStart = false;
-            _columnNumber++;
-            }
-        }
-    if(sb != null)
-        sb.append(cbuf, off, n);
-    return n;
+	if(c != -1)
+		buffer.unread((char) c);
 }
 
 public void unread(char[] cbuf, int off, int len) throws IOException{
-    // Push back in reverse so the characters come back out in their original order, reusing
-    // unread(int) so the capture buffer and column state unwind along with them.
-    for(int i = len - 1; i >= 0; i--)
-        unread(cbuf[off + i]);
+	// Push back in reverse so the characters come out again in their original order.
+	for(int i = len - 1; i >= 0; i--)
+		buffer.unread(cbuf[off + i]);
 }
 
 public String readLine() throws IOException{
-    int c = read();
-    String line;
-    switch (c) {
-    case -1:
-        line = null;
-        break;
-    case newline:
-        line = "";
-        break;
-    default:
-        String first = String.valueOf((char) c);
-        String rest = ((LineNumberReader)in).readLine();
-        if (sb != null)
-          sb.append(rest+"\n");
-        line = (rest == null) ? first : first + rest;
-        _prev = false;
-        _atLineStart = true;
-        _columnNumber = 1;
-        break;
-    }
-    return line;
+	int c = buffer.read();
+	if(c == -1)
+		return null;
+	if(c == '\n')                         // the Buffer has already collapsed CR and CRLF to '\n'
+		return "";
+	StringBuilder sb = new StringBuilder();
+	sb.append((char) c);
+	for(; ;)
+		{
+		c = buffer.read();
+		if(c == -1 || c == '\n')
+			return sb.toString();
+		sb.append((char) c);
+		}
 }
 
 public boolean atLineStart(){
-    return _atLineStart;
+	return buffer.getColumn() == 0;
+}
+
+public boolean ready() throws IOException{
+	return buffer.pos < buffer.posEnd || super.ready();
+}
+
+public long skip(long n) throws IOException{
+	long skipped = 0;
+	while(skipped < n && buffer.read() != -1)
+		skipped++;
+	return skipped;
 }
 }
