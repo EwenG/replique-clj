@@ -348,18 +348,44 @@ public class LispReader {
 
   // Reads forms until the closing `delim`, collecting them. Port of readDelimitedList.
   private ArrayList<Object> readDelimitedList(int delim) throws IOException {
+    int firstline = lineNumber();     // for the "EOF while reading, starting at line N" message
     ArrayList<Object> acc = new ArrayList<>();
     while (true) {
       Object form = read0(delim);
-      if (form == READ_EOF) throw Util.runtimeException("EOF while reading");
+      if (form == READ_EOF) {
+        if (firstline < 0) throw Util.runtimeException("EOF while reading");
+        throw Util.runtimeException("EOF while reading, starting at line " + firstline);
+      }
       if (form == READ_FINISHED) return acc;
       acc.add(form);
     }
   }
 
+  // Source position of the reader, or -1 when the input is not line-tracked (only a
+  // LineNumberingPushbackReader's Buffer counts lines, matching the original, which attached
+  // source metadata only when reading from one). 1-based line, 1-based column, as the original's
+  // getLineNumber() / getColumnNumber()-1 pair produced.
+  private int lineNumber() {
+    return buffer.countsLines() ? buffer.getLine() + 1 : -1;
+  }
+
+  private int columnNumber() {
+    return buffer.countsLines() ? buffer.getColumn() : -1;
+  }
+
   private Object readList() throws IOException {
+    // The '(' has been consumed, so this is its position -- same as the original, which read
+    // getLineNumber() / getColumnNumber()-1 at the top of ListReader.
+    int line = lineNumber();
+    int column = columnNumber();
     ArrayList<Object> a = readDelimitedList(')');
-    return a.isEmpty() ? PersistentList.EMPTY : PersistentList.create(a);
+    if (a.isEmpty()) return PersistentList.EMPTY;
+    IObj s = (IObj) PersistentList.create(a);
+    if (line < 0) return s;
+    Object meta = RT.meta(s);
+    meta = RT.assoc(meta, RT.LINE_KEY, RT.get(meta, RT.LINE_KEY, line));
+    meta = RT.assoc(meta, RT.COLUMN_KEY, RT.get(meta, RT.COLUMN_KEY, column));
+    return s.withMeta((IPersistentMap) meta);
   }
 
   private Object readVector() throws IOException {
@@ -781,6 +807,10 @@ public class LispReader {
   private static final Keyword PARAM_TAGS_KEY = Keyword.intern(null, "param-tags");
 
   private Object readMeta() throws IOException {
+    // The '^' has been consumed; this is its position.
+    int line = lineNumber();
+    int column = columnNumber();
+
     Object meta = readForm();
     if (meta instanceof Symbol || meta instanceof String)
       meta = RT.map(TAG_KEY, meta);
@@ -794,6 +824,11 @@ public class LispReader {
     Object o = readForm();
     if (!(o instanceof IMeta))
       throw new IllegalArgumentException("Metadata can only be applied to IMetas");
+    // Source position goes on seqs only, and never overrides an explicit ^{:line n}.
+    if (line >= 0 && o instanceof ISeq) {
+      meta = RT.assoc(meta, RT.LINE_KEY, RT.get(meta, RT.LINE_KEY, line));
+      meta = RT.assoc(meta, RT.COLUMN_KEY, RT.get(meta, RT.COLUMN_KEY, column));
+    }
     if (o instanceof IReference) {
       ((IReference) o).resetMeta((IPersistentMap) meta);
       return o;

@@ -17,9 +17,9 @@ standard library, AOT-compiles them, and produces a working jar and REPL.
 mvn install          # => target/clojure-1.12.5-r1.jar, 77 reader tests green
 ```
 
-Clojure's own test suite is partially green — 8 namespaces pass outright (5,045 assertions, 0
-failures: data-structures, numbers, macros, metadata, printer, special, string, edn); 4 fail *to
-load*, each on a known reader gap listed below.
+Clojure's own test suite is partially green. Every namespace that can be *read* passes, with results
+identical to stock Clojure 1.12.5 — 15 namespaces, 5,602 assertions, 0 failures, 0 errors on both.
+The namespaces that fail do so *at read time*, each on a known reader gap listed below.
 
 ## What changed vs. Clojure 1.12.5
 
@@ -77,12 +77,24 @@ hold a bare `\n`), which it does once, in place, as it fills.
   `(proxy [PushbackReader] …)` that overrides only that one — and a Clojure proxy routes *every*
   `read` overload to it, so an array read blows up with an `ArityException`.
 
-Reading all 719 forms of `core.clj`, via the path `Compiler.load` actually uses:
+Reading all 719 forms of `core.clj`, via the path `Compiler.load` actually uses (same JVM, both
+readers, source metadata on in both):
 
 | | |
 |---|---|
-| stock Clojure 1.12.5 | 12.3 ms |
-| this fork | **4.7 ms** |
+| stock Clojure 1.12.5 | 18.7 ms |
+| this fork | **7.8 ms** |
+
+### Source metadata
+
+`:line` / `:column` are attached exactly where stock Clojure attaches them — on lists (`ListReader`)
+and, for seqs, in `^meta` (`MetaReader`); vectors, maps and sets get none, which surprises people
+but is upstream's behaviour. Positions come from the shared `Buffer`, which counts against the
+consumed position, so they are right regardless of how far the reader has buffered ahead. Metadata
+is only attached when reading from a `LineNumberingPushbackReader`, again matching upstream — which
+is why `read-string` produces no `:line`.
+
+This is what makes `(meta #'foo)`, `clojure.repl/source` and inner-form stack traces work.
 
 ## Reader gaps (the remaining work)
 
@@ -93,18 +105,13 @@ Clojure's test suite is what surfaces them. Roughly in impact order:
    also blocks any library shipped as `.cljc` (e.g. `test.check`, which is why
    `clojure.test-clojure.sequences` can't load). Needs the `:read-cond` / `:features` opts threaded
    through the reader, plus a pending-forms queue for `#?@` splicing.
-2. **`:line` / `:column` metadata on forms** — not attached. Nothing fails outright (the Compiler
-   falls back to the reader's own line number, so top-level errors still name the right line), but
-   Var metadata is wrong: `(meta #'foo)` reports `:line 0`, which breaks `clojure.repl/source` and
-   degrades inner-form stack traces. `Buffer` already tracks line and column (its `countLines`
-   flag) — it just isn't wired to the forms yet.
-3. **Record literals** `#my.Record[…]` / `#my.Record{…}` — blocks
+2. **Record literals** `#my.Record[…]` / `#my.Record{…}` — blocks
    `clojure.test-clojure.compilation` and `clojure.test-clojure.protocols`.
-4. **`#=` eval reader** — `*read-eval*` is honoured (that is the security-relevant half, and it
+3. **`#=` eval reader** — `*read-eval*` is honoured (that is the security-relevant half, and it
    matches upstream), but actually evaluating throws. Needed for `print-dup` round-trips.
-5. **`#^` deprecated metadata reader** — blocks `clojure.test-clojure.evaluation`. Trivial: it is
+4. **`#^` deprecated metadata reader** — blocks `clojure.test-clojure.evaluation`. Trivial: it is
    just `^` under an old spelling.
-6. **`*reader-resolver*`** (`LispReader.Resolver`) — the interface is kept for API compatibility
+5. **`*reader-resolver*`** (`LispReader.Resolver`) — the interface is kept for API compatibility
    but is never consulted.
 
 The longer-term cleanup is to make `Buffer` the single character source and reimplement

@@ -348,6 +348,11 @@ public class Buffer {
     return -1;
   }
 
+  /** Whether this buffer tracks line/column. Only a LineNumberingPushbackReader's buffer does. */
+  public boolean countsLines() {
+    return countLines;
+  }
+
   /** 0-based line of the CONSUMED position, or -1 if this buffer does not count lines. */
   public int getLine() {
     if (!countLines) return -1;
