@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- A fork of Clojure 1.12.5 whose LispReader is replaced by the Buffer-backed reader
+       from the lijeur project. The artifactId is deliberately still `clojure`, so this jar
+       can be substituted for org.clojure:clojure on a classpath. -->
+  <groupId>replique-clj</groupId>
+  <artifactId>clojure</artifactId>
+  <name>replique-clj</name>
+  <packaging>jar</packaging>
+  <version>1.12.5-r1</version>
+
+  <description>Clojure 1.12.5 with a fast, Buffer-backed LispReader.</description>
+
+  <licenses>
+    <license>
+      <name>Eclipse Public License 1.0</name>
+      <url>http://opensource.org/licenses/eclipse-1.0.php</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.source>1.8</maven.compiler.source>
+    <maven.compiler.target>1.8</maven.compiler.target>
+
+    <!-- Direct linking is how Clojure builds its own core: it compiles core's calls as static
+         invocations instead of Var dereferences. Turn it off to get redefinable core Vars. -->
+    <clojure.compile.direct-linking>true</clojure.compile.direct-linking>
+
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>spec.alpha</artifactId>
+      <version>0.5.238</version>
+      <exclusions>
+        <exclusion>
+          <groupId>org.clojure</groupId>
+          <artifactId>clojure</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>core.specs.alpha</artifactId>
+      <version>0.4.74</version>
+      <exclusions>
+        <exclusion>
+          <groupId>org.clojure</groupId>
+          <artifactId>clojure</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.2</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- Needed by Clojure's own test suite (test/clojure). The clojure exclusions matter: these
+         must not drag org.clojure:clojure onto the classpath alongside the fork. -->
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>test.generative</artifactId>
+      <version>1.1.0</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>org.clojure</groupId>
+          <artifactId>clojure</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>test.check</artifactId>
+      <version>1.1.1</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>org.clojure</groupId>
+          <artifactId>clojure</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <sourceDirectory>src/jvm</sourceDirectory>
+    <testSourceDirectory>test/java</testSourceDirectory>
+
+    <resources>
+      <!-- clojure/*.clj must ship in the jar alongside the AOT classes: the Compiler loads
+           source for anything not AOT'd, and clojure.repl/source reads it back. -->
+      <resource>
+        <directory>src/clj</directory>
+      </resource>
+      <!-- clojure/version.properties is a template (version=${version}) that clojure.core reads
+           at load time to build *clojure-version*; it must be filtered. -->
+      <resource>
+        <directory>src/resources</directory>
+        <filtering>true</filtering>
+      </resource>
+    </resources>
+
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+
+      <!-- The bootstrap. Upstream Clojure does this by having maven-antrun shell out to a
+           215-line build.xml; exec-maven-plugin calls the same entry point directly.
+           clojure.lang.Compile reads clojure.compile.* from system properties. -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.2.0</version>
+        <executions>
+          <execution>
+            <id>aot-compile-clojure</id>
+            <phase>compile</phase>
+            <goals>
+              <goal>java</goal>
+            </goals>
+            <configuration>
+              <mainClass>clojure.lang.Compile</mainClass>
+              <classpathScope>compile</classpathScope>
+              <additionalClasspathElements>
+                <!-- src/clj so the Compiler can find clojure/core.clj to read -->
+                <additionalClasspathElement>${project.basedir}/src/clj</additionalClasspathElement>
+                <additionalClasspathElement>${project.basedir}/src/resources</additionalClasspathElement>
+              </additionalClasspathElements>
+              <systemProperties>
+                <systemProperty>
+                  <key>clojure.compile.path</key>
+                  <value>${project.build.outputDirectory}</value>
+                </systemProperty>
+                <systemProperty>
+                  <key>clojure.compile.direct-linking</key>
+                  <value>${clojure.compile.direct-linking}</value>
+                </systemProperty>
+              </systemProperties>
+              <!-- Namespaces AOT-compiled into the jar (clojure.lang.Compile takes one per
+                   argument). This is the bootstrap: the JVM running Compile is running OUR
+                   freshly-built classes, so clojure/core.clj is read by the new LispReader.
+                   If the reader is broken, this is the step that fails. -->
+              <arguments>
+                <argument>clojure.core</argument>
+                <argument>clojure.core.protocols</argument>
+                <argument>clojure.core.server</argument>
+                <argument>clojure.core.specs.alpha</argument>
+                <argument>clojure.data</argument>
+                <argument>clojure.datafy</argument>
+                <argument>clojure.edn</argument>
+                <argument>clojure.instant</argument>
+                <argument>clojure.java.browse</argument>
+                <argument>clojure.java.browse-ui</argument>
+                <argument>clojure.java.io</argument>
+                <argument>clojure.java.javadoc</argument>
+                <argument>clojure.java.process</argument>
+                <argument>clojure.java.shell</argument>
+                <argument>clojure.main</argument>
+                <argument>clojure.pprint</argument>
+                <argument>clojure.reflect</argument>
+                <argument>clojure.repl</argument>
+                <argument>clojure.set</argument>
+                <argument>clojure.stacktrace</argument>
+                <argument>clojure.string</argument>
+                <argument>clojure.template</argument>
+                <argument>clojure.test</argument>
+                <argument>clojure.test.junit</argument>
+                <argument>clojure.test.tap</argument>
+                <argument>clojure.uuid</argument>
+                <argument>clojure.walk</argument>
+                <argument>clojure.xml</argument>
+                <argument>clojure.zip</argument>
+              </arguments>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- JUnit tests for the reader (test/java). -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.1</version>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-source-plugin</artifactId>
+        <version>3.3.1</version>
+        <executions>
+          <execution>
+            <id>attach-sources</id>
+            <phase>package</phase>
+            <goals>
+              <goal>jar</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!-- Clojure's own test suite (test/clojure), via upstream's own runner script. NOT bound to
+         the default `test` phase: it is currently RED, because several test namespaces cannot even
+         be read yet (reader conditionals, record literals, #^). See the gap list in LispReader's
+         class doc and in the README. It is the driver for the remaining work.
+         Run with: mvn test -Pclojure-test -->
+    <profile>
+      <id>clojure-test</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>exec-maven-plugin</artifactId>
+            <version>3.2.0</version>
+            <executions>
+              <execution>
+                <id>run-clojure-tests</id>
+                <phase>test</phase>
+                <goals>
+                  <goal>java</goal>
+                </goals>
+                <configuration>
+                  <mainClass>clojure.main</mainClass>
+                  <classpathScope>test</classpathScope>
+                  <additionalClasspathElements>
+                    <additionalClasspathElement>${project.basedir}/test</additionalClasspathElement>
+                  </additionalClasspathElements>
+                  <systemProperties>
+                    <systemProperty>
+                      <key>clojure.test-clojure.exclude-namespaces</key>
+                      <value>#{clojure.test-clojure.compilation.load-ns clojure.test-clojure.ns-libs-load-later}</value>
+                    </systemProperty>
+                    <systemProperty>
+                      <key>java.awt.headless</key>
+                      <value>true</value>
+                    </systemProperty>
+                  </systemProperties>
+                  <arguments>
+                    <argument>${project.basedir}/src/script/run_test.clj</argument>
+                  </arguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>
