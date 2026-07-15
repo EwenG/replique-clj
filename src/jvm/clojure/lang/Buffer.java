@@ -229,6 +229,24 @@ public class Buffer {
     return k;
   }
 
+  // Number of already-consumed characters to keep behind pos so that a pushback (unread) has
+  // somewhere to land. A LineNumberingPushbackReader consumer only ever unreads one character at
+  // a time (skip-whitespace, skip-if-eol); 16 is comfortable headroom.
+  private static final int PUSHBACK_MARGIN = 16;
+
+  // Reclaims consumed input for a consumer that drives this Buffer purely as a Reader
+  // (LineNumberingPushbackReader's read / readLine / skip) rather than through LispReader's
+  // tokenizers. Those tokenizers advance tokenStart via startNewToken(); a plain Reader consumer
+  // never does, so without this tokenStart would stay put and the backing array would grow without
+  // bound over a long stream. Advancing tokenStart toward pos lets the next fill() shift the prefix
+  // down. The pin (read+string capture) still caps discarding, via discardable(). Safe because the
+  // facade never runs during a LispReader token scan -- the two share the cursor but not the clock.
+  void reclaimConsumed() {
+    int floor = pos - PUSHBACK_MARGIN;
+    if (floor > tokenStart)
+      tokenStart = floor;
+  }
+
   // Opens n free slots behind pos by shifting the live region up, so unread() has somewhere to go.
   private void makeRoomBefore(int n) {
     if (buffer.length - posEnd <= n)

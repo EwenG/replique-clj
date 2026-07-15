@@ -42,18 +42,16 @@ import java.util.regex.Pattern;
  * <p>Supported: numbers, symbols, keywords, strings, characters, {@code nil}/{@code true}/
  * {@code false}, collections, comments ({@code ;}, {@code #!}, {@code #_}), quote, deref, var,
  * unquote, metadata, symbolic values ({@code ##Inf}/{@code ##-Inf}/{@code ##NaN}), regex, tagged
- * literals, namespaced maps, syntax-quote (with auto-gensym), and the anonymous fn literal.
+ * literals, namespaced maps, syntax-quote (with auto-gensym), the anonymous fn literal, reader
+ * conditionals ({@code #?}/{@code #?@}, both {@code :allow} and {@code :preserve}), and
+ * {@code :line}/{@code :column} metadata on forms (on lists and via {@code ^meta}, as the original).
  *
  * <p>NOT YET SUPPORTED (see the TODOs at each site):
  * <ul>
- *   <li>{@code :line}/{@code :column} metadata on forms. {@link Buffer} already tracks line and
- *       column ({@code countLines}); the reader does not yet attach it. The Compiler degrades
- *       gracefully (it falls back to the reader's own line number), so stack traces still name the
- *       right top-level form, but inner forms and Var {@code :line} meta are missing.
- *   <!-- reader conditionals (#? / #?@) are supported, in both :allow and :preserve modes -->
  *   <li>The {@code #=} eval reader - {@code *read-eval*} is honoured (which is the
  *       security-relevant half) but evaluating throws.
- *   <li>Record literals ({@code #my.Record[...]} / {@code #my.Record{...}}).
+ *   <li>Record literals ({@code #my.Record[...]} / {@code #my.Record{...}}). (Dotted tags in a
+ *       dead {@code #?} branch still read, as {@code TaggedLiteral}s, via {@code *suppress-read*}.)
  *   <li>{@code *reader-resolver*} ({@link Resolver}) - the interface is kept for API
  *       compatibility but is not consulted.
  * </ul>
@@ -116,6 +114,33 @@ public class LispReader {
       throw Util.runtimeException("Reading disallowed - *read-eval* bound to :unknown");
     Object o = read0(0);
     return o == READ_EOF ? EOF : o;
+  }
+
+  // Reads one top-level form under `opts`, saving and restoring the per-read mutable state around
+  // it. That state (opts, the #?@ splice queue, the #() arg map, the syntax-quote gensym map) lives
+  // in instance fields, and a LineNumberingPushbackReader caches ONE reader instance across every
+  // form it reads. So a reentrant read() on the same stream -- e.g. a data reader whose body calls
+  // (read *in*) while an outer read is mid-#() or mid-collection -- would otherwise clobber the
+  // outer read's state. Upstream is reentrant-safe because it threads this state through call
+  // parameters and thread-bound Vars; this save/restore gives the same guarantee. The shared Buffer
+  // (the point of the design) and the token-intern cache are intentionally NOT saved.
+  Object readTopLevel(Object opts) throws IOException {
+    Object savedOpts = this.opts;
+    java.util.LinkedList<Object> savedPending = this.pendingForms;
+    java.util.TreeMap<Integer, Symbol> savedArg = this.argEnv;
+    java.util.HashMap<Symbol, Symbol> savedGensym = this.gensymEnv;
+    this.pendingForms = null;   // a fresh, top-level context for this (possibly nested) read
+    this.argEnv = null;
+    this.gensymEnv = null;
+    setOpts(opts);
+    try {
+      return read();
+    } finally {
+      this.opts = savedOpts;
+      this.pendingForms = savedPending;
+      this.argEnv = savedArg;
+      this.gensymEnv = savedGensym;
+    }
   }
 
   // Sets the reader options for the reads that follow, installing the platform feature (:clj) into
@@ -231,9 +256,8 @@ public class LispReader {
       // its token cache survives across every form in the file.
       LineNumberingPushbackReader lnpr = (LineNumberingPushbackReader) r;
       LispReader lr = lnpr.lispReader();
-      lr.setOpts(opts);
       try {
-        Object o = lr.read();
+        Object o = lr.readTopLevel(opts);
         if (o == EOF) {
           if (eofIsError)
             throw Util.runtimeException("EOF while reading");
@@ -253,9 +277,8 @@ public class LispReader {
     // at a time and push whatever lookahead is left back into it. Slow, but correct, and nothing
     // on a hot path arrives here.
     LispReader lr = new LispReader(new SingleCharReader(r), 1);
-    lr.setOpts(opts);
     try {
-      Object o = lr.read();
+      Object o = lr.readTopLevel(opts);
       if (o == EOF) {
         if (eofIsError)
           throw Util.runtimeException("EOF while reading");
@@ -321,9 +344,8 @@ public class LispReader {
    */
   static public Object readString(String s, Object opts) {
     LispReader lr = new LispReader(new StringReader(s), DEFAULT_CHUNK_SIZE);
-    lr.setOpts(opts);
     try {
-      Object o = lr.read();
+      Object o = lr.readTopLevel(opts);
       if (o == EOF) {
         boolean eofIsError = true;
         Object eofValue = null;
@@ -730,9 +752,11 @@ public class LispReader {
       }
       case ':': buffer.read(); return readNamespaceMap();               // #:ns{...} / #::{...}
       default:
-        if (Character.isLetter(ch)) return readTagged();               // #tag form (leave the letter)
-        throw new UnsupportedOperationException(
-            "Unsupported dispatch macro '#" + (char) ch + "'");
+        // Anything that is not a dispatch macro is a tagged literal: the original unreads the
+        // char and hands it to CtorReader, which reads the tag as a symbol. So #foo, #*foo, and
+        // #my.Record all land here (the char is left unconsumed for readTagged to read). read
+        // failures (a char that cannot start a symbol) surface as the same tag/symbol errors.
+        return readTagged();
     }
   }
 
@@ -1152,24 +1176,25 @@ public class LispReader {
       if (c == '\\') break;          // an escape: switch to the in-place decode path
       p++;
     }
-    // In-place decode path (first backslash reached). Each escape collapses into the buffer
-    // *behind* the read cursor, so the finished string is still one contiguous slice - no
-    // StringBuilder. This stays O(n): it writes decoded chars into the already-consumed prefix
-    // rather than shifting the unscanned tail on every escape (which would be O(n^2)).
-    b.pos = p;                                   // position the read cursor at the backslash
-    int wOff = p - b.getTokenStart();            // the clean prefix is already in place
+    // Decode path (first backslash reached). Build the decoded string in a StringBuilder rather
+    // than writing it back into the buffer. The buffer is shared: read+string captures a form's
+    // source text straight out of it (via the pin), and line/column counting rescans it lazily.
+    // Decoding in place would overwrite that source region -- collapsing e.g. \n to a real newline
+    // both corrupts the captured source and makes the line counter see a phantom line break. So we
+    // only ever *consume* from the buffer here (leaving its bytes intact), as the original reader's
+    // StringReader does. Only strings that actually contain an escape pay for the StringBuilder.
+    StringBuilder sb = new StringBuilder();
+    sb.append(a, b.getTokenStart(), p - b.getTokenStart());   // the clean prefix before the escape
+    b.pos = p;                                                // position the read cursor at the backslash
     while (true) {
       int ch = b.read();
       if (ch == '"')
-        return new String(b.buffer, b.getTokenStart(), wOff);
+        return sb.toString();
       if (ch == -1)
         throw Util.runtimeException("EOF while reading string");
       if (ch == '\\')
         ch = readStringEscape();
-      // Write index (tokenStart + wOff) always trails the read cursor once an escape has
-      // shortened the content, so this never clobbers not-yet-read input.
-      b.buffer[b.getTokenStart() + wOff] = (char) ch;
-      wOff++;
+      sb.append((char) ch);
     }
   }
 
@@ -1219,7 +1244,7 @@ public class LispReader {
       uc = uc * base + d;
     }
     if (i != length && exact)
-      throw Util.runtimeException("Invalid character length: " + i + ", should be: " + length);
+      throw new IllegalArgumentException("Invalid character length: " + i + ", should be: " + length);
     return uc;
   }
 

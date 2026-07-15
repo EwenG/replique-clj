@@ -91,12 +91,16 @@ public int getColumnNumber(){
 }
 
 public int read() throws IOException{
+	// reclaimConsumed keeps the backing array from growing without bound when this reader is driven
+	// as a plain Reader (never through LispReader's tokenizers, which is what normally reclaims).
+	buffer.reclaimConsumed();
 	return buffer.read();
 }
 
 public int read(char[] cbuf, int off, int len) throws IOException{
 	if(len <= 0)
 		return 0;
+	buffer.reclaimConsumed();
 	if(buffer.pos >= buffer.posEnd && !buffer.refill())
 		return -1;
 	int n = Math.min(len, buffer.posEnd - buffer.pos);
@@ -126,6 +130,7 @@ public String readLine() throws IOException{
 	sb.append((char) c);
 	for(; ;)
 		{
+		buffer.reclaimConsumed();         // bound growth even for one very long line
 		c = buffer.read();
 		if(c == -1 || c == '\n')
 			return sb.toString();
@@ -143,8 +148,13 @@ public boolean ready() throws IOException{
 
 public long skip(long n) throws IOException{
 	long skipped = 0;
-	while(skipped < n && buffer.read() != -1)
+	while(skipped < n)
+		{
+		buffer.reclaimConsumed();
+		if(buffer.read() == -1)
+			break;
 		skipped++;
+		}
 	return skipped;
 }
 }
