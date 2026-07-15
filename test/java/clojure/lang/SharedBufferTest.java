@@ -92,6 +92,43 @@ public class SharedBufferTest {
     assertEquals(20_000, lines);
   }
 
+  // CR, LF and CRLF must each collapse to a single '\n' -- including when a CRLF is split across a
+  // chunk boundary, so the '\r' ends one refill and the '\n' opens the next (the pendingCR carry).
+  // The collapse() fast path skips rewriting a chunk with no '\r', so this pins that it still
+  // handles the carry and lone-CR cases. A tiny chunk size forces the split.
+  @Test
+  public void crlfCollapsesAcrossChunkBoundary() throws IOException {
+    // "a\r\nb" as a string literal: the \r ends chunk 1, the \n opens chunk 2. Value is "a\nb".
+    LineNumberingPushbackReader split =
+        new LineNumberingPushbackReader(new StringReader("\"a\r\nb\""), 3);
+    assertEquals("a\nb", LispReader.read(split, false, null, false, null),
+        "CRLF split across a chunk boundary must collapse to one '\\n'");
+    // A lone CR (old-Mac line ending) also collapses to '\n'.
+    LineNumberingPushbackReader loneCR =
+        new LineNumberingPushbackReader(new StringReader("\"a\rb\""), 3);
+    assertEquals("a\nb", LispReader.read(loneCR, false, null, false, null),
+        "a lone '\\r' must collapse to '\\n'");
+  }
+
+  // Line counting must treat CR, CRLF and LF each as exactly one line break, even at a chunk size
+  // that splits every CRLF -- the case the all-LF stdlib never exercises.
+  @Test
+  public void crlfLineCountingAcrossChunkBoundary() throws IOException {
+    Keyword LINE = Keyword.intern(null, "line");
+    // Forms on successive lines separated by CRLF; chunk size 4 splits several of the breaks.
+    LineNumberingPushbackReader crlf =
+        new LineNumberingPushbackReader(new StringReader("(1)\r\n(2)\r\n(3)"), 4);
+    for (int expected = 1; expected <= 3; expected++)
+      assertEquals(expected, RT.get(RT.meta(LispReader.read(crlf, false, null, false, null)), LINE),
+          ":line of form " + expected + " with CRLF separators");
+    // Lone-CR separators count the same way.
+    LineNumberingPushbackReader cr =
+        new LineNumberingPushbackReader(new StringReader("(1)\r(2)\r(3)"), 4);
+    for (int expected = 1; expected <= 3; expected++)
+      assertEquals(expected, RT.get(RT.meta(LispReader.read(cr, false, null, false, null)), LINE),
+          ":line of form " + expected + " with lone-CR separators");
+  }
+
   // A reentrant read on the SAME reader (a data reader whose body reads another form) must not
   // corrupt the outer read. The cached reader's per-read state (#() args, #?@ queue) is saved and
   // restored around each top-level read.

@@ -189,6 +189,15 @@ public class Buffer {
    */
   private int collapse(int start, int n) {
     char[] a = buffer;
+    int end = start + n;
+    // Fast path: with no CR carried over from the previous chunk, a run with no '\r' needs no
+    // rewriting at all (lone '\n's are already kept verbatim). A read-only scan the JIT can
+    // vectorize, versus the per-char read/write state machine below.
+    if (!pendingCR) {
+      int i = start;
+      while (i < end && a[i] != '\r') i++;
+      if (i == end) return n;
+    }
     int w = start;
     for (int i = start; i < start + n; i++) {
       char c = a[i];
