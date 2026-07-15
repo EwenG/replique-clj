@@ -114,16 +114,23 @@ as a `TaggedLiteral` rather than applied — matching stock Clojure exactly (ver
 gated on `*read-eval*` like the original. Unblocks `clojure.test-clojure.protocols` and
 `clojure.test-clojure.def`.
 
+### Deprecated metadata reader
+
+`#^meta form` is the old spelling of `^meta form`; both route to the same metadata reader, as
+upstream. Unblocks `clojure.test-clojure.evaluation` (which then hits the `#=` gap, below, in one
+test).
+
 ## Reader gaps (the remaining work)
 
 None of these are used by Clojure's own sources, which is why the fork bootstraps without them.
 Clojure's test suite is what surfaces them. Roughly in impact order:
 
 1. **`#=` eval reader** — `*read-eval*` is honoured (that is the security-relevant half, and it
-   matches upstream), but actually evaluating throws. Needed for `print-dup` round-trips.
-2. **`#^` deprecated metadata reader** — blocks `clojure.test-clojure.evaluation`. Trivial: it is
-   just `^` under an old spelling.
-3. **`*reader-resolver*`** (`LispReader.Resolver`) — the interface is kept for API compatibility
+   matches upstream), but actually evaluating throws. Needed for `print-dup` round-trips, and by
+   the Compiler when it serializes certain embedded constants (a function used as code): it prints
+   them as `#=(…)` and re-reads them. This is the one remaining error in
+   `clojure.test-clojure.evaluation` (which otherwise passes, 51/52 assertions).
+2. **`*reader-resolver*`** (`LispReader.Resolver`) — the interface is kept for API compatibility
    but is never consulted.
 
 The longer-term cleanup is to make `Buffer` the single character source and reimplement

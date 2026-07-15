@@ -41,7 +41,8 @@ import java.util.regex.Pattern;
  *
  * <p>Supported: numbers, symbols, keywords, strings, characters, {@code nil}/{@code true}/
  * {@code false}, collections, comments ({@code ;}, {@code #!}, {@code #_}), quote, deref, var,
- * unquote, metadata, symbolic values ({@code ##Inf}/{@code ##-Inf}/{@code ##NaN}), regex, tagged
+ * unquote, metadata ({@code ^} and the deprecated {@code #^}), symbolic values ({@code ##Inf}/
+ * {@code ##-Inf}/{@code ##NaN}), regex, tagged
  * literals, namespaced maps, syntax-quote (with auto-gensym), the anonymous fn literal, reader
  * conditionals ({@code #?}/{@code #?@}, both {@code :allow} and {@code :preserve}), and
  * {@code :line}/{@code :column} metadata on forms (on lists and via {@code ^meta}, as the original).
@@ -737,6 +738,7 @@ public class LispReader {
       case '"': buffer.read(); return readRegex();                      // #"..." regex
       case '#': buffer.read(); return readSymbolicValue();              // ##Inf / ##-Inf / ##NaN
       case '<': buffer.read(); throw Util.runtimeException("Unreadable form");
+      case '^': buffer.read(); return readMeta();                      // #^meta form (deprecated ^)
       case '?': buffer.read(); return readConditional();               // #? / #?@ reader conditional
       case '=': {                             // #= read-eval
         buffer.read();

@@ -664,6 +664,17 @@ public class LispReaderNumberTest {
     return "\";'@^`~()[]{}\\%#".indexOf(c) >= 0;
   }
 
+  // The deprecated #^ metadata reader is the old spelling of ^; both must read identically.
+  @Test
+  public void testDeprecatedMetaReaderAgainstClojure() {
+    assertAllMatchClojure(
+        "#^String x",           // symbol tag -> {:tag String}
+        "#^:dynamic x",         // keyword    -> {:dynamic true}
+        "#^{:a 1} [1 2]",       // map meta
+        "#^\"tag\" x",          // string tag
+        "[#^Long a #^Long b]"); // several in a collection
+  }
+
   // Record construction (#pkg.Class[...] / #pkg.Class{...}). readRecord works on any class with a
   // matching constructor / create method, so java.awt.Point (a stable (int,int) data class) lets
   // this run without defining a record. Diffed against the original reader like everything else.
