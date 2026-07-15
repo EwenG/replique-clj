@@ -19,9 +19,9 @@ mvn install          # => target/clojure-1.12.5-r1.jar, 77 reader tests green
 
 Clojure's own test suite is largely green, and where it runs it matches stock Clojure 1.12.5
 assertion-for-assertion. The full reader suite (`clojure.test-clojure.reader`, 7,795 assertions)
-passes, identical to stock; a broader sweep of a dozen namespaces is 12,966 assertions, 0 failures,
-0 errors on both fork and stock. The namespaces that still fail do so *at read time*, on the reader
-gaps listed below.
+passes, identical to stock; a broader sweep of ~15 namespaces is 14,320 assertions, 0 failures,
+0 errors on both fork and stock. The namespaces that still fail do so *at read time*, on the
+remaining reader gaps listed below (`#=`, `#^`).
 
 ## What changed vs. Clojure 1.12.5
 
@@ -108,20 +108,22 @@ queue that `read0` drains before reading anything new. While a non-matching bran
 as a `TaggedLiteral` rather than applied — matching stock Clojure exactly (verified against the
 `clojure.test-clojure.reader` suite).
 
+### Record literals
+
+`#my.Record[v …]` (positional constructor) and `#my.Record{:k v …}` (map `create`) are supported,
+gated on `*read-eval*` like the original. Unblocks `clojure.test-clojure.protocols` and
+`clojure.test-clojure.def`.
+
 ## Reader gaps (the remaining work)
 
 None of these are used by Clojure's own sources, which is why the fork bootstraps without them.
 Clojure's test suite is what surfaces them. Roughly in impact order:
 
-1. **Record literals** `#my.Record[…]` / `#my.Record{…}` — blocks
-   `clojure.test-clojure.compilation` and `clojure.test-clojure.protocols`. (Note: record literals
-   in *dead* `#?` branches already work, via the `*suppress-read*` → `TaggedLiteral` path; this is
-   about actually *constructing* the record.)
-2. **`#=` eval reader** — `*read-eval*` is honoured (that is the security-relevant half, and it
+1. **`#=` eval reader** — `*read-eval*` is honoured (that is the security-relevant half, and it
    matches upstream), but actually evaluating throws. Needed for `print-dup` round-trips.
-3. **`#^` deprecated metadata reader** — blocks `clojure.test-clojure.evaluation`. Trivial: it is
+2. **`#^` deprecated metadata reader** — blocks `clojure.test-clojure.evaluation`. Trivial: it is
    just `^` under an old spelling.
-4. **`*reader-resolver*`** (`LispReader.Resolver`) — the interface is kept for API compatibility
+3. **`*reader-resolver*`** (`LispReader.Resolver`) — the interface is kept for API compatibility
    but is never consulted.
 
 The longer-term cleanup is to make `Buffer` the single character source and reimplement

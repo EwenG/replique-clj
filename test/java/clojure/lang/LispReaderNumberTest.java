@@ -663,4 +663,18 @@ public class LispReaderNumberTest {
   private static boolean isMacroCh(char c) {
     return "\";'@^`~()[]{}\\%#".indexOf(c) >= 0;
   }
+
+  // Record construction (#pkg.Class[...] / #pkg.Class{...}). readRecord works on any class with a
+  // matching constructor / create method, so java.awt.Point (a stable (int,int) data class) lets
+  // this run without defining a record. Diffed against the original reader like everything else.
+  @Test
+  public void testRecordConstructionAgainstClojure() {
+    assertAllMatchClojure(
+        "#java.awt.Point[1 2]",       // positional -> new Point(1, 2)
+        "#java.awt.Point[3 4] ",
+        "[#java.awt.Point[1 2] :x]",  // nested in a collection
+        "#java.awt.Point[1 2 3]",     // wrong arity -> both throw
+        "#java.awt.Point 5",          // neither vector nor map -> both throw "Unreadable constructor"
+        "#no.such.Class[1]");         // missing class -> both throw
+  }
 }

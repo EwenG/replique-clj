@@ -50,8 +50,6 @@ import java.util.regex.Pattern;
  * <ul>
  *   <li>The {@code #=} eval reader - {@code *read-eval*} is honoured (which is the
  *       security-relevant half) but evaluating throws.
- *   <li>Record literals ({@code #my.Record[...]} / {@code #my.Record{...}}). (Dotted tags in a
- *       dead {@code #?} branch still read, as {@code TaggedLiteral}s, via {@code *suppress-read*}.)
  *   <li>{@code *reader-resolver*} ({@link Resolver}) - the interface is kept for API
  *       compatibility but is not consulted.
  * </ul>
@@ -791,26 +789,63 @@ public class LispReader {
 
   // #tag form - reads the tag symbol and a form, then applies the matching data reader.
   private Object readTagged() throws IOException {
-    Object tag = readForm();
-    if (!(tag instanceof Symbol)) throw Util.runtimeException("Reader tag must be a symbol");
+    Object tagObj = readForm();
+    if (!(tagObj instanceof Symbol)) throw Util.runtimeException("Reader tag must be a symbol");
+    Symbol tag = (Symbol) tagObj;
     Object form = readForm();
     // In :preserve mode, or while discarding a non-matching #? branch (*suppress-read*), the tag
     // is not applied -- it is kept verbatim as a TaggedLiteral. This is what lets a dead branch
     // hold a #js or a #some.nonexistent.Record with no data reader without blowing up, and what
     // lets :preserve round-trip them. Matches the original's CtorReader.
     if (isPreserveReadCond() || RT.suppressRead())
-      return TaggedLiteral.create((Symbol) tag, form);
-    IFn reader = dataReaderFor((Symbol) tag);
+      return TaggedLiteral.create(tag, form);
+    // A dotted tag name is a record constructor (#my.Record[...] / #my.Record{...}); a plain tag
+    // is a data reader. The original decides the same way, and BEFORE any *data-readers* lookup.
+    if (tag.getName().contains("."))
+      return readRecord(form, tag);
+    IFn reader = dataReaderFor(tag);
     if (reader != null) return reader.invoke(form);
-    // No registered reader. Clojure routes tags whose *name* contains '.' to record
-    // construction (TODO: not implemented); only plain tags fall back to
-    // *default-data-reader-fn*, called as (f tag form). Guarding on the dot keeps dotted tags
-    // from wrongly hitting it.
-    if (!((Symbol) tag).getName().contains(".")) {
-      IFn defaultReader = (IFn) RT.var("clojure.core", "*default-data-reader-fn*").deref();
-      if (defaultReader != null) return defaultReader.invoke(tag, form);
-    }
+    // No registered reader: fall back to *default-data-reader-fn*, called as (f tag form).
+    IFn defaultReader = (IFn) RT.var("clojure.core", "*default-data-reader-fn*").deref();
+    if (defaultReader != null) return defaultReader.invoke(tag, form);
     throw Util.runtimeException("No reader function for tag " + tag);
+  }
+
+  // #my.Record[v0 v1 ...] positional, or #my.Record{:k v ...} map. Port of the original's
+  // readRecord. Gated on *read-eval* because it constructs an arbitrary class.
+  private Object readRecord(Object form, Symbol recordName) {
+    if (!RT.booleanCast(RT.READEVAL.deref()))
+      throw Util.runtimeException("Record construction syntax can only be used when *read-eval* == true");
+
+    Class recordClass = RT.classForNameNonLoading(recordName.toString());
+
+    boolean shortForm;
+    if (form instanceof IPersistentMap)
+      shortForm = false;                        // #Rec{:k v} -> (Rec/create {...})
+    else if (form instanceof IPersistentVector)
+      shortForm = true;                         // #Rec[v ...] -> positional constructor
+    else
+      throw Util.runtimeException("Unreadable constructor form starting with \"#" + recordName + "\"");
+
+    if (shortForm) {
+      IPersistentVector recordEntries = (IPersistentVector) form;
+      boolean ctorFound = false;
+      for (java.lang.reflect.Constructor ctor : recordClass.getConstructors())
+        if (ctor.getParameterTypes().length == recordEntries.count())
+          ctorFound = true;
+      if (!ctorFound)
+        throw Util.runtimeException("Unexpected number of constructor arguments to "
+            + recordClass.toString() + ": got " + recordEntries.count());
+      return Reflector.invokeConstructor(recordClass, RT.toArray(recordEntries));
+    }
+
+    IPersistentMap vals = (IPersistentMap) form;
+    for (ISeq s = RT.keys(vals); s != null; s = s.next()) {
+      if (!(s.first() instanceof Keyword))
+        throw Util.runtimeException(
+            "Unreadable defrecord form: key must be of type clojure.lang.Keyword, got " + s.first().toString());
+    }
+    return Reflector.invokeStaticMethod(recordClass, "create", new Object[]{vals});
   }
 
   // ---- Reader conditionals #? / #?@ --------------------------------------------------------
