@@ -17,11 +17,12 @@ standard library, AOT-compiles them, and produces a working jar and REPL.
 mvn install          # => target/clojure-1.12.5-r1.jar, 77 reader tests green
 ```
 
-Clojure's own test suite is largely green, and where it runs it matches stock Clojure 1.12.5
-assertion-for-assertion. The full reader suite (`clojure.test-clojure.reader`, 7,795 assertions)
-passes, identical to stock; a broader sweep of ~15 namespaces is 14,320 assertions, 0 failures,
-0 errors on both fork and stock. The namespaces that still fail do so *at read time*, on the
-remaining reader gaps listed below (`#=`, `#^`).
+Clojure's own test suite matches stock Clojure 1.12.5 assertion-for-assertion. The full reader
+suite (`clojure.test-clojure.reader`, 7,795 assertions) passes, identical to stock; a broad sweep
+of ~16 namespaces is 14,372 assertions, 0 failures on both fork and stock (the one "error" is a
+missing-fixture artifact present on stock too). Every reader macro Clojure's own test suite
+exercises now reads with byte-for-byte parity; the sole remaining gap (`*reader-resolver*`) is
+unreachable through the normal read path.
 
 ## What changed vs. Clojure 1.12.5
 
@@ -117,21 +118,24 @@ gated on `*read-eval*` like the original. Unblocks `clojure.test-clojure.protoco
 ### Deprecated metadata reader
 
 `#^meta form` is the old spelling of `^meta form`; both route to the same metadata reader, as
-upstream. Unblocks `clojure.test-clojure.evaluation` (which then hits the `#=` gap, below, in one
-test).
+upstream. Unblocks `clojure.test-clojure.evaluation`.
+
+### `#=` eval reader
+
+`#=form` evaluates at read time, gated on `*read-eval*` (false/nil throws before the form is even
+read, as upstream). It is not a general `eval`: like the original it handles exactly the forms
+`print-dup` and the Compiler's constant serialization emit — a class name, `(var ns/name)`, a
+`(Ctor. …)` call, a static-member call, and a `(var-fn …)` application. This is reachable from
+ordinary `eval` too, whenever a non-trivial constant (e.g. a function used as code) gets embedded
+and round-tripped through `#=`.
 
 ## Reader gaps (the remaining work)
 
-None of these are used by Clojure's own sources, which is why the fork bootstraps without them.
-Clojure's test suite is what surfaces them. Roughly in impact order:
+One item remains, and it is inert — nothing in Clojure's own sources or test suite exercises it:
 
-1. **`#=` eval reader** — `*read-eval*` is honoured (that is the security-relevant half, and it
-   matches upstream), but actually evaluating throws. Needed for `print-dup` round-trips, and by
-   the Compiler when it serializes certain embedded constants (a function used as code): it prints
-   them as `#=(…)` and re-reads them. This is the one remaining error in
-   `clojure.test-clojure.evaluation` (which otherwise passes, 51/52 assertions).
-2. **`*reader-resolver*`** (`LispReader.Resolver`) — the interface is kept for API compatibility
-   but is never consulted.
+1. **`*reader-resolver*`** (`LispReader.Resolver`) — the interface is kept for API compatibility
+   but is never consulted. The `*reader-resolver*` path is only reachable when a custom resolver is
+   bound, which `RT.readString` and the Compiler never do.
 
 The longer-term cleanup is to make `Buffer` the single character source and reimplement
 `LineNumberingPushbackReader` on top of it, so the reader and the REPL share one cursor instead of

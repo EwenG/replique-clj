@@ -466,13 +466,15 @@ public class LispReaderNumberTest {
       }
     }
 
-    // With eval enabled, Clojure would evaluate; LispReader intentionally does not (no compiler).
-    // Only the #= form differs — ordinary forms still read fine under read-eval true.
-    Object plain = withReadEval(Boolean.TRUE, () -> new LispReader(new StringReader("(+ 1 2)")).read());
-    assertEquals(clojureRead("(+ 1 2)"), plain, "ordinary form should read under read-eval true");
-    Object evalForm = withReadEval(Boolean.TRUE, () -> new LispReader(new StringReader("#=(+ 1 2)")).read());
-    assertTrue(evalForm instanceof UnsupportedOperationException,
-        "#= with eval enabled should throw UnsupportedOperationException but got " + evalForm);
+    // With eval enabled, #= evaluates. Match the original reader on the forms it handles: a class
+    // name, (var ...), a constructor / static-member call, and a var-fn application.
+    for (String s : new String[]{"#=(clojure.core/+ 1 2 3)", "#=java.lang.String",
+                                 "#=(var clojure.core/+)", "#=(java.lang.String. \"hi\")",
+                                 "#=(java.lang.Integer/parseInt \"7\")"}) {
+      Object expected = clojureRead(s);
+      Object actual = withReadEval(Boolean.TRUE, () -> new LispReader(new StringReader(s)).read());
+      assertEquals(expected, actual, "#= eval for \"" + s + "\"");
+    }
   }
 
   // Canonicalizes gensym symbols (p1__N#, foo__N__auto__) by first-appearance order, so two

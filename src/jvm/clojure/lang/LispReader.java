@@ -47,15 +47,11 @@ import java.util.regex.Pattern;
  * conditionals ({@code #?}/{@code #?@}, both {@code :allow} and {@code :preserve}), and
  * {@code :line}/{@code :column} metadata on forms (on lists and via {@code ^meta}, as the original).
  *
- * <p>NOT YET SUPPORTED (see the TODOs at each site):
+ * <p>NOT YET SUPPORTED:
  * <ul>
- *   <li>The {@code #=} eval reader - {@code *read-eval*} is honoured (which is the
- *       security-relevant half) but evaluating throws.
  *   <li>{@code *reader-resolver*} ({@link Resolver}) - the interface is kept for API
  *       compatibility but is not consulted.
  * </ul>
- * None of these are used by Clojure's own sources, so the fork bootstraps without them; they show
- * up in Clojure's test suite.
  */
 public class LispReader {
 
@@ -740,16 +736,7 @@ public class LispReader {
       case '<': buffer.read(); throw Util.runtimeException("Unreadable form");
       case '^': buffer.read(); return readMeta();                      // #^meta form (deprecated ^)
       case '?': buffer.read(); return readConditional();               // #? / #?@ reader conditional
-      case '=': {                             // #= read-eval
-        buffer.read();
-        // The original checks *read-eval* before reading its form; false/nil throws exactly this.
-        if (!RT.booleanCast(RT.READEVAL.deref()))
-          throw Util.runtimeException("EvalReader not allowed when *read-eval* is false.");
-        // TODO evaluate. The *read-eval* gating above is the security-relevant behaviour and
-        // matches the original; actually evaluating needs Compiler.eval plus the Class/Var
-        // special cases from the original EvalReader.
-        throw new UnsupportedOperationException("#= read-eval is not implemented yet");
-      }
+      case '=': buffer.read(); return readEval();                       // #=form read-eval
       case ':': buffer.read(); return readNamespaceMap();               // #:ns{...} / #::{...}
       default:
         // Anything that is not a dispatch macro is a tagged literal: the original unreads the
@@ -848,6 +835,41 @@ public class LispReader {
             "Unreadable defrecord form: key must be of type clojure.lang.Keyword, got " + s.first().toString());
     }
     return Reflector.invokeStaticMethod(recordClass, "create", new Object[]{vals});
+  }
+
+  // #=form -- evaluate at read time. Port of the original's EvalReader. The '=' has been consumed.
+  // *read-eval* is checked before reading the form, as the original does: false/nil throws. This
+  // is not a general eval -- it handles exactly the forms print-dup / the Compiler's constant
+  // serialization emit: a class name, (var ns/name), a (Ctor. ...) call, a static-member call, or
+  // a (var-fn ...) application.
+  private Object readEval() throws IOException {
+    if (!RT.booleanCast(RT.READEVAL.deref()))
+      throw Util.runtimeException("EvalReader not allowed when *read-eval* is false.");
+
+    Object o = readForm();
+    if (o instanceof Symbol)
+      return RT.classForName(o.toString());
+    if (o instanceof IPersistentList) {
+      Symbol fs = (Symbol) RT.first(o);
+      if (fs.equals(THE_VAR)) {
+        Symbol vs = (Symbol) RT.second(o);
+        return RT.var(vs.getNamespace(), vs.getName());
+      }
+      if (fs.getName().endsWith(".")) {
+        Object[] args = RT.toArray(RT.next(o));
+        return Reflector.invokeConstructor(
+            RT.classForName(fs.getName().substring(0, fs.getName().length() - 1)), args);
+      }
+      if (Compiler.namesStaticMember(fs)) {
+        Object[] args = RT.toArray(RT.next(o));
+        return Reflector.invokeStaticMethod(fs.getNamespace(), fs.getName(), args);
+      }
+      Object v = Compiler.maybeResolveIn(Compiler.currentNS(), fs);
+      if (v instanceof Var)
+        return ((IFn) v).applyTo(RT.next(o));
+      throw Util.runtimeException("Can't resolve " + fs);
+    }
+    throw new IllegalArgumentException("Unsupported #= form");
   }
 
   // ---- Reader conditionals #? / #?@ --------------------------------------------------------
