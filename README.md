@@ -17,9 +17,11 @@ standard library, AOT-compiles them, and produces a working jar and REPL.
 mvn install          # => target/clojure-1.12.5-r1.jar, 77 reader tests green
 ```
 
-Clojure's own test suite is partially green. Every namespace that can be *read* passes, with results
-identical to stock Clojure 1.12.5 — 15 namespaces, 5,602 assertions, 0 failures, 0 errors on both.
-The namespaces that fail do so *at read time*, each on a known reader gap listed below.
+Clojure's own test suite is largely green, and where it runs it matches stock Clojure 1.12.5
+assertion-for-assertion. The full reader suite (`clojure.test-clojure.reader`, 7,795 assertions)
+passes, identical to stock; a broader sweep of a dozen namespaces is 12,966 assertions, 0 failures,
+0 errors on both fork and stock. The namespaces that still fail do so *at read time*, on the reader
+gaps listed below.
 
 ## What changed vs. Clojure 1.12.5
 
@@ -96,22 +98,30 @@ is why `read-string` produces no `:line`.
 
 This is what makes `(meta #'foo)`, `clojure.repl/source` and inner-form stack traces work.
 
+### Reader conditionals
+
+`#?` / `#?@` are supported, in both `:allow` and `:preserve` modes, so `.cljc` files read (and
+`test.check`, shipped as `.cljc`, loads). `opts` (`:read-cond`, `:features`) is threaded through the
+instance reader with the platform feature `:clj` installed, and `#?@` splices through a pending-forms
+queue that `read0` drains before reading anything new. While a non-matching branch is discarded,
+`*suppress-read*` is bound, so a `#js` or `#some.nonexistent.Record` literal in a dead branch is kept
+as a `TaggedLiteral` rather than applied — matching stock Clojure exactly (verified against the
+`clojure.test-clojure.reader` suite).
+
 ## Reader gaps (the remaining work)
 
 None of these are used by Clojure's own sources, which is why the fork bootstraps without them.
 Clojure's test suite is what surfaces them. Roughly in impact order:
 
-1. **Reader conditionals** `#?` / `#?@` — the reader throws. This blocks every `.cljc` file, and so
-   also blocks any library shipped as `.cljc` (e.g. `test.check`, which is why
-   `clojure.test-clojure.sequences` can't load). Needs the `:read-cond` / `:features` opts threaded
-   through the reader, plus a pending-forms queue for `#?@` splicing.
-2. **Record literals** `#my.Record[…]` / `#my.Record{…}` — blocks
-   `clojure.test-clojure.compilation` and `clojure.test-clojure.protocols`.
-3. **`#=` eval reader** — `*read-eval*` is honoured (that is the security-relevant half, and it
+1. **Record literals** `#my.Record[…]` / `#my.Record{…}` — blocks
+   `clojure.test-clojure.compilation` and `clojure.test-clojure.protocols`. (Note: record literals
+   in *dead* `#?` branches already work, via the `*suppress-read*` → `TaggedLiteral` path; this is
+   about actually *constructing* the record.)
+2. **`#=` eval reader** — `*read-eval*` is honoured (that is the security-relevant half, and it
    matches upstream), but actually evaluating throws. Needed for `print-dup` round-trips.
-4. **`#^` deprecated metadata reader** — blocks `clojure.test-clojure.evaluation`. Trivial: it is
+3. **`#^` deprecated metadata reader** — blocks `clojure.test-clojure.evaluation`. Trivial: it is
    just `^` under an old spelling.
-5. **`*reader-resolver*`** (`LispReader.Resolver`) — the interface is kept for API compatibility
+4. **`*reader-resolver*`** (`LispReader.Resolver`) — the interface is kept for API compatibility
    but is never consulted.
 
 The longer-term cleanup is to make `Buffer` the single character source and reimplement

@@ -50,7 +50,7 @@ import java.util.regex.Pattern;
  *       column ({@code countLines}); the reader does not yet attach it. The Compiler degrades
  *       gracefully (it falls back to the reader's own line number), so stack traces still name the
  *       right top-level form, but inner forms and Var {@code :line} meta are missing.
- *   <li>Reader conditionals ({@code #?} / {@code #?@}) - {@code readDispatch} throws.
+ *   <!-- reader conditionals (#? / #?@) are supported, in both :allow and :preserve modes -->
  *   <li>The {@code #=} eval reader - {@code *read-eval*} is honoured (which is the
  *       security-relevant half) but evaluating throws.
  *   <li>Record literals ({@code #my.Record[...]} / {@code #my.Record{...}}).
@@ -68,6 +68,15 @@ public class LispReader {
   public static final int DEFAULT_CHUNK_SIZE = 4096;
 
   private final Buffer buffer;
+
+  // Reader options ({@code :read-cond}, {@code :features}, {@code :eof}), with the platform
+  // feature installed. Set per read via {@link #setOpts}. Only reader conditionals consult it.
+  private Object opts;
+
+  // The #?@ splice queue. read0 drains it before reading anything new, and a matching #?@ prepends
+  // its resolved forms to it. Null at the absolute top level -- that null is exactly how a #?@
+  // learns it is at the top level (where splicing is banned); any nested read makes it non-null.
+  private java.util.LinkedList<Object> pendingForms;
 
   // Macro characters, matching the original LispReader's `macros` table (all ASCII).
   private static final boolean[] MACRO = new boolean[128];
@@ -107,6 +116,27 @@ public class LispReader {
       throw Util.runtimeException("Reading disallowed - *read-eval* bound to :unknown");
     Object o = read0(0);
     return o == READ_EOF ? EOF : o;
+  }
+
+  // Sets the reader options for the reads that follow, installing the platform feature (:clj) into
+  // :features so #? matches it. Called per read(), because a cached reader (the one pinned on a
+  // LineNumberingPushbackReader) is reused across forms whose opts may differ -- e.g. a .cljc load
+  // passes {:read-cond :allow} while a .clj load passes nothing.
+  void setOpts(Object opts) {
+    this.opts = installPlatformFeature(opts);
+  }
+
+  private static final Keyword PLATFORM_KEY = Keyword.intern(null, "clj");
+  private static final IPersistentSet PLATFORM_FEATURES = PersistentHashSet.create(PLATFORM_KEY);
+
+  private static Object installPlatformFeature(Object opts) {
+    if (opts == null)
+      return RT.mapUniqueKeys(OPT_FEATURES, PLATFORM_FEATURES);
+    IPersistentMap mopts = (IPersistentMap) opts;
+    Object features = mopts.valAt(OPT_FEATURES);
+    if (features == null)
+      return mopts.assoc(OPT_FEATURES, PLATFORM_FEATURES);
+    return mopts.assoc(OPT_FEATURES, RT.conj((IPersistentSet) features, PLATFORM_KEY));
   }
 
   // ---- Static API ---------------------------------------------------------------------------
@@ -201,6 +231,7 @@ public class LispReader {
       // its token cache survives across every form in the file.
       LineNumberingPushbackReader lnpr = (LineNumberingPushbackReader) r;
       LispReader lr = lnpr.lispReader();
+      lr.setOpts(opts);
       try {
         Object o = lr.read();
         if (o == EOF) {
@@ -222,6 +253,7 @@ public class LispReader {
     // at a time and push whatever lookahead is left back into it. Slow, but correct, and nothing
     // on a hot path arrives here.
     LispReader lr = new LispReader(new SingleCharReader(r), 1);
+    lr.setOpts(opts);
     try {
       Object o = lr.read();
       if (o == EOF) {
@@ -244,7 +276,7 @@ public class LispReader {
    * {@code clojure.repl/source-fn} passes a {@code (proxy [PushbackReader] [rdr] (read [] ...))},
    * and a Clojure proxy routes EVERY overload of {@code read} to that single fn -- so calling
    * {@code read(char[],int,int)} on it blows up with an ArityException. The original LispReader
-   * only ever called {@code read()}, so proxies like that worked; going through this shim keeps
+   * only ever called {@code read ()}, so proxies like that worked; going through this shim keeps
    * them working.
    */
   private static final class SingleCharReader extends java.io.Reader {
@@ -289,6 +321,7 @@ public class LispReader {
    */
   static public Object readString(String s, Object opts) {
     LispReader lr = new LispReader(new StringReader(s), DEFAULT_CHUNK_SIZE);
+    lr.setOpts(opts);
     try {
       Object o = lr.read();
       if (o == EOF) {
@@ -318,6 +351,10 @@ public class LispReader {
   // comments and #_ discards (which produce no value), matching the original read loop.
   private Object read0(int returnOn) throws IOException {
     while (true) {
+      // A #?@ splice deposits its forms here; hand them back before touching the input, so they
+      // land as elements of the enclosing collection. Same as the original's read-loop head.
+      if (pendingForms != null && !pendingForms.isEmpty())
+        return pendingForms.remove(0);
       int c1 = skipWhitespace();
       if (c1 == -1) return READ_EOF;
       if (returnOn != 0 && c1 == returnOn) { buffer.read(); return READ_FINISHED; }
@@ -349,15 +386,20 @@ public class LispReader {
   // Reads forms until the closing `delim`, collecting them. Port of readDelimitedList.
   private ArrayList<Object> readDelimitedList(int delim) throws IOException {
     int firstline = lineNumber();     // for the "EOF while reading, starting at line N" message
-    ArrayList<Object> acc = new ArrayList<>();
-    while (true) {
-      Object form = read0(delim);
-      if (form == READ_EOF) {
-        if (firstline < 0) throw Util.runtimeException("EOF while reading");
-        throw Util.runtimeException("EOF while reading, starting at line " + firstline);
+    java.util.LinkedList<Object> savedPending = enterPending();
+    try {
+      ArrayList<Object> acc = new ArrayList<>();
+      while (true) {
+        Object form = read0(delim);
+        if (form == READ_EOF) {
+          if (firstline < 0) throw Util.runtimeException("EOF while reading");
+          throw Util.runtimeException("EOF while reading, starting at line " + firstline);
+        }
+        if (form == READ_FINISHED) return acc;
+        acc.add(form);
       }
-      if (form == READ_FINISHED) return acc;
-      acc.add(form);
+    } finally {
+      pendingForms = savedPending;
     }
   }
 
@@ -433,11 +475,29 @@ public class LispReader {
   private java.util.TreeMap<Integer, Symbol> argEnv;       // #() arg map: n -> param symbol
   private java.util.HashMap<Symbol, Symbol> gensymEnv;     // syntax-quote foo# -> gensym
 
-  // Reads a required form (end of input is an error), as the reader macros do.
+  // Reads a required form (end of input is an error), as the reader macros do. Establishes a
+  // pending context: every reader macro in the original reads its sub-form with ensurePending,
+  // so a #?@ directly under one (e.g. under quote) is not "at the top level".
   private Object readForm() throws IOException {
-    Object o = read0(0);
-    if (o == READ_EOF) throw Util.runtimeException("EOF while reading");
-    return o;
+    java.util.LinkedList<Object> savedPending = enterPending();
+    try {
+      Object o = read0(0);
+      if (o == READ_EOF) throw Util.runtimeException("EOF while reading");
+      return o;
+    } finally {
+      pendingForms = savedPending;
+    }
+  }
+
+  // Marks the start of a nested read: pendingForms becomes non-null (so a #?@ seen here knows it
+  // is not at the top level, where splicing is banned), and #?@ splices drain into it. Returns the
+  // previous value for the caller to restore. Mirrors the original calling ensurePending() on
+  // every recursive read.
+  private java.util.LinkedList<Object> enterPending() {
+    java.util.LinkedList<Object> saved = pendingForms;
+    if (pendingForms == null)
+      pendingForms = new java.util.LinkedList<>();
+    return saved;
   }
 
   // '~' just read: ~@form -> (unquote-splicing form), ~form -> (unquote form).
@@ -657,11 +717,7 @@ public class LispReader {
       case '"': buffer.read(); return readRegex();                      // #"..." regex
       case '#': buffer.read(); return readSymbolicValue();              // ##Inf / ##-Inf / ##NaN
       case '<': buffer.read(); throw Util.runtimeException("Unreadable form");
-      case '?':
-        // TODO reader conditionals (#? / #?@). Needs the :read-cond / :features opts threaded in
-        // and a pendingForms queue for #?@ splicing. Nothing in Clojure's own sources uses them,
-        // but the test suite and every .cljc file do.
-        buffer.read(); throw Util.runtimeException("Conditional read not allowed");
+      case '?': buffer.read(); return readConditional();               // #? / #?@ reader conditional
       case '=': {                             // #= read-eval
         buffer.read();
         // The original checks *read-eval* before reading its form; false/nil throws exactly this.
@@ -714,6 +770,12 @@ public class LispReader {
     Object tag = readForm();
     if (!(tag instanceof Symbol)) throw Util.runtimeException("Reader tag must be a symbol");
     Object form = readForm();
+    // In :preserve mode, or while discarding a non-matching #? branch (*suppress-read*), the tag
+    // is not applied -- it is kept verbatim as a TaggedLiteral. This is what lets a dead branch
+    // hold a #js or a #some.nonexistent.Record with no data reader without blowing up, and what
+    // lets :preserve round-trip them. Matches the original's CtorReader.
+    if (isPreserveReadCond() || RT.suppressRead())
+      return TaggedLiteral.create((Symbol) tag, form);
     IFn reader = dataReaderFor((Symbol) tag);
     if (reader != null) return reader.invoke(form);
     // No registered reader. Clojure routes tags whose *name* contains '.' to record
@@ -725,6 +787,119 @@ public class LispReader {
       if (defaultReader != null) return defaultReader.invoke(tag, form);
     }
     throw Util.runtimeException("No reader function for tag " + tag);
+  }
+
+  // ---- Reader conditionals #? / #?@ --------------------------------------------------------
+  // Port of the original's ConditionalReader. The '#?' has been consumed. In :allow mode a single
+  // matching branch is spliced in (#?@) or returned (#?); in :preserve mode the whole thing is
+  // kept as a ReaderConditional. Requires opts to carry :read-cond -> :allow / :preserve.
+
+  private static final Object READ_STARTED = new Object();
+  private static final Keyword DEFAULT_FEATURE = Keyword.intern(null, "default");
+  private static final IPersistentSet RESERVED_FEATURES =
+      RT.set(Keyword.intern(null, "else"), Keyword.intern(null, "none"));
+  // Marks that we are lexically inside a reader conditional, gating :preserve (matching the
+  // original's private READ_COND_ENV var).
+  private static final Var READ_COND_ENV = Var.create(null).setDynamic();
+
+  private Object readConditional() throws IOException {
+    checkConditionalAllowed();
+    int ch = buffer.read();                 // char after '#?'
+    if (ch == -1) throw Util.runtimeException("EOF while reading character");
+    boolean splicing = false;
+    if (ch == '@') { splicing = true; ch = buffer.read(); }
+    while (isWhitespace(ch)) ch = buffer.read();
+    if (ch == -1) throw Util.runtimeException("EOF while reading character");
+    if (ch != '(') throw Util.runtimeException("read-cond body must be a list");
+    // '(' consumed. A splice is "at the top level" iff nothing has established a pending context.
+    boolean toplevel = (pendingForms == null);
+    Var.pushThreadBindings(RT.map(READ_COND_ENV, RT.T));
+    try {
+      if (isPreserveReadCond()) {
+        // Keep it verbatim. readList reads the body to ')' (the '(' is already consumed).
+        Object form = readList();
+        return ReaderConditional.create(form, splicing);
+      }
+      return readCondDelimited(splicing, toplevel);
+    } finally {
+      Var.popThreadBindings();
+    }
+  }
+
+  // Reads feature/form pairs to the closing ')'. The first matching feature's form becomes the
+  // result; everything else is read and discarded (with *suppress-read* bound, so tagged/record
+  // literals in dead branches are not applied). Returns the matched form, or SKIP for no match /
+  // for a splice (which prepends its forms to pendingForms).
+  private Object readCondDelimited(boolean splicing, boolean toplevel) throws IOException {
+    Object result = READ_STARTED;
+    int firstline = lineNumber();
+    while (true) {
+      if (result == READ_STARTED) {
+        Object feature = read0(')');
+        if (feature == READ_EOF) throw condEof(firstline);
+        if (feature == READ_FINISHED) break;
+        if (RESERVED_FEATURES.contains(feature))
+          throw Util.runtimeException("Feature name " + feature + " is reserved.");
+        if (hasFeature(feature)) {
+          Object form = read0(')');
+          if (form == READ_EOF) throw condEof(firstline);
+          if (form == READ_FINISHED) {
+            if (firstline < 0)
+              throw Util.runtimeException("read-cond requires an even number of forms.");
+            throw Util.runtimeException(
+                "read-cond starting on line " + firstline + " requires an even number of forms");
+          }
+          result = form;
+        }
+      }
+      // Discard the next form: the non-matching feature's form, or everything past a match.
+      Var.pushThreadBindings(RT.map(RT.SUPPRESS_READ, RT.T));
+      try {
+        Object form = read0(')');
+        if (form == READ_EOF) throw condEof(firstline);
+        if (form == READ_FINISHED) break;
+      } finally {
+        Var.popThreadBindings();
+      }
+    }
+
+    if (result == READ_STARTED)            // no feature matched: a no-op, like whitespace
+      return SKIP;
+
+    if (splicing) {
+      if (!(result instanceof java.util.List))
+        throw Util.runtimeException("Spliced form list in read-cond-splicing must implement java.util.List");
+      if (toplevel)
+        throw Util.runtimeException("Reader conditional splicing not allowed at the top level.");
+      pendingForms.addAll(0, (java.util.List) result);
+      return SKIP;
+    }
+    return result;
+  }
+
+  private RuntimeException condEof(int firstline) {
+    if (firstline < 0) return Util.runtimeException("EOF while reading");
+    return Util.runtimeException("EOF while reading, starting at line " + firstline);
+  }
+
+  private boolean hasFeature(Object feature) {
+    if (!(feature instanceof Keyword))
+      throw Util.runtimeException("Feature should be a keyword: " + feature);
+    if (DEFAULT_FEATURE.equals(feature)) return true;
+    IPersistentSet custom = (IPersistentSet) ((IPersistentMap) opts).valAt(OPT_FEATURES);
+    return custom != null && custom.contains(feature);
+  }
+
+  private void checkConditionalAllowed() {
+    Object rc = (opts instanceof IPersistentMap) ? ((IPersistentMap) opts).valAt(OPT_READ_COND) : null;
+    if (!(COND_ALLOW.equals(rc) || COND_PRESERVE.equals(rc)))
+      throw Util.runtimeException("Conditional read not allowed");
+  }
+
+  private boolean isPreserveReadCond() {
+    if (RT.booleanCast(READ_COND_ENV.deref()) && opts instanceof IPersistentMap)
+      return COND_PRESERVE.equals(((IPersistentMap) opts).valAt(OPT_READ_COND));
+    return false;
   }
 
   // #:ns{...} / #::{...} / #::alias{...} - the leading "#:" has been consumed. Unqualified keys
