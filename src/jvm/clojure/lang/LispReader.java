@@ -446,10 +446,11 @@ public class LispReader {
     if (a.isEmpty()) return PersistentList.EMPTY;
     IObj s = (IObj) PersistentList.create(a);
     if (line < 0) return s;
-    Object meta = RT.meta(s);
-    meta = RT.assoc(meta, RT.LINE_KEY, RT.get(meta, RT.LINE_KEY, line));
-    meta = RT.assoc(meta, RT.COLUMN_KEY, RT.get(meta, RT.COLUMN_KEY, column));
-    return s.withMeta((IPersistentMap) meta);
+    // PersistentList.create returns a fresh list with no meta, so the defensive
+    // RT.meta/RT.get/RT.assoc dance the original does would only ever scan an empty map and
+    // rebuild it key by key. Build the {:line :column} map directly instead.
+    return s.withMeta(new PersistentArrayMap(
+        new Object[]{RT.LINE_KEY, line, RT.COLUMN_KEY, column}));
   }
 
   private Object readVector() throws IOException {
