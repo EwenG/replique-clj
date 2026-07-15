@@ -20,9 +20,8 @@ mvn install          # => target/clojure-1.12.5-r1.jar, 77 reader tests green
 Clojure's own test suite matches stock Clojure 1.12.5 assertion-for-assertion. The full reader
 suite (`clojure.test-clojure.reader`, 7,795 assertions) passes, identical to stock; a broad sweep
 of ~16 namespaces is 14,372 assertions, 0 failures on both fork and stock (the one "error" is a
-missing-fixture artifact present on stock too). Every reader macro Clojure's own test suite
-exercises now reads with byte-for-byte parity; the sole remaining gap (`*reader-resolver*`) is
-unreachable through the normal read path.
+missing-fixture artifact present on stock too). **The port is complete: every reader macro of
+Clojure 1.12.5's `LispReader` is implemented, with byte-for-byte parity.**
 
 ## What changed vs. Clojure 1.12.5
 
@@ -129,25 +128,25 @@ read, as upstream). It is not a general `eval`: like the original it handles exa
 ordinary `eval` too, whenever a non-trivial constant (e.g. a function used as code) gets embedded
 and round-tripped through `#=`.
 
-## Reader gaps (the remaining work)
+### `*reader-resolver*`
 
-One item remains, and it is inert — nothing in Clojure's own sources or test suite exercises it:
-
-1. **`*reader-resolver*`** (`LispReader.Resolver`) — the interface is kept for API compatibility
-   but is never consulted. The `*reader-resolver*` path is only reachable when a custom resolver is
-   bound, which `RT.readString` and the Compiler never do.
-
-The longer-term cleanup is to make `Buffer` the single character source and reimplement
-`LineNumberingPushbackReader` on top of it, so the reader and the REPL share one cursor instead of
-handing characters back and forth. That would also give (2) and `read+string` for free, and let the
-static API drop its chunk-size-1 restriction.
+A resolver bound to `*reader-resolver*` (`LispReader.Resolver`) overrides how `::keywords`,
+`#::maps`, and syntax-quoted symbols resolve — the path ClojureScript's reader and similar tooling
+use to read code for a namespace other than the one doing the reading. `RT.readString` and the
+Compiler never bind one, so the default path (resolve against the current namespace) is what
+normally runs. Diffed against the original reader with a resolver bound to both
+(`ReaderResolverTest`), since Clojure's own suite does not cover it.
 
 ## Tests
 
-`mvn test` runs the reader's own JUnit tests (77, green):
+`mvn test` runs the reader's own JUnit tests (86, green):
 
-- `test/java/clojure/lang/LispReaderNumberTest.java` — ported from lijeur's `Reader2NumberTest`.
+- `test/java/clojure/lang/LispReaderNumberTest.java` — ported from lijeur's `Reader2NumberTest`,
+  plus differential tests for record construction and the `#^` metadata reader.
 - `test/java/clojure/lang/BufferTest.java` — ported from lijeur's `BufferTest`.
+- `test/java/clojure/lang/SharedBufferTest.java` — the shared-cursor invariants (source capture,
+  line stability across escaped strings, bounded memory, reentrant reads).
+- `test/java/clojure/lang/ReaderResolverTest.java` — `*reader-resolver*`, diffed against the oracle.
 - `test/java/clojure/lang/OriginalLispReader.java` — **the oracle.**
 
 That last file matters. These are *differential* tests: they assert the new reader reads exactly

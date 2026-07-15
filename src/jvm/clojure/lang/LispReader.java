@@ -44,14 +44,11 @@ import java.util.regex.Pattern;
  * unquote, metadata ({@code ^} and the deprecated {@code #^}), symbolic values ({@code ##Inf}/
  * {@code ##-Inf}/{@code ##NaN}), regex, tagged
  * literals, namespaced maps, syntax-quote (with auto-gensym), the anonymous fn literal, reader
- * conditionals ({@code #?}/{@code #?@}, both {@code :allow} and {@code :preserve}), and
+ * conditionals ({@code #?}/{@code #?@}, both {@code :allow} and {@code :preserve}), record
+ * literals, the {@code #=} eval reader, {@code *reader-resolver*} ({@link Resolver}), and
  * {@code :line}/{@code :column} metadata on forms (on lists and via {@code ^meta}, as the original).
  *
- * <p>NOT YET SUPPORTED:
- * <ul>
- *   <li>{@code *reader-resolver*} ({@link Resolver}) - the interface is kept for API
- *       compatibility but is not consulted.
- * </ul>
+ * <p>This is a complete port: every reader macro of Clojure 1.12.5's LispReader is implemented.
  */
 public class LispReader {
 
@@ -70,6 +67,11 @@ public class LispReader {
   // its resolved forms to it. Null at the absolute top level -- that null is exactly how a #?@
   // learns it is at the top level (where splicing is banned); any nested read makes it non-null.
   private java.util.LinkedList<Object> pendingForms;
+
+  // The value of *reader-resolver* for the current read, or null (the usual case: RT.readString
+  // and the Compiler never bind one). When set, it overrides how ::keywords, #::maps, and
+  // syntax-quoted symbols resolve. Derived once per top-level read in readTopLevel.
+  private Resolver resolver;
 
   // Macro characters, matching the original LispReader's `macros` table (all ASCII).
   private static final boolean[] MACRO = new boolean[128];
@@ -124,9 +126,11 @@ public class LispReader {
     java.util.LinkedList<Object> savedPending = this.pendingForms;
     java.util.TreeMap<Integer, Symbol> savedArg = this.argEnv;
     java.util.HashMap<Symbol, Symbol> savedGensym = this.gensymEnv;
+    Resolver savedResolver = this.resolver;
     this.pendingForms = null;   // a fresh, top-level context for this (possibly nested) read
     this.argEnv = null;
     this.gensymEnv = null;
+    this.resolver = (Resolver) RT.READER_RESOLVER.deref();   // snapshot *reader-resolver* for this read
     setOpts(opts);
     try {
       return read();
@@ -135,6 +139,7 @@ public class LispReader {
       this.pendingForms = savedPending;
       this.argEnv = savedArg;
       this.gensymEnv = savedGensym;
+      this.resolver = savedResolver;
     }
   }
 
@@ -635,10 +640,32 @@ public class LispReader {
         sym = gs;
       } else if (sym.getNamespace() == null && sym.getName().endsWith(".")) {
         Symbol csym = Symbol.intern(null, sym.getName().substring(0, sym.getName().length() - 1));
-        csym = Compiler.resolveSymbol(csym);
+        if (resolver != null) {
+          Symbol rc = resolver.resolveClass(csym);
+          if (rc != null) csym = rc;
+        } else {
+          csym = Compiler.resolveSymbol(csym);
+        }
         sym = Symbol.intern(null, csym.getName().concat("."));
       } else if (sym.getNamespace() == null && sym.getName().startsWith(".")) {
         // instance method name: leave as-is (quoted below)
+      } else if (resolver != null) {
+        // A bound *reader-resolver* resolves classes / aliases / vars itself.
+        Symbol nsym = null;
+        if (sym.getNamespace() != null) {
+          Symbol alias = Symbol.intern(null, sym.getNamespace());
+          nsym = resolver.resolveClass(alias);
+          if (nsym == null) nsym = resolver.resolveAlias(alias);
+        }
+        if (nsym != null) {
+          sym = Symbol.intern(nsym.getName(), sym.getName());   // Classname/foo -> pkg.Classname/foo
+        } else if (sym.getNamespace() == null) {
+          Symbol rsym = resolver.resolveClass(sym);
+          if (rsym == null) rsym = resolver.resolveVar(sym);
+          if (rsym != null) sym = rsym;
+          else sym = Symbol.intern(resolver.currentNS().getName(), sym.getName());
+        }
+        // already-qualified and unresolved: leave alone
       } else {
         Object maybeClass = null;
         if (sym.getNamespace() != null)
@@ -1010,12 +1037,20 @@ public class LispReader {
     String nsname;
     if (auto) {
       if (osym == null) {
-        nsname = currentNS().getName().getName();
+        nsname = (resolver != null) ? resolver.currentNS().getName()
+                                    : currentNS().getName().getName();
       } else if (osym instanceof Symbol && ((Symbol) osym).getNamespace() == null) {
-        Namespace resolved = currentNS().lookupAlias(Symbol.intern(((Symbol) osym).getName()));
+        Symbol alias = Symbol.intern(((Symbol) osym).getName());
+        Symbol resolved;
+        if (resolver != null) {
+          resolved = resolver.resolveAlias(alias);
+        } else {
+          Namespace rns = currentNS().lookupAlias(alias);
+          resolved = (rns != null) ? rns.getName() : null;
+        }
         if (resolved == null)
           throw Util.runtimeException("Unknown auto-resolved namespace alias: " + osym);
-        nsname = resolved.getName().getName();
+        nsname = resolved.getName();
       } else {
         throw Util.runtimeException("Namespaced map must specify a valid namespace: " + osym);
       }
@@ -1398,7 +1433,7 @@ public class LispReader {
       }
     }
     String s = new String(a, start, len);
-    Object ret = matchSymbol(s);
+    Object ret = matchSymbol(s, resolver);
     if (ret != null) return ret;
     throw Util.runtimeException("Invalid token: " + s);
   }
@@ -1448,7 +1483,7 @@ public class LispReader {
   private static final int SYM_NS_PRESENT = 1;      // group1 (namespace) present
   private static final int SYM_NS_COLON_SLASH = 2;  // group1 ends with ":/"
 
-  private static Object matchSymbol(String s) {
+  private static Object matchSymbol(String s, Resolver resolver) {
     int n = s.length();
     // symbolPat's leading [:]? is greedy: try consuming a leading ':' first, then not.
     int r = (s.charAt(0) == ':') ? symMatch(s, 1) : SYM_NO_MATCH;
@@ -1463,10 +1498,19 @@ public class LispReader {
           || s.indexOf("::", 1) != -1)
         return null;
       if (n >= 2 && s.charAt(0) == ':' && s.charAt(1) == ':') {
-        // ::-autoresolve, matching the original's null-Resolver path (as used by RT.readString):
-        // ::ns/name resolves ns as an ALIAS of the current namespace only (no Namespace/find);
-        // ::name resolves against the current namespace itself.
+        // ::-autoresolve. ::ns/name resolves ns as an alias, ::name against the current namespace.
         Symbol ks = Symbol.intern(s.substring(2));
+        if (resolver != null) {
+          // A bound *reader-resolver* decides the namespace symbol.
+          Symbol nsym = (ks.getNamespace() != null)
+              ? resolver.resolveAlias(Symbol.intern(ks.getNamespace()))
+              : resolver.currentNS();
+          if (nsym != null)
+            return Keyword.intern(nsym.getName(), ks.getName());
+          return null;
+        }
+        // Default path (RT.readString / the Compiler): alias lookup on the current namespace only,
+        // no Namespace/find.
         Namespace kns;
         if (ks.getNamespace() != null)
           kns = currentNS().lookupAlias(Symbol.intern(ks.getNamespace()));
