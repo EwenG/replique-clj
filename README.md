@@ -19,7 +19,8 @@ The jar is published as `replique-clj/clojure:1.12.5-r1`, deliberately keeping t
 
 ## Divergence from upstream
 
-`git diff clojure-1.12.5 -- src test` lists it; `test` is untouched. Today it is one change:
+`git diff clojure-1.12.5 -- src test` lists it; `test` is untouched. Today it is two changes, both
+in the compiler and both measured:
 
 - **`Compiler.writeClassFile` defers the compiler's own class-file writes to virtual threads**, and
   joins them at each namespace boundary. Class-file I/O is ~13% of AOT wall time (~2800 files for
@@ -42,6 +43,58 @@ The jar is published as `replique-clj/clojure:1.12.5-r1`, deliberately keeping t
   1.12 is already the last release on a Java 8 baseline. If you ever need the Java 8 floor back,
   swap `Executors.newVirtualThreadPerTaskExecutor()` for a small fixed platform pool and drop
   `maven.compiler.release` — nothing else in the design depends on it.
+
+- **`Reflector.getMethods` caches `Class.getMethods()` in a `ClassValue`.** `Class.getMethods()`
+  copies the whole public-method array *and every `Method` object in it* on every call, and the
+  compiler calls it once per interop form it analyses — which made `Class.copyMethods` the single
+  hottest leaf under `analyze`. Worth **~4%** of compile time (25 recompiles of a 3240-line
+  namespace: 6296ms → 6033ms). It also speeds up runtime reflective calls, so unhinted code
+  benefits at run time and not just at compile time.
+
+  `ClassValue` is JDK 7+, so unlike the change above this one costs no baseline. It keys on the
+  `Class`, so a class redefined at the REPL is a distinct key rather than a stale hit, and entries
+  are collected with the class instead of pinning its loader — which matters for a REPL that
+  reloads namespaces all day.
+
+  Caching gives up the isolation `Class.getMethods()` was paying for: the `Method` objects handed
+  out are now shared instances, so a caller that mutated one (`setAccessible`) would affect every
+  later caller. `getMethods` is therefore **package-private now, where upstream has it public** —
+  every caller is `Compiler` or `Reflector` itself, none of which mutate them, so the shared
+  instances cannot leave `clojure.lang`. Nothing the compiler emits calls `getMethods` (reflective
+  call sites go to `Reflector.invokeInstanceMethod` / `invokeNoArgInstanceMember`), so this does
+  not affect already-AOT-compiled code; it breaks only third-party code calling
+  `clojure.lang.Reflector/getMethods` directly — a far smaller surface than the Java 21 floor
+  above. If you upstream this, expect that narrowing to be the contentious part.
+
+Neither change alters what the compiler emits, and the vendored test suite passes unmodified.
+
+### Speed without AOT
+
+Neither divergence above helps a REPL: `writeClassFile` is never called when `*compile-files*` is
+false, and the Reflector cache is only ~4%. Compiling a namespace from source is dominated by
+analysis and macroexpansion, and the two things that actually move it are **not** code changes:
+
+```
+-Dclojure.spec.skip-macros=true     # -15% cold, -18% on a warm recompile loop
+-XX:SharedArchiveFile=app.jsa       # -10% cold; startup only, ~100ms per JVM launch
+```
+
+`Compiler.checkSpecs` — validating `defn` / `let` / `fn` forms against `core.specs.alpha` on every
+macroexpansion — is **12.8% of all compile time**, and 52% of everything `macroexpand1` does. The
+cost of skipping it is that a malformed `defn` gets you a raw compiler error rather than a spec
+explanation. Together the two are ~-26% on a cold "boot + load a namespace" loop.
+
+The AppCDS archive is fussy to produce. Dump it from a **minimal boot** on a **jars-only**
+classpath — it refuses directories, and an archive dumped from a run that compiled code archives
+the dynamically generated classes (16MB vs 9.7MB) and is worth nothing on replay:
+
+```
+java -XX:ArchiveClassesAtExit=app.jsa -cp <jars only> clojure.main -e nil
+```
+
+Appending entries to the runtime classpath is fine; a directory on the classpath changing after the
+dump is not — the archive is then rejected at startup and you silently get no speedup. Check with
+`-Xlog:cds=warning`: no "shared class paths mismatch" means it loaded.
 
 > **History.** An earlier iteration replaced the `LispReader` with a faster, `Buffer`-backed reader
 > (ported from the sibling *lijeur* project). It was reverted, and the measurements say that was the
