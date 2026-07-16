@@ -27,8 +27,13 @@
     <maven.compiler.target>1.8</maven.compiler.target>
 
     <!-- Direct linking is how Clojure builds its own core: it compiles core's calls as static
-         invocations instead of Var dereferences. Turn it off to get redefinable core Vars. -->
-    <clojure.compile.direct-linking>true</clojure.compile.direct-linking>
+         invocations instead of Var dereferences. Turn it off to get redefinable core Vars.
+         The property name matters: Compiler.java collects compiler options by scanning system
+         properties under the "clojure.compiler." prefix, so a "clojure.compile." spelling is
+         silently ignored and you get a jar built with direct linking off. (Only *path*,
+         *warn-on-reflection* and *unchecked-math* live under "clojure.compile." — those are read
+         by clojure.lang.Compile itself, which is a different thing.) -->
+    <clojure.compiler.direct-linking>true</clojure.compiler.direct-linking>
 
   </properties>
 
@@ -144,8 +149,8 @@
                   <value>${project.build.outputDirectory}</value>
                 </systemProperty>
                 <systemProperty>
-                  <key>clojure.compile.direct-linking</key>
-                  <value>${clojure.compile.direct-linking}</value>
+                  <key>clojure.compiler.direct-linking</key>
+                  <value>${clojure.compiler.direct-linking}</value>
                 </systemProperty>
               </systemProperties>
               <!-- Namespaces AOT-compiled into the jar (clojure.lang.Compile takes one per
@@ -228,34 +233,103 @@
       <id>clojure-test</id>
       <build>
         <plugins>
+          <!-- Resolves the test-scoped dependency jars into ${clojure-test.deps.classpath} so the
+               forked JVM below can be handed an explicit -classpath. exec:exec's <classpath/>
+               cannot have entries appended to it, and the suite needs the test/ source directory
+               itself on the classpath (CLJ-1184-do-in-non-list-test spits a .clj into
+               test/clojure/ at runtime and compiles it, so a copy staged into target/ will not
+               do). -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-dependency-plugin</artifactId>
+            <version>3.6.1</version>
+            <executions>
+              <execution>
+                <id>test-deps-classpath</id>
+                <phase>process-test-classes</phase>
+                <goals>
+                  <goal>build-classpath</goal>
+                </goals>
+                <configuration>
+                  <includeScope>test</includeScope>
+                  <outputProperty>clojure-test.deps.classpath</outputProperty>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
           <plugin>
             <groupId>org.codehaus.mojo</groupId>
             <artifactId>exec-maven-plugin</artifactId>
             <version>3.2.0</version>
             <executions>
+              <!-- A handful of test namespaces must be AOT-compiled before the suite runs: they
+                   are referenced by class name (e.g. clj-1208 does
+                   (clojure.test_clojure.compilation.load_ns.x.)), so loading them from source is
+                   not enough. This mirrors upstream's build.xml `compile-tests` target, which the
+                   original port of this pom omitted. Runs before run-clojure-tests: executions of
+                   one plugin in one phase run in declaration order. -->
               <execution>
-                <id>run-clojure-tests</id>
+                <id>aot-compile-tests</id>
                 <phase>test</phase>
                 <goals>
                   <goal>java</goal>
                 </goals>
                 <configuration>
-                  <mainClass>clojure.main</mainClass>
+                  <mainClass>clojure.lang.Compile</mainClass>
                   <classpathScope>test</classpathScope>
                   <additionalClasspathElements>
                     <additionalClasspathElement>${project.basedir}/test</additionalClasspathElement>
                   </additionalClasspathElements>
                   <systemProperties>
                     <systemProperty>
-                      <key>clojure.test-clojure.exclude-namespaces</key>
-                      <value>#{clojure.test-clojure.compilation.load-ns clojure.test-clojure.ns-libs-load-later}</value>
+                      <key>clojure.compile.path</key>
+                      <value>${project.build.testOutputDirectory}</value>
                     </systemProperty>
                     <systemProperty>
-                      <key>java.awt.headless</key>
-                      <value>true</value>
+                      <key>clojure.compiler.direct-linking</key>
+                      <value>${clojure.compiler.direct-linking}</value>
                     </systemProperty>
                   </systemProperties>
                   <arguments>
+                    <argument>clojure.test-clojure.protocols.examples</argument>
+                    <argument>clojure.test-clojure.proxy.examples</argument>
+                    <argument>clojure.test-clojure.genclass.examples</argument>
+                    <argument>clojure.test-clojure.compilation.load-ns</argument>
+                    <argument>clojure.test-clojure.annotations</argument>
+                  </arguments>
+                </configuration>
+              </execution>
+
+              <!-- Forked, not exec:java, and that is load-bearing: two tests
+                   (genclass/gen-interface-source-file, java-interop/test-proxy-method-order)
+                   build a clojure.asm.ClassReader from a class *name*, which resolves through
+                   ClassLoader.getSystemResourceAsStream. Under exec:java the project classpath
+                   is a child classloader and the system classloader is Maven's own, so those
+                   classes are invisible and the tests error with "Class not found". Upstream
+                   runs the suite under <java fork="true"> for the same reason. -->
+              <execution>
+                <id>run-clojure-tests</id>
+                <phase>test</phase>
+                <goals>
+                  <goal>exec</goal>
+                </goals>
+                <configuration>
+                  <executable>${java.home}/bin/java</executable>
+                  <classpathScope>test</classpathScope>
+                  <!-- run_test.clj scans (File. "test") for namespaces, and several tests read or
+                       write paths relative to the project root (e.g. sequences/test-iteration
+                       reads readme.txt). -->
+                  <workingDirectory>${project.basedir}</workingDirectory>
+                  <arguments>
+                    <argument>-classpath</argument>
+                    <!-- Mirrors upstream build.xml's test-example: test-classes : test : build :
+                         cljsrc : maven.test.classpath -->
+                    <argument>${project.build.testOutputDirectory}${path.separator}${project.basedir}/test${path.separator}${project.build.outputDirectory}${path.separator}${project.basedir}/src/clj${path.separator}${clojure-test.deps.classpath}</argument>
+                    <argument>-Dclojure.test-clojure.exclude-namespaces=#{clojure.test-clojure.compilation.load-ns clojure.test-clojure.ns-libs-load-later}</argument>
+                    <argument>-Dclojure.compiler.direct-linking=${clojure.compiler.direct-linking}</argument>
+                    <argument>-Djava.awt.headless=true</argument>
+                    <argument>clojure.main</argument>
                     <argument>${project.basedir}/src/script/run_test.clj</argument>
                   </arguments>
                 </configuration>

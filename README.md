@@ -1,26 +1,26 @@
 # replique-clj
 
-Clojure 1.12.5, vendored verbatim, with a self-contained Maven build.
-
-The source tree — compiler, runtime, data structures, the `LispReader`, `clojure.core` and the rest
-of the standard library — is **byte-identical to the upstream `clojure-1.12.5` tag**. The only thing
-that differs is how it builds: a plain `pom.xml` instead of upstream's Maven-shells-out-to-Ant
-arrangement. The jar is published as `replique-clj/clojure:1.12.5-r1`, deliberately keeping the
-artifactId `clojure`, so it can be dropped onto a classpath in place of `org.clojure/clojure`.
+Clojure 1.12.5, vendored from the upstream `clojure-1.12.5` tag, with a self-contained Maven build.
+The jar is published as `replique-clj/clojure:1.12.5-r1`, deliberately keeping the artifactId
+`clojure`, so it can be dropped onto a classpath in place of `org.clojure/clojure`.
 
 ## What this is (and isn't)
 
-- **The behaviour is stock Clojure 1.12.5.** Nothing in `src` or `test` is modified —
-  `git diff clojure-1.12.5 -- src test` is empty. The reader, the compiler, the numerics, source
-  metadata (`:line` / `:column` on lists and `^meta` seqs) — all exactly upstream.
-- **The difference is the build**, and the packaging (`groupId` / `version`). See
+- **This fork does not promise to stay byte-identical to upstream.** Divergence in `src` is on the
+  table where it earns its keep. Judge a change on its merits — a benchmark, a bug, the vendored
+  test suite passing — not on whether it perturbs the diff against the tag.
+- **As it stands, `src` and `test` are unmodified** (`git diff clojure-1.12.5 -- src test` is
+  empty), so behaviour is stock Clojure 1.12.5: the reader, the compiler, the numerics, source
+  metadata (`:line` / `:column` on lists and `^meta` seqs). That is a description of the current
+  state, not a constraint on future ones.
+- **What differs today is the build** and the packaging (`groupId` / `version`). See
   [Build](#build) and [The build vs. upstream's](#the-build-vs-upstreams).
 
-> **History.** An earlier iteration of this project replaced the `LispReader` with a faster,
-> `Buffer`-backed reader (ported from the sibling *lijeur* project). That reader has been reverted
-> to stock: the ~2.7× read speedup it bought was only a few percent of compile time, and keeping the
-> tree byte-identical to upstream is worth more than the win. The reader work lives in the git
-> history if you want it back.
+> **History.** An earlier iteration replaced the `LispReader` with a faster, `Buffer`-backed reader
+> (ported from the sibling *lijeur* project). It was reverted, and the measurements say that was the
+> right call on the merits: reading is only ~5% of AOT compile time, so even a 2.7× reader buys
+> ~3.4% overall — macroexpansion (~24%) and analysis (~22%) are where the time actually goes. Not
+> worth carrying a reader rewrite. The work lives in the git history if you want it back.
 
 ## Build
 
@@ -40,6 +40,15 @@ maven-jar-plugin        target/classes + src/clj   -> clojure-1.12.5-r1.jar
 
 `src/resources/clojure/version.properties` is a filtered template (`version=${version}`) that
 `clojure.core` reads at load time to build `*clojure-version*`.
+
+Core is AOT-compiled with **direct linking** on (`clojure.compiler.direct-linking`), as upstream
+builds it. Mind the prefix: `Compiler.java` collects compiler options by scanning system properties
+under `clojure.compiler.`, so the plausible-looking `clojure.compile.direct-linking` is silently
+ignored and yields a jar with direct linking *off*. (This pom had exactly that typo, and shipped
+non-direct-linked jars because of it.) The `clojure.compile.` prefix is a different, smaller thing —
+`path`, `warn-on-reflection`, `unchecked-math` — read by `clojure.lang.Compile` itself. To check
+which you got, disassemble a core fn: direct-linked call sites are `invokestatic … invokeStatic`,
+non-direct-linked ones go through `Var.getRawRoot`.
 
 `src/assembly/` (upstream's slim-jar and distribution descriptors) is vendored but unused — the
 assembly plugin is not configured here. Wire it back up if you want those artifacts.
@@ -67,12 +76,30 @@ Clojure's own test suite (`test/clojure/test_clojure/**`, vendored unmodified) r
 upstream's own runner script, via a profile that is **not** bound to the default `test` phase:
 
 ```
-mvn test -Pclojure-test
+mvn test -Pclojure-test     # 783 tests, 20448 assertions, 0 failures, 0 errors
 ```
 
 Because the source is byte-identical to the tag, this behaves exactly as it does on upstream Clojure
 1.12.5. (`mvn test` on its own runs the `test/java` JUnit tests — there are currently none, so it is
 a no-op that just confirms the build.)
+
+Three things about that profile are load-bearing, all of them things upstream's `build.xml` does and
+an earlier version of this pom did not:
+
+- **A subset of test namespaces is AOT-compiled first** (`aot-compile-tests`, mirroring upstream's
+  `compile-tests` target). They are referenced by class name rather than required — `clj-1208`
+  evaluates `(clojure.test_clojure.compilation.load_ns.x.)` — so loading them from source is not
+  enough.
+- **The suite runs in a forked JVM** (`exec:exec`, not `exec:java`). Two tests build a
+  `clojure.asm.ClassReader` from a class *name*, which resolves through
+  `ClassLoader.getSystemResourceAsStream`. Under `exec:java` the project classpath is a child
+  classloader while the system classloader is Maven's own, so those classes are invisible.
+- **`test/` is on the classpath as a directory**, and the working directory is the project root.
+  `CLJ-1184-do-in-non-list-test` writes `test/clojure/bad_def_test.clj` at runtime and compiles it,
+  so a copy staged into `target/` at `process-test-resources` time will not do.
+
+`readme.txt` is upstream's Clojure readme, restored verbatim from the tag and distinct from this
+file: `sequences/test-iteration` reads it from the working directory.
 
 ## Comparing against upstream Clojure
 
@@ -81,19 +108,22 @@ to clojure/clojure by accident). The vendored files sit at their upstream paths,
 directly.
 
 ```
-git diff clojure-1.12.5 -- src test    # empty: the source is unmodified
-git diff clojure-1.12.5                 # the fork = pom.xml + .gitattributes + this README
+git diff clojure-1.12.5 -- src test    # what this fork changes in the source (today: nothing)
+git diff clojure-1.12.5                 # the whole fork: the build, the packaging, this README
 ```
+
+Keeping that first diff honest and small is the point — not because the source may never change,
+but so that when it does, the change is legible against upstream.
 
 ### Keeping those diffs clean: line endings
 
-The vendored files are byte-identical to upstream, **including line endings**. 15 upstream files are
-stored with CRLF (`epl-v10.html`, `Sequential.java`, `ISeq.java`, `MapEntry.java`, …), and a machine
-with `core.autocrlf=input` would normalize them to LF when git hashes the working tree — making 15
-files we never touched diff as *fully rewritten*, ~2,400 phantom lines drowning any real change.
+The vendored files carry upstream's line endings. 15 upstream files are stored with CRLF
+(`epl-v10.html`, `Sequential.java`, `ISeq.java`, `MapEntry.java`, …), and a machine with
+`core.autocrlf=input` would normalize them to LF when git hashes the working tree — making 15 files
+we never touched diff as *fully rewritten*, ~2,400 phantom lines drowning any real change.
 
-`.gitattributes` sets `* -text`, which disables EOL conversion so blobs stay byte-identical to
-upstream. Two things to know about it:
+`.gitattributes` sets `* -text`, which disables EOL conversion so those blobs keep matching
+upstream's. Two things to know about it:
 
 - It must stay committable. `.gitignore` had `/.gitattributes` on line 884 (it is a generated file
   in upstream's layout), which made git ignore it entirely; that line has been removed. If the
