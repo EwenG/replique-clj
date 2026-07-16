@@ -12,1732 +12,1691 @@ package clojure.lang;
 
 import java.io.IOException;
 import java.io.PushbackReader;
-import java.io.StringReader;
-import java.util.ArrayList;
-import java.util.List;
+import java.io.Reader;
+import java.lang.Character;
+import java.lang.Class;
+import java.lang.Exception;
+import java.lang.IllegalArgumentException;
+import java.lang.IllegalStateException;
+import java.lang.Integer;
+import java.lang.Number;
+import java.lang.NumberFormatException;
+import java.lang.Object;
+import java.lang.RuntimeException;
+import java.lang.String;
+import java.lang.StringBuilder;
+import java.lang.Throwable;
+import java.lang.UnsupportedOperationException;
+import java.lang.reflect.Constructor;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/**
- * A fast Clojure reader built on {@link Buffer}. Behaviour matches Clojure 1.12.5's original
- * LispReader, but tokens are scanned directly over the {@link Buffer} backing array rather than
- * character-by-character through a {@link PushbackReader}.
- *
- * <p>This class has two faces:
- *
- * <ul>
- *   <li>An <b>instance API</b> ({@link #LispReader(java.io.Reader)} + {@link #read()}) which owns
- *       its input and reads it in chunks. This is the fast path.
- *   <li>A <b>static API</b> ({@code read(PushbackReader, ...)}) preserving the signatures the rest
- *       of the runtime (Compiler, RT, clojure.core, clojure.main) calls. Because callers such as
- *       {@code clojure.main/repl-read} interleave their own {@code .read}/{@code .unread}/
- *       {@code .readLine} calls on the same stream, the static path must not consume more input
- *       than the form it returns: it reads with a chunk size of 1 and pushes any unconsumed
- *       lookahead back into the {@link PushbackReader}, so the stream is left positioned exactly
- *       where the original LispReader would have left it.
- * </ul>
- *
- * <p>Supported: numbers, symbols, keywords, strings, characters, {@code nil}/{@code true}/
- * {@code false}, collections, comments ({@code ;}, {@code #!}, {@code #_}), quote, deref, var,
- * unquote, metadata ({@code ^} and the deprecated {@code #^}), symbolic values ({@code ##Inf}/
- * {@code ##-Inf}/{@code ##NaN}), regex, tagged
- * literals, namespaced maps, syntax-quote (with auto-gensym), the anonymous fn literal, reader
- * conditionals ({@code #?}/{@code #?@}, both {@code :allow} and {@code :preserve}), record
- * literals, the {@code #=} eval reader, {@code *reader-resolver*} ({@link Resolver}), and
- * {@code :line}/{@code :column} metadata on forms (on lists and via {@code ^meta}, as the original).
- *
- * <p>This is a complete port: every reader macro of Clojure 1.12.5's LispReader is implemented.
- */
-public class LispReader {
+public class LispReader{
 
-  /** Returned by {@link #read()} at end of input. */
-  public static final Object EOF = new Object();
+static final Symbol QUOTE = Symbol.intern("quote");
+static final Symbol THE_VAR = Symbol.intern("var");
+//static Symbol SYNTAX_QUOTE = Symbol.intern(null, "syntax-quote");
+static Symbol UNQUOTE = Symbol.intern("clojure.core", "unquote");
+static Symbol UNQUOTE_SPLICING = Symbol.intern("clojure.core", "unquote-splicing");
+static Symbol CONCAT = Symbol.intern("clojure.core", "concat");
+static Symbol SEQ = Symbol.intern("clojure.core", "seq");
+static Symbol LIST = Symbol.intern("clojure.core", "list");
+static Symbol APPLY = Symbol.intern("clojure.core", "apply");
+static Symbol HASHMAP = Symbol.intern("clojure.core", "hash-map");
+static Symbol HASHSET = Symbol.intern("clojure.core", "hash-set");
+static Symbol VECTOR = Symbol.intern("clojure.core", "vector");
+static Symbol WITH_META = Symbol.intern("clojure.core", "with-meta");
+static Symbol META = Symbol.intern("clojure.core", "meta");
+static Symbol DEREF = Symbol.intern("clojure.core", "deref");
+static Symbol READ_COND = Symbol.intern("clojure.core", "read-cond");
+static Symbol READ_COND_SPLICING = Symbol.intern("clojure.core", "read-cond-splicing");
+static Keyword UNKNOWN = Keyword.intern(null, "unknown");
+//static Symbol DEREF_BANG = Symbol.intern("clojure.core", "deref!");
 
-  public static final int DEFAULT_CHUNK_SIZE = 4096;
+static IFn[] macros = new IFn[256];
+static IFn[] dispatchMacros = new IFn[256];
+//static Pattern symbolPat = Pattern.compile("[:]?([\\D&&[^:/]][^:/]*/)?[\\D&&[^:/]][^:/]*");
+static Pattern symbolPat = Pattern.compile("[:]?([\\D&&[^/]].*/)?(/|[\\D&&[^/]][^/]*)");
+static Pattern arraySymbolPat = Pattern.compile("([\\D&&[^/:]].*)/([1-9])");
+//static Pattern varPat = Pattern.compile("([\\D&&[^:\\.]][^:\\.]*):([\\D&&[^:\\.]][^:\\.]*)");
+//static Pattern intPat = Pattern.compile("[-+]?[0-9]+\\.?");
+static Pattern intPat =
+		Pattern.compile(
+				"([-+]?)(?:(0)|([1-9][0-9]*)|0[xX]([0-9A-Fa-f]+)|0([0-7]+)|([1-9][0-9]?)[rR]([0-9A-Za-z]+)|0[0-9]+)(N)?");
+static Pattern ratioPat = Pattern.compile("([-+]?[0-9]+)/([0-9]+)");
+static Pattern floatPat = Pattern.compile("([-+]?[0-9]+(\\.[0-9]*)?([eE][-+]?[0-9]+)?)(M)?");
+static Pattern argPat = Pattern.compile("%(?:(&)|([1-9][0-9]*))?");
+//static Pattern accessorPat = Pattern.compile("\\.[a-zA-Z_]\\w*");
+//static Pattern instanceMemberPat = Pattern.compile("\\.([a-zA-Z_][\\w\\.]*)\\.([a-zA-Z_]\\w*)");
+//static Pattern staticMemberPat = Pattern.compile("([a-zA-Z_][\\w\\.]*)\\.([a-zA-Z_]\\w*)");
+//static Pattern classNamePat = Pattern.compile("([a-zA-Z_][\\w\\.]*)\\.");
 
-  private final Buffer buffer;
+//symbol->gensymbol
+static Var GENSYM_ENV = Var.create(null).setDynamic();
+//sorted-map num->gensymbol
+static Var ARG_ENV = Var.create(null).setDynamic();
+static IFn ctorReader = new CtorReader();
 
-  // Reader options ({@code :read-cond}, {@code :features}, {@code :eof}), with the platform
-  // feature installed. Set per read via {@link #setOpts}. Only reader conditionals consult it.
-  private Object opts;
+// Dynamic var set to true in a read-cond context
+static Var READ_COND_ENV = Var.create(null).setDynamic();
 
-  // The #?@ splice queue. read0 drains it before reading anything new, and a matching #?@ prepends
-  // its resolved forms to it. Null at the absolute top level -- that null is exactly how a #?@
-  // learns it is at the top level (where splicing is banned); any nested read makes it non-null.
-  private java.util.LinkedList<Object> pendingForms;
+static
+	{
+	macros['"'] = new StringReader();
+	macros[';'] = new CommentReader();
+	macros['\''] = new WrappingReader(QUOTE);
+	macros['@'] = new WrappingReader(DEREF);//new DerefReader();
+	macros['^'] = new MetaReader();
+	macros['`'] = new SyntaxQuoteReader();
+	macros['~'] = new UnquoteReader();
+	macros['('] = new ListReader();
+	macros[')'] = new UnmatchedDelimiterReader();
+	macros['['] = new VectorReader();
+	macros[']'] = new UnmatchedDelimiterReader();
+	macros['{'] = new MapReader();
+	macros['}'] = new UnmatchedDelimiterReader();
+//	macros['|'] = new ArgVectorReader();
+	macros['\\'] = new CharacterReader();
+	macros['%'] = new ArgReader();
+	macros['#'] = new DispatchReader();
 
-  // The value of *reader-resolver* for the current read, or null (the usual case: RT.readString
-  // and the Compiler never bind one). When set, it overrides how ::keywords, #::maps, and
-  // syntax-quoted symbols resolve. Derived once per top-level read in readTopLevel.
-  private Resolver resolver;
 
-  // Macro characters, matching the original LispReader's `macros` table (all ASCII).
-  private static final boolean[] MACRO = new boolean[128];
-  static {
-    for (char c : new char[]{'"', ';', '\'', '@', '^', '`', '~',
-                             '(', ')', '[', ']', '{', '}', '\\', '%', '#'}) {
-      MACRO[c] = true;
-    }
-  }
+	dispatchMacros['^'] = new MetaReader();
+	dispatchMacros['#'] = new SymbolicValueReader();
+	dispatchMacros['\''] = new VarReader();
+	dispatchMacros['"'] = new RegexReader();
+	dispatchMacros['('] = new FnReader();
+	dispatchMacros['{'] = new SetReader();
+	dispatchMacros['='] = new EvalReader();
+	dispatchMacros['!'] = new CommentReader();
+	dispatchMacros['<'] = new UnreadableReader();
+	dispatchMacros['_'] = new DiscardReader();
+	dispatchMacros['?'] = new ConditionalReader();
+	dispatchMacros[':'] = new NamespaceMapReader();
+	}
 
-  public LispReader(java.io.Reader r, int chunkSize) {
-    this.buffer = new Buffer(r, chunkSize);
-  }
-
-  public LispReader(java.io.Reader r) {
-    this(r, DEFAULT_CHUNK_SIZE);
-  }
-
-  // Reads from a Buffer someone else owns. This is how a LineNumberingPushbackReader hands us its
-  // Buffer: we tokenize out of the same characters it serves to the REPL and the Compiler, sharing
-  // one cursor, rather than draining it into a buffer of our own.
-  LispReader(Buffer buffer) {
-    this.buffer = buffer;
-  }
-
-  // Internal control-flow sentinels, mirroring the original read loop.
-  private static final Object READ_EOF = new Object();       // end of input
-  private static final Object READ_FINISHED = new Object();  // hit the expected closing delimiter
-  private static final Object SKIP = new Object();           // no value (comment / discard); continue
-
-  private static final Keyword UNKNOWN = Keyword.intern(null, "unknown");
-
-  /** Reads one form, or returns {@link #EOF} at end of input. */
-  public Object read() throws IOException {
-    // The original guards the top of read() the same way: :unknown blocks everything.
-    if (RT.READEVAL.deref() == UNKNOWN)
-      throw Util.runtimeException("Reading disallowed - *read-eval* bound to :unknown");
-    Object o = read0(0);
-    return o == READ_EOF ? EOF : o;
-  }
-
-  // Reads one top-level form under `opts`, saving and restoring the per-read mutable state around
-  // it. That state (opts, the #?@ splice queue, the #() arg map, the syntax-quote gensym map) lives
-  // in instance fields, and a LineNumberingPushbackReader caches ONE reader instance across every
-  // form it reads. So a reentrant read() on the same stream -- e.g. a data reader whose body calls
-  // (read *in*) while an outer read is mid-#() or mid-collection -- would otherwise clobber the
-  // outer read's state. Upstream is reentrant-safe because it threads this state through call
-  // parameters and thread-bound Vars; this save/restore gives the same guarantee. The shared Buffer
-  // (the point of the design) and the token-intern cache are intentionally NOT saved.
-  Object readTopLevel(Object opts) throws IOException {
-    Object savedOpts = this.opts;
-    java.util.LinkedList<Object> savedPending = this.pendingForms;
-    java.util.TreeMap<Integer, Symbol> savedArg = this.argEnv;
-    java.util.HashMap<Symbol, Symbol> savedGensym = this.gensymEnv;
-    Resolver savedResolver = this.resolver;
-    this.pendingForms = null;   // a fresh, top-level context for this (possibly nested) read
-    this.argEnv = null;
-    this.gensymEnv = null;
-    this.resolver = (Resolver) RT.READER_RESOLVER.deref();   // snapshot *reader-resolver* for this read
-    setOpts(opts);
-    try {
-      return read();
-    } finally {
-      this.opts = savedOpts;
-      this.pendingForms = savedPending;
-      this.argEnv = savedArg;
-      this.gensymEnv = savedGensym;
-      this.resolver = savedResolver;
-    }
-  }
-
-  // Sets the reader options for the reads that follow, installing the platform feature (:clj) into
-  // :features so #? matches it. Called per read(), because a cached reader (the one pinned on a
-  // LineNumberingPushbackReader) is reused across forms whose opts may differ -- e.g. a .cljc load
-  // passes {:read-cond :allow} while a .clj load passes nothing.
-  void setOpts(Object opts) {
-    this.opts = installPlatformFeature(opts);
-  }
-
-  private static final Keyword PLATFORM_KEY = Keyword.intern(null, "clj");
-  private static final IPersistentSet PLATFORM_FEATURES = PersistentHashSet.create(PLATFORM_KEY);
-
-  private static Object installPlatformFeature(Object opts) {
-    if (opts == null)
-      return RT.mapUniqueKeys(OPT_FEATURES, PLATFORM_FEATURES);
-    IPersistentMap mopts = (IPersistentMap) opts;
-    Object features = mopts.valAt(OPT_FEATURES);
-    if (features == null)
-      return mopts.assoc(OPT_FEATURES, PLATFORM_FEATURES);
-    return mopts.assoc(OPT_FEATURES, RT.conj((IPersistentSet) features, PLATFORM_KEY));
-  }
-
-  // ---- Static API ---------------------------------------------------------------------------
-  // The signatures the rest of the runtime calls. See the class doc for why the static path reads
-  // one character at a time and pushes its lookahead back.
-
-  public static interface Resolver {
+public static interface Resolver{
     Symbol currentNS();
     Symbol resolveClass(Symbol sym);
     Symbol resolveAlias(Symbol sym);
     Symbol resolveVar(Symbol sym);
-  }
+}
 
-  static boolean isWhitespace(int ch) {
-    return ch < 128 ? (ch >= 0 && WS[ch]) : Character.isWhitespace(ch);
-  }
+static boolean isWhitespace(int ch){
+	return Character.isWhitespace(ch) || ch == ',';
+}
 
-  static void unread(PushbackReader r, int ch) {
-    if (ch != -1)
-      try {
-        r.unread(ch);
-      } catch (IOException e) {
-        throw Util.sneakyThrow(e);
-      }
-  }
+static void unread(PushbackReader r, int ch) {
+	if(ch != -1)
+		try
+			{
+			r.unread(ch);
+			}
+		catch(IOException e)
+			{
+			throw Util.sneakyThrow(e);
+			}
+}
 
-  public static class ReaderException extends RuntimeException implements IExceptionInfo {
-    public final int line;
-    public final int column;
-    public final Object data;
+public static class ReaderException extends RuntimeException implements IExceptionInfo{
+	public final int line;
+	public final int column;
+	public final Object data;
 
     final static public String ERR_NS = "clojure.error";
-    final static public Keyword ERR_LINE = Keyword.intern(ERR_NS, "line");
-    final static public Keyword ERR_COLUMN = Keyword.intern(ERR_NS, "column");
+	final static public Keyword ERR_LINE = Keyword.intern(ERR_NS, "line");
+	final static public Keyword ERR_COLUMN = Keyword.intern(ERR_NS, "column");
 
-    public ReaderException(int line, int column, Throwable cause) {
-      super(cause);
-      this.line = line;
-      this.column = column;
-      this.data = RT.map(ERR_LINE, line, ERR_COLUMN, column);
-    }
+	public ReaderException(int line, int column, Throwable cause){
+		super(cause);
+		this.line = line;
+		this.column = column;
+		this.data = RT.map(ERR_LINE, line, ERR_COLUMN, column);
+	}
 
-    public IPersistentMap getData() {
-      return (IPersistentMap) data;
-    }
-  }
+	public IPersistentMap getData(){
+		return (IPersistentMap)data;
+	}
+}
 
-  static public int read1(java.io.Reader r) {
-    try {
-      return r.read();
-    } catch (IOException e) {
-      throw Util.sneakyThrow(e);
-    }
-  }
+static public int read1(Reader r){
+	try
+		{
+		return r.read();
+		}
+	catch(IOException e)
+		{
+		throw Util.sneakyThrow(e);
+		}
+}
 
-  // Reader opts
-  static public final Keyword OPT_EOF = Keyword.intern(null, "eof");
-  static public final Keyword OPT_FEATURES = Keyword.intern(null, "features");
-  static public final Keyword OPT_READ_COND = Keyword.intern(null, "read-cond");
+// Reader opts
+static public final Keyword OPT_EOF = Keyword.intern(null,"eof");
+static public final Keyword OPT_FEATURES = Keyword.intern(null,"features");
+static public final Keyword OPT_READ_COND = Keyword.intern(null, "read-cond");
 
-  // EOF special value to throw on eof
-  static public final Keyword EOFTHROW = Keyword.intern(null, "eofthrow");
+// EOF special value to throw on eof
+static public final Keyword EOFTHROW = Keyword.intern(null,"eofthrow");
 
-  // Reader conditional options - use with :read-cond
-  static public final Keyword COND_ALLOW = Keyword.intern(null, "allow");
-  static public final Keyword COND_PRESERVE = Keyword.intern(null, "preserve");
+// Platform features - always installed
+static private final Keyword PLATFORM_KEY = Keyword.intern(null, "clj");
+static private final Object PLATFORM_FEATURES = PersistentHashSet.create(PLATFORM_KEY);
 
-  static public Object read(PushbackReader r, Object opts) {
+// Reader conditional options - use with :read-cond
+static public final Keyword COND_ALLOW = Keyword.intern(null, "allow");
+    static public final Keyword COND_PRESERVE = Keyword.intern(null, "preserve");
+
+static public Object read(PushbackReader r, Object opts){
     boolean eofIsError = true;
     Object eofValue = null;
-    if (opts instanceof IPersistentMap) {
-      Object eof = ((IPersistentMap) opts).valAt(OPT_EOF, EOFTHROW);
-      if (!EOFTHROW.equals(eof)) {
-        eofIsError = false;
-        eofValue = eof;
-      }
-    }
-    return read(r, eofIsError, eofValue, false, opts);
-  }
-
-  static public Object read(PushbackReader r, boolean eofIsError, Object eofValue, boolean isRecursive) {
-    return read(r, eofIsError, eofValue, isRecursive, PersistentHashMap.EMPTY);
-  }
-
-  static public Object read(PushbackReader r, boolean eofIsError, Object eofValue, boolean isRecursive,
-                            Object opts) {
-    if (r instanceof LineNumberingPushbackReader) {
-      // The fast path, and the one everything that matters takes: Compiler.load, clojure.main's
-      // REPL, and RT.readReader all hand us a LineNumberingPushbackReader. We borrow its Buffer,
-      // so reading ahead is free -- there is no second cursor to fall out of step with, and it
-      // does not matter how much we buffer. The LispReader instance is cached on the reader, so
-      // its token cache survives across every form in the file.
-      LineNumberingPushbackReader lnpr = (LineNumberingPushbackReader) r;
-      LispReader lr = lnpr.lispReader();
-      try {
-        Object o = lr.readTopLevel(opts);
-        if (o == EOF) {
-          if (eofIsError)
-            throw Util.runtimeException("EOF while reading");
-          return eofValue;
-        }
-        return o;
-      } catch (Exception e) {
-        if (isRecursive)
-          throw Util.sneakyThrow(e);
-        throw new ReaderException(lnpr.getLineNumber(), lnpr.getColumnNumber(), e);
-      }
-    }
-
-    // Compat path: a PushbackReader we do not own, e.g. user code calling
-    // (read (java.io.PushbackReader. rdr)). We cannot share a Buffer with it, and the caller may
-    // well read it directly afterwards, so we must not consume past the form: read one character
-    // at a time and push whatever lookahead is left back into it. Slow, but correct, and nothing
-    // on a hot path arrives here.
-    LispReader lr = new LispReader(new SingleCharReader(r), 1);
-    try {
-      Object o = lr.readTopLevel(opts);
-      if (o == EOF) {
-        if (eofIsError)
-          throw Util.runtimeException("EOF while reading");
-        return eofValue;
-      }
-      return o;
-    } catch (Exception e) {
-      throw Util.sneakyThrow(e);
-    } finally {
-      lr.pushBackLookahead(r);
-    }
-  }
-
-  /**
-   * Feeds a foreign Reader to a Buffer one character at a time, going through {@code read()} only.
-   *
-   * <p>Necessary because a foreign reader may not implement the array read at all.
-   * {@code clojure.repl/source-fn} passes a {@code (proxy [PushbackReader] [rdr] (read [] ...))},
-   * and a Clojure proxy routes EVERY overload of {@code read} to that single fn -- so calling
-   * {@code read(char[],int,int)} on it blows up with an ArityException. The original LispReader
-   * only ever called {@code read ()}, so proxies like that worked; going through this shim keeps
-   * them working.
-   */
-  private static final class SingleCharReader extends java.io.Reader {
-    private final java.io.Reader in;
-
-    SingleCharReader(java.io.Reader in) {
-      this.in = in;
-    }
-
-    public int read(char[] cbuf, int off, int len) throws IOException {
-      if (len <= 0)
-        return 0;
-      int c = in.read();
-      if (c == -1)
-        return -1;
-      cbuf[off] = (char) c;
-      return 1;
-    }
-
-    public void close() throws IOException {
-      in.close();
-    }
-  }
-
-  // Returns any buffered-but-unconsumed characters to `r`. With chunkSize 1 this is at most the
-  // couple of characters of lookahead the scanners peeked at (a token delimiter, the character
-  // after a leading +/-).
-  private void pushBackLookahead(PushbackReader r) {
-    int n = buffer.posEnd - buffer.pos;
-    if (n <= 0)
-      return;
-    try {
-      r.unread(buffer.buffer, buffer.pos, n);
-    } catch (IOException e) {
-      throw Util.sneakyThrow(e);
-    }
-  }
-
-  /**
-   * Reads a single form from a string. Unlike the {@link PushbackReader} path this owns its input,
-   * so it reads in full chunks.
-   */
-  static public Object readString(String s, Object opts) {
-    LispReader lr = new LispReader(new StringReader(s), DEFAULT_CHUNK_SIZE);
-    try {
-      Object o = lr.readTopLevel(opts);
-      if (o == EOF) {
-        boolean eofIsError = true;
-        Object eofValue = null;
-        if (opts instanceof IPersistentMap) {
-          Object eof = ((IPersistentMap) opts).valAt(OPT_EOF, EOFTHROW);
-          if (!EOFTHROW.equals(eof)) {
+    if(opts != null && opts instanceof IPersistentMap)
+    {
+        Object eof = ((IPersistentMap)opts).valAt(OPT_EOF, EOFTHROW);
+        if(!EOFTHROW.equals(eof)) {
             eofIsError = false;
             eofValue = eof;
-          }
         }
-        if (eofIsError)
-          throw Util.runtimeException("EOF while reading");
-        return eofValue;
-      }
-      return o;
-    } catch (IOException e) {
-      throw Util.sneakyThrow(e);
     }
-  }
+    return read(r,eofIsError,eofValue,false,opts);
+}
 
-  // ---- Reader core --------------------------------------------------------------------------
+static public Object read(PushbackReader r, boolean eofIsError, Object eofValue, boolean isRecursive)
+{
+    return read(r, eofIsError, eofValue, isRecursive, PersistentHashMap.EMPTY);
+}
 
-  // Reads one form. `returnOn` is the closing delimiter to stop on (0 = none): on it, consumes
-  // the delimiter and returns READ_FINISHED. Returns READ_EOF at end of input. Loops over
-  // comments and #_ discards (which produce no value), matching the original read loop.
-  private Object read0(int returnOn) throws IOException {
-    while (true) {
-      // A #?@ splice deposits its forms here; hand them back before touching the input, so they
-      // land as elements of the enclosing collection. Same as the original's read-loop head.
-      if (pendingForms != null && !pendingForms.isEmpty())
-        return pendingForms.remove(0);
-      int c1 = skipWhitespace();
-      if (c1 == -1) return READ_EOF;
-      if (returnOn != 0 && c1 == returnOn) { buffer.read(); return READ_FINISHED; }
-      if (Character.isDigit(c1)) return readNumber();
-      switch (c1) {
-        case '"':  buffer.read(); return readStringForm();
-        case '\\': buffer.read(); return readCharacterForm();
-        case '(':  buffer.read(); return readList();
-        case '[':  buffer.read(); return readVector();
-        case '{':  buffer.read(); return readMap();
-        case ')': case ']': case '}':
-          throw Util.runtimeException("Unmatched delimiter: " + (char) c1);
-        case ';':  buffer.read(); skipLine(); continue;         // line comment
-        case '#':  { Object o = readDispatch(); if (o == SKIP) continue; return o; }
-        case '\'': buffer.read(); return RT.list(QUOTE, readForm());              // 'x
-        case '@':  buffer.read(); return RT.list(DEREF, readForm());             // @x
-        case '~':  buffer.read(); return readUnquote();                          // ~x / ~@x
-        case '^':  buffer.read(); return readMeta();                             // ^meta form
-        case '%':  return argEnv != null ? readArg() : readToken();              // %/%n/%& in #(), else symbol
-        case '`':  buffer.read(); return readSyntaxQuote();                      // `form
-        default:   break;
-      }
-      // Every macro character has an explicit case above, so anything reaching here is a token.
-      if ((c1 == '+' || c1 == '-') && Character.isDigit(peekAt(1))) return readNumber();
-      return readToken();   // symbols, keywords, nil / true / false
-    }
-  }
+static public Object read(PushbackReader r, boolean eofIsError, Object eofValue, boolean isRecursive, Object opts)
+{
+	// start with pendingForms null as reader conditional splicing is not allowed at top level
+	return read(r, eofIsError, eofValue, null, null, isRecursive, opts, null, (Resolver) RT.READER_RESOLVER.deref());
+}
 
-  // Reads forms until the closing `delim`, collecting them. Port of readDelimitedList.
-  private ArrayList<Object> readDelimitedList(int delim) throws IOException {
-    int firstline = lineNumber();     // for the "EOF while reading, starting at line N" message
-    java.util.LinkedList<Object> savedPending = enterPending();
-    try {
-      ArrayList<Object> acc = new ArrayList<>();
-      while (true) {
-        Object form = read0(delim);
-        if (form == READ_EOF) {
-          if (firstline < 0) throw Util.runtimeException("EOF while reading");
-          throw Util.runtimeException("EOF while reading, starting at line " + firstline);
-        }
-        if (form == READ_FINISHED) return acc;
-        acc.add(form);
-      }
-    } finally {
-      pendingForms = savedPending;
-    }
-  }
+static private Object read(PushbackReader r, boolean eofIsError, Object eofValue, boolean isRecursive, Object opts, Object pendingForms) {
+	return read(r, eofIsError, eofValue, null, null, isRecursive, opts, ensurePending(pendingForms), (Resolver) RT.READER_RESOLVER.deref());
+}
 
-  // Source position of the reader, or -1 when the input is not line-tracked (only a
-  // LineNumberingPushbackReader's Buffer counts lines, matching the original, which attached
-  // source metadata only when reading from one). 1-based line, 1-based column, as the original's
-  // getLineNumber() / getColumnNumber()-1 pair produced.
-  private int lineNumber() {
-    return buffer.countsLines() ? buffer.getLine() + 1 : -1;
-  }
+static private Object ensurePending(Object pendingForms) {
+	if(pendingForms == null)
+		return new LinkedList();
+	else
+		return pendingForms;
+}
 
-  private int columnNumber() {
-    return buffer.countsLines() ? buffer.getColumn() : -1;
-  }
-
-  private Object readList() throws IOException {
-    // The '(' has been consumed, so this is its position -- same as the original, which read
-    // getLineNumber() / getColumnNumber()-1 at the top of ListReader.
-    int line = lineNumber();
-    int column = columnNumber();
-    ArrayList<Object> a = readDelimitedList(')');
-    if (a.isEmpty()) return PersistentList.EMPTY;
-    IObj s = (IObj) PersistentList.create(a);
-    if (line < 0) return s;
-    // PersistentList.create returns a fresh list with no meta, so the defensive
-    // RT.meta/RT.get/RT.assoc dance the original does would only ever scan an empty map and
-    // rebuild it key by key. Build the {:line :column} map directly instead.
-    return s.withMeta(new PersistentArrayMap(
-        new Object[]{RT.LINE_KEY, line, RT.COLUMN_KEY, column}));
-  }
-
-  private Object readVector() throws IOException {
-    return LazilyPersistentVector.create(readDelimitedList(']'));
-  }
-
-  private Object readMap() throws IOException {
-    Object[] a = readDelimitedList('}').toArray();
-    if ((a.length & 1) == 1)
-      throw Util.runtimeException("Map literal must contain an even number of forms");
-    return RT.map(a);                       // RT.map does the duplicate-key check
-  }
-
-  private Object readSet() throws IOException {
-    return PersistentHashSet.createWithCheck(readDelimitedList('}'));
-  }
-
-  // Symbols used by the wrapping macros.
-  private static final Symbol QUOTE = Symbol.intern("quote");
-  private static final Symbol THE_VAR = Symbol.intern("var");
-  private static final Symbol DEREF = Symbol.intern("clojure.core", "deref");
-  private static final Symbol UNQUOTE = Symbol.intern("clojure.core", "unquote");
-  private static final Symbol UNQUOTE_SPLICING = Symbol.intern("clojure.core", "unquote-splicing");
-  private static final Symbol SYM_INF = Symbol.intern("Inf");
-  private static final Symbol SYM_NEG_INF = Symbol.intern("-Inf");
-  private static final Symbol SYM_NAN = Symbol.intern("NaN");
-
-  // Symbols used by #() and syntax-quote expansion.
-  private static final Symbol FN = Symbol.intern("fn*");            // Compiler.FN
-  private static final Symbol AMP = Symbol.intern("&");             // Compiler._AMP_
-  private static final Symbol APPLY = Symbol.intern("clojure.core", "apply");
-  private static final Symbol HASHMAP = Symbol.intern("clojure.core", "hash-map");
-  private static final Symbol HASHSET = Symbol.intern("clojure.core", "hash-set");
-  private static final Symbol VECTOR = Symbol.intern("clojure.core", "vector");
-  private static final Symbol SEQ = Symbol.intern("clojure.core", "seq");
-  private static final Symbol CONCAT = Symbol.intern("clojure.core", "concat");
-  private static final Symbol LIST = Symbol.intern("clojure.core", "list");
-  private static final Symbol WITH_META = Symbol.intern("clojure.core", "with-meta");
-  private static final Keyword LINE_KEY = Keyword.intern(null, "line");
-  private static final Keyword COLUMN_KEY = Keyword.intern(null, "column");
-
-  // Per-read state for #() arg literals and syntax-quote auto-gensyms; null when not inside the
-  // respective macro. These stand in for the original's ARG_ENV / GENSYM_ENV thread-local Vars;
-  // because this reader is an instance rather than a pile of statics, they can just be fields.
-  private java.util.TreeMap<Integer, Symbol> argEnv;       // #() arg map: n -> param symbol
-  private java.util.HashMap<Symbol, Symbol> gensymEnv;     // syntax-quote foo# -> gensym
-
-  // Reads a required form (end of input is an error), as the reader macros do. Establishes a
-  // pending context: every reader macro in the original reads its sub-form with ensurePending,
-  // so a #?@ directly under one (e.g. under quote) is not "at the top level".
-  private Object readForm() throws IOException {
-    java.util.LinkedList<Object> savedPending = enterPending();
-    try {
-      Object o = read0(0);
-      if (o == READ_EOF) throw Util.runtimeException("EOF while reading");
-      return o;
-    } finally {
-      pendingForms = savedPending;
-    }
-  }
-
-  // Marks the start of a nested read: pendingForms becomes non-null (so a #?@ seen here knows it
-  // is not at the top level, where splicing is banned), and #?@ splices drain into it. Returns the
-  // previous value for the caller to restore. Mirrors the original calling ensurePending() on
-  // every recursive read.
-  private java.util.LinkedList<Object> enterPending() {
-    java.util.LinkedList<Object> saved = pendingForms;
-    if (pendingForms == null)
-      pendingForms = new java.util.LinkedList<>();
-    return saved;
-  }
-
-  // '~' just read: ~@form -> (unquote-splicing form), ~form -> (unquote form).
-  private Object readUnquote() throws IOException {
-    if (buffer.peek() == '@') { buffer.read(); return RT.list(UNQUOTE_SPLICING, readForm()); }
-    return RT.list(UNQUOTE, readForm());
-  }
-
-  // ---- Anonymous fn #(...) and arg literals %, %n, %& -------------------------------------
-  // The opening '(' has been consumed. Reads the body list (during which '%' literals register
-  // themselves into argEnv), then builds (fn* [args] body). Nested #() is rejected.
-
-  private Object readFn() throws IOException {
-    if (argEnv != null) throw new IllegalStateException("Nested #()s are not allowed");
-    java.util.TreeMap<Integer, Symbol> saved = argEnv;   // null
-    argEnv = new java.util.TreeMap<>();
-    try {
-      Object form = readList();                          // reads to ')', registering % args
-      PersistentVector args = PersistentVector.EMPTY;
-      if (!argEnv.isEmpty()) {
-        int higharg = argEnv.lastKey();                  // highest key (-1 sorts below positives)
-        if (higharg > 0) {
-          for (int i = 1; i <= higharg; i++) {
-            Symbol sym = argEnv.get(i);
-            if (sym == null) sym = garg(i);              // fill gaps, e.g. %2 without %1
-            args = args.cons(sym);
-          }
-        }
-        Symbol restsym = argEnv.get(-1);
-        if (restsym != null) { args = args.cons(AMP); args = args.cons(restsym); }
-      }
-      return RT.list(FN, args, form);
-    } finally {
-      argEnv = saved;
-    }
-  }
-
-  // A generated arg/param symbol, e.g. p1__42# or rest__43#.
-  private static Symbol garg(int n) {
-    return Symbol.intern(null, (n == -1 ? "rest" : ("p" + n)) + "__" + RT.nextID() + "#");
-  }
-
-  private Symbol registerArg(int n) {
-    Symbol ret = argEnv.get(n);
-    if (ret == null) { ret = garg(n); argEnv.put(n, ret); }
-    return ret;
-  }
-
-  // '%' seen inside a #(); argEnv is non-null. Reads the token and interprets the arg literal.
-  private Object readArg() throws IOException {
-    // Scan the %-token and interpret it inline - no regex Matcher, no String. The grammar is
-    // just %, %&, or %[1-9][0-9]* (the original's argPat), and arg literals can appear many times
-    // in an arg-heavy #(), so this stays on the fast char[] path like the other token scanners.
-    Buffer b = buffer;
-    b.startNewToken();
-    int p = b.pos;
-    char[] a = b.buffer;
-    while (true) {
-      char c = a[p];
-      if (c == Buffer.SENTINEL && p == b.posEnd) {
-        b.pos = p;
-        if (!b.refill()) { a = b.buffer; p = b.posEnd; break; }
-        a = b.buffer; p = b.pos; continue;
-      }
-      if (isWhitespace(c) || isTerminatingMacro(c)) break;
-      p++;
-    }
-    int start = b.getTokenStart();
-    int len = p - start;
-    b.pos = p;
-    if (len == 1) return registerArg(1);                               // %
-    if (len == 2 && a[start + 1] == '&') return registerArg(-1);       // %&
-    char c1 = a[start + 1];
-    if (c1 >= '1' && c1 <= '9') {                                      // %[1-9][0-9]*
-      long n = c1 - '0';
-      boolean digits = true;
-      for (int i = start + 2; i < p; i++) {
-        char d = a[i];
-        if (d < '0' || d > '9') { digits = false; break; }
-        n = n * 10 + (d - '0');
-        if (n > Integer.MAX_VALUE)   // match Integer.parseInt's overflow (both throw)
-          throw new NumberFormatException("For input string: \"" + new String(a, start + 1, len - 1) + "\"");
-      }
-      if (digits) return registerArg((int) n);
-    }
-    throw new IllegalStateException("arg literal must be %, %& or %integer");
-  }
-
-  // ---- Syntax-quote `form ------------------------------------------------------------------
-  // A fresh auto-gensym map is scoped to each backquote, so nested `...` get independent foo#
-  // gensyms. Symbol resolution matches Clojure exactly by calling Compiler.isSpecial /
-  // Compiler.resolveSymbol directly (both package-private, and we are in clojure.lang).
-  private Object readSyntaxQuote() throws IOException {
-    java.util.HashMap<Symbol, Symbol> saved = gensymEnv;
-    gensymEnv = new java.util.HashMap<>();
-    try {
-      return syntaxQuote(readForm());
-    } finally {
-      gensymEnv = saved;
-    }
-  }
-
-  private Object syntaxQuote(Object form) {
-    Object ret;
-    if (Compiler.isSpecial(form)) {
-      ret = RT.list(QUOTE, form);
-    } else if (form instanceof Symbol) {
-      Symbol sym = (Symbol) form;
-      if (sym.getNamespace() == null && sym.getName().endsWith("#")) {
-        // auto-gensym: foo# -> foo__N__auto__, stable within this syntax-quote
-        if (gensymEnv == null) throw new IllegalStateException("Gensym literal not in syntax-quote");
-        Symbol gs = gensymEnv.get(sym);
-        if (gs == null) {
-          gs = Symbol.intern(null, sym.getName().substring(0, sym.getName().length() - 1)
-              + "__" + RT.nextID() + "__auto__");
-          gensymEnv.put(sym, gs);
-        }
-        sym = gs;
-      } else if (sym.getNamespace() == null && sym.getName().endsWith(".")) {
-        Symbol csym = Symbol.intern(null, sym.getName().substring(0, sym.getName().length() - 1));
-        if (resolver != null) {
-          Symbol rc = resolver.resolveClass(csym);
-          if (rc != null) csym = rc;
-        } else {
-          csym = Compiler.resolveSymbol(csym);
-        }
-        sym = Symbol.intern(null, csym.getName().concat("."));
-      } else if (sym.getNamespace() == null && sym.getName().startsWith(".")) {
-        // instance method name: leave as-is (quoted below)
-      } else if (resolver != null) {
-        // A bound *reader-resolver* resolves classes / aliases / vars itself.
-        Symbol nsym = null;
-        if (sym.getNamespace() != null) {
-          Symbol alias = Symbol.intern(null, sym.getNamespace());
-          nsym = resolver.resolveClass(alias);
-          if (nsym == null) nsym = resolver.resolveAlias(alias);
-        }
-        if (nsym != null) {
-          sym = Symbol.intern(nsym.getName(), sym.getName());   // Classname/foo -> pkg.Classname/foo
-        } else if (sym.getNamespace() == null) {
-          Symbol rsym = resolver.resolveClass(sym);
-          if (rsym == null) rsym = resolver.resolveVar(sym);
-          if (rsym != null) sym = rsym;
-          else sym = Symbol.intern(resolver.currentNS().getName(), sym.getName());
-        }
-        // already-qualified and unresolved: leave alone
-      } else {
-        Object maybeClass = null;
-        if (sym.getNamespace() != null)
-          maybeClass = currentNS().getMapping(Symbol.intern(null, sym.getNamespace()));
-        if (maybeClass instanceof Class)
-          sym = Symbol.intern(((Class) maybeClass).getName(), sym.getName());
+static private Object installPlatformFeature(Object opts) {
+    if(opts == null)
+        return RT.mapUniqueKeys(LispReader.OPT_FEATURES, PLATFORM_FEATURES);
+    else {
+        IPersistentMap mopts = (IPersistentMap) opts;
+        Object features = mopts.valAt(OPT_FEATURES);
+        if (features == null)
+            return mopts.assoc(LispReader.OPT_FEATURES, PLATFORM_FEATURES);
         else
-          sym = Compiler.resolveSymbol(sym);
-      }
-      ret = RT.list(QUOTE, sym);
-    } else if (isUnquote(form)) {
-      return RT.second(form);
-    } else if (isUnquoteSplicing(form)) {
-      throw new IllegalStateException("splice not in list");
-    } else if (form instanceof IPersistentCollection) {
-      if (form instanceof IRecord) {
-        ret = form;
-      } else if (form instanceof IPersistentMap) {
-        IPersistentVector keyvals = flattenMap(form);
-        ret = RT.list(APPLY, HASHMAP, RT.list(SEQ, RT.cons(CONCAT, sqExpandList(keyvals.seq()))));
-      } else if (form instanceof IPersistentVector) {
-        ret = RT.list(APPLY, VECTOR, RT.list(SEQ, RT.cons(CONCAT, sqExpandList(((IPersistentVector) form).seq()))));
-      } else if (form instanceof IPersistentSet) {
-        ret = RT.list(APPLY, HASHSET, RT.list(SEQ, RT.cons(CONCAT, sqExpandList(((IPersistentSet) form).seq()))));
-      } else if (form instanceof ISeq || form instanceof IPersistentList) {
-        ISeq seq = RT.seq(form);
-        if (seq == null) ret = RT.cons(LIST, null);
-        else ret = RT.list(SEQ, RT.cons(CONCAT, sqExpandList(seq)));
-      } else {
-        throw new UnsupportedOperationException("Unknown Collection type");
-      }
-    } else if (form instanceof Keyword || form instanceof Number
-        || form instanceof Character || form instanceof String) {
-      ret = form;
-    } else {
-      ret = RT.list(QUOTE, form);
+            return mopts.assoc(LispReader.OPT_FEATURES, RT.conj((IPersistentSet) features, PLATFORM_KEY));
     }
+}
 
-    if (form instanceof IObj && RT.meta(form) != null) {
-      IPersistentMap newMeta = ((IObj) form).meta().without(LINE_KEY).without(COLUMN_KEY);
-      if (newMeta.count() > 0)
-        return RT.list(WITH_META, ret, syntaxQuote(((IObj) form).meta()));
+static private Object read(PushbackReader r, boolean eofIsError, Object eofValue, Character returnOn,
+                           Object returnOnValue, boolean isRecursive, Object opts, Object pendingForms,
+                           Resolver resolver)
+{
+    if(RT.READEVAL.deref() == UNKNOWN)
+        throw Util.runtimeException("Reading disallowed - *read-eval* bound to :unknown");
+
+    opts = installPlatformFeature(opts);
+
+	try
+		{
+		for(; ;)
+			{
+
+			if(pendingForms instanceof List && !((List)pendingForms).isEmpty())
+				return ((List)pendingForms).remove(0);
+
+			int ch = read1(r);
+
+			while(isWhitespace(ch))
+				ch = read1(r);
+
+			if(ch == -1)
+				{
+				if(eofIsError)
+					throw Util.runtimeException("EOF while reading");
+				return eofValue;
+				}
+
+			if(returnOn != null && (returnOn.charValue() == ch)) {
+				return returnOnValue;
+			}
+
+			if(Character.isDigit(ch))
+				{
+				Object n = readNumber(r, (char) ch);
+				return n;
+				}
+
+			IFn macroFn = getMacro(ch);
+			if(macroFn != null)
+				{
+				Object ret = macroFn.invoke(r, (char) ch, opts, pendingForms);
+				//no op macros return the reader
+				if(ret == r)
+					continue;
+				return ret;
+				}
+
+			if(ch == '+' || ch == '-')
+				{
+				int ch2 = read1(r);
+				if(Character.isDigit(ch2))
+					{
+					unread(r, ch2);
+					Object n = readNumber(r, (char) ch);
+					return n;
+					}
+				unread(r, ch2);
+				}
+
+			String token = readToken(r, (char) ch);
+			return interpretToken(token, resolver);
+			}
+		}
+	catch(Exception e)
+		{
+		if(isRecursive || !(r instanceof LineNumberingPushbackReader))
+			throw Util.sneakyThrow(e);
+		LineNumberingPushbackReader rdr = (LineNumberingPushbackReader) r;
+		//throw Util.runtimeException(String.format("ReaderError:(%d,1) %s", rdr.getLineNumber(), e.getMessage()), e);
+		throw new ReaderException(rdr.getLineNumber(), rdr.getColumnNumber(), e);
+		}
+}
+
+static private String readToken(PushbackReader r, char initch) {
+	StringBuilder sb = new StringBuilder();
+	sb.append(initch);
+
+	for(; ;)
+		{
+		int ch = read1(r);
+		if(ch == -1 || isWhitespace(ch) || isTerminatingMacro(ch))
+			{
+			unread(r, ch);
+			return sb.toString();
+			}
+		sb.append((char) ch);
+		}
+}
+
+static private Object readNumber(PushbackReader r, char initch) {
+	StringBuilder sb = new StringBuilder();
+	sb.append(initch);
+
+	for(; ;)
+		{
+		int ch = read1(r);
+		if(ch == -1 || isWhitespace(ch) || isMacro(ch))
+			{
+			unread(r, ch);
+			break;
+			}
+		sb.append((char) ch);
+		}
+
+	String s = sb.toString();
+	Object n = matchNumber(s);
+	if(n == null)
+		throw new NumberFormatException("Invalid number: " + s);
+	return n;
+}
+
+static private int readUnicodeChar(String token, int offset, int length, int base) {
+	if(token.length() != offset + length)
+		throw new IllegalArgumentException("Invalid unicode character: \\" + token);
+	int uc = 0;
+	for(int i = offset; i < offset + length; ++i)
+		{
+		int d = Character.digit(token.charAt(i), base);
+		if(d == -1)
+			throw new IllegalArgumentException("Invalid digit: " + token.charAt(i));
+		uc = uc * base + d;
+		}
+	return (char) uc;
+}
+
+static private int readUnicodeChar(PushbackReader r, int initch, int base, int length, boolean exact) {
+	int uc = Character.digit(initch, base);
+	if(uc == -1)
+		throw new IllegalArgumentException("Invalid digit: " + (char) initch);
+	int i = 1;
+	for(; i < length; ++i)
+		{
+		int ch = read1(r);
+		if(ch == -1 || isWhitespace(ch) || isMacro(ch))
+			{
+			unread(r, ch);
+			break;
+			}
+		int d = Character.digit(ch, base);
+		if(d == -1)
+			throw new IllegalArgumentException("Invalid digit: " + (char) ch);
+		uc = uc * base + d;
+		}
+	if(i != length && exact)
+		throw new IllegalArgumentException("Invalid character length: " + i + ", should be: " + length);
+	return uc;
+}
+
+static private Object interpretToken(String s, Resolver resolver) {
+	if(s.equals("nil"))
+		{
+		return null;
+		}
+	else if(s.equals("true"))
+		{
+		return RT.T;
+		}
+	else if(s.equals("false"))
+		{
+		return RT.F;
+		}
+	Object ret = null;
+
+	ret = matchSymbol(s, resolver);
+	if(ret != null)
+		return ret;
+
+	throw Util.runtimeException("Invalid token: " + s);
+}
+
+
+private static Object matchSymbol(String s, Resolver resolver){
+	Matcher m = symbolPat.matcher(s);
+	if(m.matches())
+		{
+		int gc = m.groupCount();
+		String ns = m.group(1);
+		String name = m.group(2);
+		if(ns != null && ns.endsWith(":/")
+		   || name.endsWith(":")
+		   || s.indexOf("::", 1) != -1)
+			return null;
+		if(s.startsWith("::"))
+			{
+			Symbol ks = Symbol.intern(s.substring(2));
+            if(resolver != null)
+                {
+                Symbol nsym;
+                if(ks.ns != null)
+                    nsym = resolver.resolveAlias(Symbol.intern(ks.ns));
+                else
+                    nsym = resolver.currentNS();
+                //auto-resolving keyword
+                if(nsym != null)
+                    return Keyword.intern(nsym.name, ks.name);
+                else
+                    return null;
+                }
+            else
+                {
+                Namespace kns;
+                if(ks.ns != null)
+                    kns = Compiler.currentNS().lookupAlias(Symbol.intern(ks.ns));
+                else
+                    kns = Compiler.currentNS();
+                //auto-resolving keyword
+                if(kns != null)
+                    return Keyword.intern(kns.name.name, ks.name);
+                else
+                    return null;
+                }
+            }
+		boolean isKeyword = s.charAt(0) == ':';
+		Symbol sym = Symbol.intern(s.substring(isKeyword ? 1 : 0));
+		if(isKeyword)
+			return Keyword.intern(sym);
+		return sym;
+		}
+	else
+		{
+		Matcher am = arraySymbolPat.matcher(s);
+		if(am.matches())
+			return Symbol.intern(am.group(1), am.group(2));
+		}
+	return null;
+}
+
+
+private static Object matchNumber(String s){
+	Matcher m = intPat.matcher(s);
+	if(m.matches())
+		{
+		if(m.group(2) != null)
+			{
+			if(m.group(8) != null)
+				return BigInt.ZERO;
+			return Numbers.num(0);
+			}
+		boolean negate = (m.group(1).equals("-"));
+		String n;
+		int radix = 10;
+		if((n = m.group(3)) != null)
+			radix = 10;
+		else if((n = m.group(4)) != null)
+			radix = 16;
+		else if((n = m.group(5)) != null)
+			radix = 8;
+		else if((n = m.group(7)) != null)
+			radix = Integer.parseInt(m.group(6));
+		if(n == null)
+			return null;
+		BigInteger bn = new BigInteger(n, radix);
+		if(negate)
+			bn = bn.negate();
+		if(m.group(8) != null)
+			return BigInt.fromBigInteger(bn);
+		return bn.bitLength() < 64 ?
+		       Numbers.num(bn.longValue())
+		                           : BigInt.fromBigInteger(bn);
+		}
+	m = floatPat.matcher(s);
+	if(m.matches())
+		{
+		if(m.group(4) != null)
+			return new BigDecimal(m.group(1));
+		return Double.parseDouble(s);
+		}
+	m = ratioPat.matcher(s);
+	if(m.matches())
+		{
+		String numerator = m.group(1);
+		if (numerator.startsWith("+")) numerator = numerator.substring(1);
+
+		return Numbers.divide(Numbers.reduceBigInt(BigInt.fromBigInteger(new BigInteger(numerator))),
+		                      Numbers.reduceBigInt(BigInt.fromBigInteger(new BigInteger(m.group(2)))));
+		}
+	return null;
+}
+
+static private IFn getMacro(int ch){
+	if(ch < macros.length)
+		return macros[ch];
+	return null;
+}
+
+static private boolean isMacro(int ch){
+	return (ch < macros.length && macros[ch] != null);
+}
+
+static private boolean isTerminatingMacro(int ch){
+	return (ch != '#' && ch != '\'' && ch != '%' && isMacro(ch));
+}
+
+public static class RegexReader extends AFn{
+	static StringReader stringrdr = new StringReader();
+
+	public Object invoke(Object reader, Object doublequote, Object opts, Object pendingForms) {
+		StringBuilder sb = new StringBuilder();
+		Reader r = (Reader) reader;
+		for(int ch = read1(r); ch != '"'; ch = read1(r))
+			{
+			if(ch == -1)
+				throw Util.runtimeException("EOF while reading regex");
+			sb.append( (char) ch );
+			if(ch == '\\')	//escape
+				{
+				ch = read1(r);
+				if(ch == -1)
+					throw Util.runtimeException("EOF while reading regex");
+				sb.append( (char) ch ) ;
+				}
+			}
+		return Pattern.compile(sb.toString());
+	}
+}
+
+public static class StringReader extends AFn{
+	public Object invoke(Object reader, Object doublequote, Object opts, Object pendingForms) {
+		StringBuilder sb = new StringBuilder();
+		Reader r = (Reader) reader;
+
+		for(int ch = read1(r); ch != '"'; ch = read1(r))
+			{
+			if(ch == -1)
+				throw Util.runtimeException("EOF while reading string");
+			if(ch == '\\')	//escape
+				{
+				ch = read1(r);
+				if(ch == -1)
+					throw Util.runtimeException("EOF while reading string");
+				switch(ch)
+					{
+					case 't':
+						ch = '\t';
+						break;
+					case 'r':
+						ch = '\r';
+						break;
+					case 'n':
+						ch = '\n';
+						break;
+					case '\\':
+						break;
+					case '"':
+						break;
+					case 'b':
+						ch = '\b';
+						break;
+					case 'f':
+						ch = '\f';
+						break;
+					case 'u':
+					{
+					ch = read1(r);
+					if (Character.digit(ch, 16) == -1)
+						throw Util.runtimeException("Invalid unicode escape: \\u" + (char) ch);
+					ch = readUnicodeChar((PushbackReader) r, ch, 16, 4, true);
+					break;
+					}
+					default:
+					{
+					if(Character.isDigit(ch))
+						{
+						ch = readUnicodeChar((PushbackReader) r, ch, 8, 3, false);
+						if(ch > 0377)
+							throw Util.runtimeException("Octal escape sequence must be in range [0, 377].");
+						}
+					else
+						throw Util.runtimeException("Unsupported escape character: \\" + (char) ch);
+					}
+					}
+				}
+			sb.append((char) ch);
+			}
+		return sb.toString();
+	}
+}
+
+public static class CommentReader extends AFn{
+	public Object invoke(Object reader, Object semicolon, Object opts, Object pendingForms) {
+		Reader r = (Reader) reader;
+		int ch;
+		do
+			{
+			ch = read1(r);
+			} while(ch != -1 && ch != '\n' && ch != '\r');
+		return r;
+	}
+
+}
+
+public static class DiscardReader extends AFn{
+	public Object invoke(Object reader, Object underscore, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		read(r, true, null, true, opts, ensurePending(pendingForms));
+		return r;
+	}
+}
+
+// :a.b{:c 1} => {:a.b/c 1}
+// ::{:c 1}   => {:a.b/c 1}  (where *ns* = a.b)
+// ::a{:c 1}  => {:a.b/c 1}  (where a is aliased to a.b)
+public static class NamespaceMapReader extends AFn{
+	public Object invoke(Object reader, Object colon, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+
+		boolean auto = false;
+		int autoChar = read1(r);
+		if(autoChar == ':')
+			auto = true;
+		else
+		    unread(r, autoChar);
+
+		Object sym = null;
+		int nextChar = read1(r);
+		if(isWhitespace(nextChar)) {  // the #:: { } case or an error
+			if(auto) {
+				while (isWhitespace(nextChar))
+					nextChar = read1(r);
+				if(nextChar != '{') {
+					unread(r, nextChar);
+					throw Util.runtimeException("Namespaced map must specify a namespace");
+				}
+			} else {
+				unread(r, nextChar);
+				throw Util.runtimeException("Namespaced map must specify a namespace");
+			}
+		} else if(nextChar != '{') {  // #:foo { } or #::foo { }
+			unread(r, nextChar);
+			sym = read(r, true, null, false, opts, pendingForms);
+			nextChar = read1(r);
+			while(isWhitespace(nextChar))
+				nextChar = read1(r);
+		}
+		if(nextChar != '{')
+			throw Util.runtimeException("Namespaced map must specify a map");
+
+		// Resolve autoresolved ns
+		String ns;
+		if (auto) {
+            Resolver resolver = (Resolver) RT.READER_RESOLVER.deref();
+			if (sym == null) {
+                if(resolver != null)
+                    ns = resolver.currentNS().name;
+                else
+				    ns = Compiler.currentNS().getName().getName();
+			} else if (!(sym instanceof Symbol) || ((Symbol)sym).getNamespace() != null) {
+				throw Util.runtimeException("Namespaced map must specify a valid namespace: " + sym);
+			} else {
+				Symbol resolvedNS;
+				if (resolver != null)
+                    resolvedNS = resolver.resolveAlias((Symbol) sym);
+				else{
+                    Namespace rns = Compiler.currentNS().lookupAlias((Symbol)sym);
+                    resolvedNS = rns != null?rns.getName():null;
+                }
+
+				if(resolvedNS == null) {
+					throw Util.runtimeException("Unknown auto-resolved namespace alias: " + sym);
+				} else {
+					ns = resolvedNS.getName();
+				}
+			}
+		} else if (!(sym instanceof Symbol) || ((Symbol)sym).getNamespace() != null) {
+			throw Util.runtimeException("Namespaced map must specify a valid namespace: " + sym);
+		} else {
+			ns = ((Symbol)sym).getName();
+		}
+
+		// Read map
+		List kvs = readDelimitedList('}', r, true, opts, ensurePending(pendingForms));
+		if((kvs.size() & 1) == 1)
+			throw Util.runtimeException("Namespaced map literal must contain an even number of forms");
+
+		// Construct output map
+		Object[] a = new Object[kvs.size()];
+		Iterator iter = kvs.iterator();
+		for(int i = 0; iter.hasNext(); i += 2) {
+			Object key = iter.next();
+			Object val = iter.next();
+
+			if(key instanceof Keyword) {
+				Keyword kw = (Keyword) key;
+				if (kw.getNamespace() == null) {
+					key = Keyword.intern(ns, kw.getName());
+				} else if (kw.getNamespace().equals("_")) {
+					key = Keyword.intern(null, kw.getName());
+				}
+			} else if(key instanceof Symbol) {
+				Symbol s = (Symbol) key;
+				if (s.getNamespace() == null) {
+					key = Symbol.intern(ns, s.getName());
+				} else if (s.getNamespace().equals("_")) {
+					key = Symbol.intern(null, s.getName());
+				}
+			}
+			a[i] = key;
+			a[i+1] = val;
+		}
+		return RT.map(a);
+	}
+}
+
+
+public static class SymbolicValueReader extends AFn{
+
+    static IPersistentMap  specials = PersistentHashMap.create(Symbol.intern("Inf"), Double.POSITIVE_INFINITY,
+                                                               Symbol.intern("-Inf"), Double.NEGATIVE_INFINITY,
+                                                               Symbol.intern("NaN"), Double.NaN);
+
+	public Object invoke(Object reader, Object quote, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		Object o = read(r, true, null, true, opts, ensurePending(pendingForms));
+
+		if (!(o instanceof Symbol))
+			throw Util.runtimeException("Invalid token: ##" + o);
+		if (!(specials.containsKey(o)))
+			throw Util.runtimeException("Unknown symbolic value: ##" + o);
+
+		return specials.valAt(o);
+	}
+}
+
+public static class WrappingReader extends AFn{
+	final Symbol sym;
+
+	public WrappingReader(Symbol sym){
+		this.sym = sym;
+	}
+
+	public Object invoke(Object reader, Object quote, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		Object o = read(r, true, null, true, opts, ensurePending(pendingForms));
+		return RT.list(sym, o);
+	}
+
+}
+
+public static class DeprecatedWrappingReader extends AFn{
+	final Symbol sym;
+	final String macro;
+
+	public DeprecatedWrappingReader(Symbol sym, String macro){
+		this.sym = sym;
+		this.macro = macro;
+	}
+
+	public Object invoke(Object reader, Object quote, Object opts, Object pendingForms) {
+		System.out.println("WARNING: reader macro " + macro +
+		                   " is deprecated; use " + sym.getName() +
+		                   " instead");
+		PushbackReader r = (PushbackReader) reader;
+		Object o = read(r, true, null, true, opts, ensurePending(pendingForms));
+		return RT.list(sym, o);
+	}
+
+}
+
+public static class VarReader extends AFn{
+	public Object invoke(Object reader, Object quote, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		Object o = read(r, true, null, true, opts, ensurePending(pendingForms));
+//		if(o instanceof Symbol)
+//			{
+//			Object v = Compiler.maybeResolveIn(Compiler.currentNS(), (Symbol) o);
+//			if(v instanceof Var)
+//				return v;
+//			}
+		return RT.list(THE_VAR, o);
+	}
+}
+
+/*
+static class DerefReader extends AFn{
+
+	public Object invoke(Object reader, Object quote) {
+		PushbackReader r = (PushbackReader) reader;
+		int ch = read1(r);
+		if(ch == -1)
+			throw Util.runtimeException("EOF while reading character");
+		if(ch == '!')
+			{
+			Object o = read(r, true, null, true);
+			return RT.list(DEREF_BANG, o);
+			}
+		else
+			{
+			r.unread(ch);
+			Object o = read(r, true, null, true);
+			return RT.list(DEREF, o);
+			}
+	}
+
+}
+*/
+
+public static class DispatchReader extends AFn{
+	public Object invoke(Object reader, Object hash, Object opts, Object pendingForms) {
+		int ch = read1((Reader) reader);
+		if(ch == -1)
+			throw Util.runtimeException("EOF while reading character");
+		IFn fn = dispatchMacros[ch];
+
+		// Try the ctor reader first
+		if(fn == null) {
+		unread((PushbackReader) reader, ch);
+		pendingForms = ensurePending(pendingForms);
+		Object result = ctorReader.invoke(reader, ch, opts, pendingForms);
+
+		if(result != null)
+			return result;
+		else
+			throw Util.runtimeException(String.format("No dispatch macro for: %c", (char) ch));
+		}
+		return fn.invoke(reader, ch, opts, pendingForms);
+	}
+}
+
+static Symbol garg(int n){
+	return Symbol.intern(null, (n == -1 ? "rest" : ("p" + n)) + "__" + RT.nextID() + "#");
+}
+
+public static class FnReader extends AFn{
+	public Object invoke(Object reader, Object lparen, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		if(ARG_ENV.deref() != null)
+			throw new IllegalStateException("Nested #()s are not allowed");
+		try
+			{
+			Var.pushThreadBindings(
+					RT.map(ARG_ENV, PersistentTreeMap.EMPTY));
+			unread(r, '(');
+			Object form = read(r, true, null, true, opts, ensurePending(pendingForms));
+
+			PersistentVector args = PersistentVector.EMPTY;
+			PersistentTreeMap argsyms = (PersistentTreeMap) ARG_ENV.deref();
+			ISeq rargs = argsyms.rseq();
+			if(rargs != null)
+				{
+				int higharg = (Integer) ((Map.Entry) rargs.first()).getKey();
+				if(higharg > 0)
+					{
+					for(int i = 1; i <= higharg; ++i)
+						{
+						Object sym = argsyms.valAt(i);
+						if(sym == null)
+							sym = garg(i);
+						args = args.cons(sym);
+						}
+					}
+				Object restsym = argsyms.valAt(-1);
+				if(restsym != null)
+					{
+					args = args.cons(Compiler._AMP_);
+					args = args.cons(restsym);
+					}
+				}
+			return RT.list(Compiler.FN, args, form);
+			}
+		finally
+			{
+			Var.popThreadBindings();
+			}
+	}
+}
+
+static Symbol registerArg(int n){
+	PersistentTreeMap argsyms = (PersistentTreeMap) ARG_ENV.deref();
+	if(argsyms == null)
+		{
+		throw new IllegalStateException("arg literal not in #()");
+		}
+	Symbol ret = (Symbol) argsyms.valAt(n);
+	if(ret == null)
+		{
+		ret = garg(n);
+		ARG_ENV.set(argsyms.assoc(n, ret));
+		}
+	return ret;
+}
+
+static class ArgReader extends AFn{
+	public Object invoke(Object reader, Object pct, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		String token = readToken(r, '%');
+		if(ARG_ENV.deref() == null)
+			return interpretToken(token, null);
+
+		Matcher m = argPat.matcher(token);
+		if (!m.matches())
+			throw new IllegalStateException("arg literal must be %, %& or %integer");
+		if (m.group(1) != null) // %&
+			return registerArg(-1);
+		return registerArg(m.group(2) == null ? 1 : Integer.parseInt(m.group(2)));
+	}
+}
+
+public static class MetaReader extends AFn{
+	public Object invoke(Object reader, Object caret, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		int line = -1;
+		int column = -1;
+		if(r instanceof LineNumberingPushbackReader)
+			{
+			line = ((LineNumberingPushbackReader) r).getLineNumber();
+			column = ((LineNumberingPushbackReader) r).getColumnNumber()-1;
+			}
+		pendingForms = ensurePending(pendingForms);
+		Object meta = read(r, true, null, true, opts, pendingForms);
+		if(meta instanceof Symbol || meta instanceof String)
+			meta = RT.map(RT.TAG_KEY, meta);
+		else if (meta instanceof Keyword)
+			meta = RT.map(meta, RT.T);
+		else if (meta instanceof IPersistentVector)
+			meta = RT.map(RT.PARAM_TAGS_KEY, meta);
+		else if(!(meta instanceof IPersistentMap))
+			throw new IllegalArgumentException("Metadata must be Symbol,Keyword,String,Vector or Map");
+
+		Object o = read(r, true, null, true, opts, pendingForms);
+		if(o instanceof IMeta)
+			{
+			if(line != -1 && o instanceof ISeq)
+				{
+				meta = RT.assoc(meta, RT.LINE_KEY, RT.get(meta, RT.LINE_KEY, line));
+				meta = RT.assoc(meta, RT.COLUMN_KEY, RT.get(meta,RT.COLUMN_KEY, column));
+				}
+			if(o instanceof IReference)
+				{
+				((IReference)o).resetMeta((IPersistentMap) meta);
+				return o;
+				}
+			Object ometa = RT.meta(o);
+			for(ISeq s = RT.seq(meta); s != null; s = s.next()) {
+			IMapEntry kv = (IMapEntry) s.first();
+			ometa = RT.assoc(ometa, kv.getKey(), kv.getValue());
+			}
+			return ((IObj) o).withMeta((IPersistentMap) ometa);
+			}
+		else
+			throw new IllegalArgumentException("Metadata can only be applied to IMetas");
+	}
+
+}
+
+public static class SyntaxQuoteReader extends AFn{
+	public Object invoke(Object reader, Object backquote, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		try
+			{
+			Var.pushThreadBindings(
+					RT.map(GENSYM_ENV, PersistentHashMap.EMPTY));
+
+			Object form = read(r, true, null, true, opts, ensurePending(pendingForms));
+			return syntaxQuote(form);
+			}
+		finally
+			{
+			Var.popThreadBindings();
+			}
+	}
+
+	static Object syntaxQuote(Object form) {
+		Object ret;
+		if(Compiler.isSpecial(form))
+			ret = RT.list(Compiler.QUOTE, form);
+		else if(form instanceof Symbol)
+			{
+            Resolver resolver = (Resolver) RT.READER_RESOLVER.deref();
+			Symbol sym = (Symbol) form;
+			if(sym.ns == null && sym.name.endsWith("#"))
+				{
+				IPersistentMap gmap = (IPersistentMap) GENSYM_ENV.deref();
+				if(gmap == null)
+					throw new IllegalStateException("Gensym literal not in syntax-quote");
+				Symbol gs = (Symbol) gmap.valAt(sym);
+				if(gs == null)
+					GENSYM_ENV.set(gmap.assoc(sym, gs = Symbol.intern(null,
+					                                                  sym.name.substring(0, sym.name.length() - 1)
+					                                                  + "__" + RT.nextID() + "__auto__")));
+				sym = gs;
+				}
+			else if(sym.ns == null && sym.name.endsWith("."))
+				{
+				Symbol csym = Symbol.intern(null, sym.name.substring(0, sym.name.length() - 1));
+				if(resolver != null){
+                    Symbol rc = resolver.resolveClass(csym);
+                    if(rc != null)
+                        csym = rc;
+                }
+				else
+				    csym = Compiler.resolveSymbol(csym);
+				sym = Symbol.intern(null, csym.name.concat("."));
+				}
+			else if(sym.ns == null && sym.name.startsWith("."))
+				{
+				// Simply quote method names.
+				}
+            else if(resolver != null)
+                {
+                Symbol nsym = null;
+                if(sym.ns != null){
+                    Symbol alias = Symbol.intern(null, sym.ns);
+                    nsym = resolver.resolveClass(alias);
+                    if(nsym == null)
+                        nsym = resolver.resolveAlias(alias);
+                    }
+                if(nsym != null){
+                    // Classname/foo -> package.qualified.Classname/foo
+                    sym = Symbol.intern(nsym.name, sym.name);
+                    }
+                else if(sym.ns == null){
+                    Symbol rsym = resolver.resolveClass(sym);
+                    if(rsym == null)
+                        rsym = resolver.resolveVar(sym);
+                    if(rsym != null)
+                        sym = rsym;
+                    else
+                        sym = Symbol.intern(resolver.currentNS().name,sym.name);
+                }
+                //leave alone if qualified
+                }
+			else
+				{
+				Object maybeClass = null;
+				if(sym.ns != null)
+					maybeClass = Compiler.currentNS().getMapping(
+							Symbol.intern(null, sym.ns));
+				if(maybeClass instanceof Class)
+					{
+					// Classname/foo -> package.qualified.Classname/foo
+					sym = Symbol.intern(
+							((Class)maybeClass).getName(), sym.name);
+					}
+				else
+					sym = Compiler.resolveSymbol(sym);
+				}
+			ret = RT.list(Compiler.QUOTE, sym);
+			}
+		else if(isUnquote(form))
+			return RT.second(form);
+		else if(isUnquoteSplicing(form))
+			throw new IllegalStateException("splice not in list");
+		else if(form instanceof IPersistentCollection)
+			{
+			if(form instanceof IRecord)
+				ret = form;
+			else if(form instanceof IPersistentMap)
+				{
+				IPersistentVector keyvals = flattenMap(form);
+				ret = RT.list(APPLY, HASHMAP, RT.list(SEQ, RT.cons(CONCAT, sqExpandList(keyvals.seq()))));
+				}
+			else if(form instanceof IPersistentVector)
+				{
+				ret = RT.list(APPLY, VECTOR, RT.list(SEQ, RT.cons(CONCAT, sqExpandList(((IPersistentVector) form).seq()))));
+				}
+			else if(form instanceof IPersistentSet)
+				{
+				ret = RT.list(APPLY, HASHSET, RT.list(SEQ, RT.cons(CONCAT, sqExpandList(((IPersistentSet) form).seq()))));
+				}
+			else if(form instanceof ISeq || form instanceof IPersistentList)
+				{
+				ISeq seq = RT.seq(form);
+				if(seq == null)
+					ret = RT.cons(LIST,null);
+				else
+					ret = RT.list(SEQ, RT.cons(CONCAT, sqExpandList(seq)));
+				}
+			else
+				throw new UnsupportedOperationException("Unknown Collection type");
+			}
+		else if(form instanceof Keyword
+		        || form instanceof Number
+		        || form instanceof Character
+		        || form instanceof String)
+			ret = form;
+		else
+			ret = RT.list(Compiler.QUOTE, form);
+
+		if(form instanceof IObj && RT.meta(form) != null)
+			{
+			//filter line and column numbers
+			IPersistentMap newMeta = ((IObj) form).meta().without(RT.LINE_KEY).without(RT.COLUMN_KEY);
+			if(newMeta.count() > 0)
+				return RT.list(WITH_META, ret, syntaxQuote(((IObj) form).meta()));
+			}
+		return ret;
+	}
+
+	private static ISeq sqExpandList(ISeq seq) {
+		PersistentVector ret = PersistentVector.EMPTY;
+		for(; seq != null; seq = seq.next())
+			{
+			Object item = seq.first();
+			if(isUnquote(item))
+				ret = ret.cons(RT.list(LIST, RT.second(item)));
+			else if(isUnquoteSplicing(item))
+				ret = ret.cons(RT.second(item));
+			else
+				ret = ret.cons(RT.list(LIST, syntaxQuote(item)));
+			}
+		return ret.seq();
+	}
+
+	private static IPersistentVector flattenMap(Object form){
+		IPersistentVector keyvals = PersistentVector.EMPTY;
+		for(ISeq s = RT.seq(form); s != null; s = s.next())
+			{
+			IMapEntry e = (IMapEntry) s.first();
+			keyvals = (IPersistentVector) keyvals.cons(e.key());
+			keyvals = (IPersistentVector) keyvals.cons(e.val());
+			}
+		return keyvals;
+	}
+
+}
+
+static boolean isUnquoteSplicing(Object form){
+	return form instanceof ISeq && Util.equals(RT.first(form),UNQUOTE_SPLICING);
+}
+
+static boolean isUnquote(Object form){
+	return form instanceof ISeq && Util.equals(RT.first(form),UNQUOTE);
+}
+
+static class UnquoteReader extends AFn{
+	public Object invoke(Object reader, Object comma, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		int ch = read1(r);
+		if(ch == -1)
+			throw Util.runtimeException("EOF while reading character");
+		pendingForms = ensurePending(pendingForms);
+		if(ch == '@')
+			{
+			Object o = read(r, true, null, true, opts, pendingForms);
+			return RT.list(UNQUOTE_SPLICING, o);
+			}
+		else
+			{
+			unread(r, ch);
+			Object o = read(r, true, null, true, opts, pendingForms);
+			return RT.list(UNQUOTE, o);
+			}
+	}
+
+}
+
+public static class CharacterReader extends AFn{
+	public Object invoke(Object reader, Object backslash, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		int ch = read1(r);
+		if(ch == -1)
+			throw Util.runtimeException("EOF while reading character");
+		String token = readToken(r, (char) ch);
+		if(token.length() == 1)
+			return Character.valueOf(token.charAt(0));
+		else if(token.equals("newline"))
+			return '\n';
+		else if(token.equals("space"))
+			return ' ';
+		else if(token.equals("tab"))
+			return '\t';
+		else if(token.equals("backspace"))
+			return '\b';
+		else if(token.equals("formfeed"))
+			return '\f';
+		else if(token.equals("return"))
+			return '\r';
+		else if(token.startsWith("u"))
+			{
+			char c = (char) readUnicodeChar(token, 1, 4, 16);
+			if(c >= '\uD800' && c <= '\uDFFF') // surrogate code unit?
+				throw Util.runtimeException("Invalid character constant: \\u" + Integer.toString(c, 16));
+			return c;
+			}
+		else if(token.startsWith("o"))
+			{
+			int len = token.length() - 1;
+			if(len > 3)
+				throw Util.runtimeException("Invalid octal escape sequence length: " + len);
+			int uc = readUnicodeChar(token, 1, len, 8);
+			if(uc > 0377)
+				throw Util.runtimeException("Octal escape sequence must be in range [0, 377].");
+			return (char) uc;
+			}
+		throw Util.runtimeException("Unsupported character: \\" + token);
+	}
+
+}
+
+public static class ListReader extends AFn{
+	public Object invoke(Object reader, Object leftparen, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		int line = -1;
+		int column = -1;
+		if(r instanceof LineNumberingPushbackReader)
+			{
+			line = ((LineNumberingPushbackReader) r).getLineNumber();
+			column = ((LineNumberingPushbackReader) r).getColumnNumber()-1;
+			}
+		List list = readDelimitedList(')', r, true, opts, ensurePending(pendingForms));
+		if(list.isEmpty())
+			return PersistentList.EMPTY;
+		IObj s = (IObj) PersistentList.create(list);
+//		IObj s = (IObj) RT.seq(list);
+		if(line != -1)
+			{
+			Object meta = RT.meta(s);
+			meta = RT.assoc(meta, RT.LINE_KEY, RT.get(meta, RT.LINE_KEY, line));
+			meta = RT.assoc(meta, RT.COLUMN_KEY, RT.get(meta,RT.COLUMN_KEY, column));
+			return s.withMeta((IPersistentMap)meta);
+			}
+		else
+			return s;
+	}
+
+}
+
+/*
+static class CtorReader extends AFn{
+	static final Symbol cls = Symbol.intern("class");
+
+	public Object invoke(Object reader, Object leftangle) {
+		PushbackReader r = (PushbackReader) reader;
+		// #<class classname>
+		// #<classname args*>
+		// #<classname/staticMethod args*>
+		List list = readDelimitedList('>', r, true);
+		if(list.isEmpty())
+			throw Util.runtimeException("Must supply 'class', classname or classname/staticMethod");
+		Symbol s = (Symbol) list.get(0);
+		Object[] args = list.subList(1, list.size()).toArray();
+		if(s.equals(cls))
+			{
+			return RT.classForName(args[0].toString());
+			}
+		else if(s.ns != null) //static method
+			{
+			String classname = s.ns;
+			String method = s.name;
+			return Reflector.invokeStaticMethod(classname, method, args);
+			}
+		else
+			{
+			return Reflector.invokeConstructor(RT.classForName(s.name), args);
+			}
+	}
+}
+*/
+
+public static class EvalReader extends AFn{
+	public Object invoke(Object reader, Object eq, Object opts, Object pendingForms) {
+		if (!RT.booleanCast(RT.READEVAL.deref()))
+			{
+			throw Util.runtimeException("EvalReader not allowed when *read-eval* is false.");
+			}
+
+		PushbackReader r = (PushbackReader) reader;
+		Object o = read(r, true, null, true, opts, ensurePending(pendingForms));
+		if(o instanceof Symbol)
+			{
+			return RT.classForName(o.toString());
+			}
+		else if(o instanceof IPersistentList)
+			{
+			Symbol fs = (Symbol) RT.first(o);
+			if(fs.equals(THE_VAR))
+				{
+				Symbol vs = (Symbol) RT.second(o);
+				return RT.var(vs.ns, vs.name);  //Compiler.resolve((Symbol) RT.second(o),true);
+				}
+			if(fs.name.endsWith("."))
+				{
+				Object[] args = RT.toArray(RT.next(o));
+				return Reflector.invokeConstructor(RT.classForName(fs.name.substring(0, fs.name.length() - 1)), args);
+				}
+			if(Compiler.namesStaticMember(fs))
+				{
+				Object[] args = RT.toArray(RT.next(o));
+				return Reflector.invokeStaticMethod(fs.ns, fs.name, args);
+				}
+			Object v = Compiler.maybeResolveIn(Compiler.currentNS(), fs);
+			if(v instanceof Var)
+				{
+				return ((IFn) v).applyTo(RT.next(o));
+				}
+			throw Util.runtimeException("Can't resolve " + fs);
+			}
+		else
+			throw new IllegalArgumentException("Unsupported #= form");
+	}
+}
+
+//static class ArgVectorReader extends AFn{
+//	public Object invoke(Object reader, Object leftparen) {
+//		PushbackReader r = (PushbackReader) reader;
+//		return ArgVector.create(readDelimitedList('|', r, true));
+//	}
+//
+//}
+
+public static class VectorReader extends AFn{
+	public Object invoke(Object reader, Object leftparen, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		return LazilyPersistentVector.create(readDelimitedList(']', r, true, opts, ensurePending(pendingForms)));
+	}
+
+}
+
+public static class MapReader extends AFn{
+	public Object invoke(Object reader, Object leftparen, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		Object[] a = readDelimitedList('}', r, true, opts, ensurePending(pendingForms)).toArray();
+		if((a.length & 1) == 1)
+			throw Util.runtimeException("Map literal must contain an even number of forms");
+		return RT.map(a);
+	}
+
+}
+
+public static class SetReader extends AFn{
+	public Object invoke(Object reader, Object leftbracket, Object opts, Object pendingForms) {
+		PushbackReader r = (PushbackReader) reader;
+		return PersistentHashSet.createWithCheck(readDelimitedList('}', r, true, opts, ensurePending(pendingForms)));
+	}
+
+}
+
+public static class UnmatchedDelimiterReader extends AFn{
+	public Object invoke(Object reader, Object rightdelim, Object opts, Object pendingForms) {
+		throw Util.runtimeException("Unmatched delimiter: " + rightdelim);
+	}
+
+}
+
+public static class UnreadableReader extends AFn{
+	public Object invoke(Object reader, Object leftangle, Object opts, Object pendingForms) {
+		throw Util.runtimeException("Unreadable form");
+	}
+}
+
+// Sentinel values for reading lists
+private static final Object READ_EOF = new Object();
+private static final Object READ_FINISHED = new Object();
+
+public static List readDelimitedList(char delim, PushbackReader r, boolean isRecursive, Object opts, Object pendingForms) {
+	final int firstline =
+			(r instanceof LineNumberingPushbackReader) ?
+			((LineNumberingPushbackReader) r).getLineNumber() : -1;
+
+	ArrayList a = new ArrayList();
+	Resolver resolver = (Resolver) RT.READER_RESOLVER.deref();
+
+	for(; ;) {
+
+		Object form = read(r, false, READ_EOF, delim, READ_FINISHED, isRecursive, opts, pendingForms,
+                           resolver);
+
+		if (form == READ_EOF) {
+			if (firstline < 0)
+				throw Util.runtimeException("EOF while reading");
+			else
+				throw Util.runtimeException("EOF while reading, starting at line " + firstline);
+		} else if (form == READ_FINISHED) {
+			return a;
+		}
+
+		a.add(form);
+	}
+}
+
+public static class CtorReader extends AFn{
+	public Object invoke(Object reader, Object firstChar, Object opts, Object pendingForms){
+		PushbackReader r = (PushbackReader) reader;
+		pendingForms = ensurePending(pendingForms);
+		Object name = read(r, true, null, false, opts, pendingForms);
+		if (!(name instanceof Symbol))
+			throw new RuntimeException("Reader tag must be a symbol");
+		Symbol sym = (Symbol)name;
+		Object form = read(r, true, null, true, opts, pendingForms);
+
+		if(isPreserveReadCond(opts) || RT.suppressRead()) {
+			return TaggedLiteral.create(sym, form);
+		} else {
+			return sym.getName().contains(".") ? readRecord(form, sym, opts, pendingForms) : readTagged(form, sym, opts, pendingForms);
+		}
+
+	}
+
+	private Object readTagged(Object o, Symbol tag, Object opts, Object pendingForms){
+
+		ILookup data_readers = (ILookup)RT.DATA_READERS.deref();
+		IFn data_reader = (IFn)RT.get(data_readers, tag);
+		if(data_reader == null){
+		data_readers = (ILookup)RT.DEFAULT_DATA_READERS.deref();
+		data_reader = (IFn)RT.get(data_readers, tag);
+		if(data_reader == null){
+		IFn default_reader = (IFn)RT.DEFAULT_DATA_READER_FN.deref();
+		if(default_reader != null)
+			return default_reader.invoke(tag, o);
+		else
+			throw new RuntimeException("No reader function for tag " + tag.toString());
+		}
+		}
+
+		return data_reader.invoke(o);
+	}
+
+	private Object readRecord(Object form, Symbol recordName, Object opts, Object pendingForms){
+        boolean readeval = RT.booleanCast(RT.READEVAL.deref());
+
+	    if(!readeval)
+		    {
+		    throw Util.runtimeException("Record construction syntax can only be used when *read-eval* == true");
+		    }
+
+		Class recordClass = RT.classForNameNonLoading(recordName.toString());
+
+
+		boolean shortForm = true;
+
+		if(form instanceof IPersistentMap) {
+			shortForm = false;
+		} else if (form instanceof IPersistentVector) {
+			shortForm = true;
+		} else {
+			throw Util.runtimeException("Unreadable constructor form starting with \"#" + recordName + "\"");
+		}
+
+		Object ret = null;
+		Constructor[] allctors = ((Class)recordClass).getConstructors();
+
+		if(shortForm)
+			{
+	        IPersistentVector recordEntries = (IPersistentVector)form;
+			boolean ctorFound = false;
+			for (Constructor ctor : allctors)
+				if(ctor.getParameterTypes().length == recordEntries.count())
+					ctorFound = true;
+
+			if(!ctorFound)
+				throw Util.runtimeException("Unexpected number of constructor arguments to " + recordClass.toString() + ": got " + recordEntries.count());
+
+			ret = Reflector.invokeConstructor(recordClass, RT.toArray(recordEntries));
+			}
+		else
+			{
+
+			IPersistentMap vals = (IPersistentMap)form;
+			for(ISeq s = RT.keys(vals); s != null; s = s.next())
+				{
+				if(!(s.first() instanceof Keyword))
+					throw Util.runtimeException("Unreadable defrecord form: key must be of type clojure.lang.Keyword, got " + s.first().toString());
+				}
+			ret = Reflector.invokeStaticMethod(recordClass, "create", new Object[]{vals});
+			}
+
+		return ret;
+	}
+}
+
+static boolean isPreserveReadCond(Object opts) {
+	if(RT.booleanCast(READ_COND_ENV.deref()) && opts instanceof IPersistentMap)
+    {
+        Object readCond = ((IPersistentMap) opts).valAt(OPT_READ_COND);
+        return COND_PRESERVE.equals(readCond);
     }
-    return ret;
-  }
-
-  private ISeq sqExpandList(ISeq seq) {
-    PersistentVector ret = PersistentVector.EMPTY;
-    for (; seq != null; seq = seq.next()) {
-      Object item = seq.first();
-      if (isUnquote(item)) ret = ret.cons(RT.list(LIST, RT.second(item)));
-      else if (isUnquoteSplicing(item)) ret = ret.cons(RT.second(item));
-      else ret = ret.cons(RT.list(LIST, syntaxQuote(item)));
-    }
-    return ret.seq();
-  }
-
-  private static IPersistentVector flattenMap(Object form) {
-    IPersistentVector keyvals = PersistentVector.EMPTY;
-    for (ISeq s = RT.seq(form); s != null; s = s.next()) {
-      IMapEntry e = (IMapEntry) s.first();
-      keyvals = (IPersistentVector) keyvals.cons(e.key());
-      keyvals = (IPersistentVector) keyvals.cons(e.val());
-    }
-    return keyvals;
-  }
-
-  private static boolean isUnquote(Object form) {
-    return form instanceof ISeq && UNQUOTE.equals(RT.first(form));
-  }
-
-  private static boolean isUnquoteSplicing(Object form) {
-    return form instanceof ISeq && UNQUOTE_SPLICING.equals(RT.first(form));
-  }
-
-  // Handles a form beginning with '#'. The leading '#' has NOT been consumed. Returns the
-  // form, or SKIP for a no-value dispatch (#_, #!).
-  private Object readDispatch() throws IOException {
-    buffer.read();                          // consume '#'
-    int ch = buffer.peek();                 // dispatch char (consumed below, except for tags)
-    if (ch == -1) throw Util.runtimeException("EOF while reading character");
-    switch (ch) {
-      case '{': buffer.read(); return readSet();
-      case '(': buffer.read(); return readFn();                          // #(...) anonymous fn
-      case '_': {                           // discard the next form
-        buffer.read();
-        Object discarded = read0(0);
-        if (discarded == READ_EOF) throw Util.runtimeException("EOF while reading");
-        return SKIP;
-      }
-      case '!': buffer.read(); skipLine(); return SKIP;                 // shebang line comment
-      case '\'': buffer.read(); return RT.list(THE_VAR, readForm());    // #'x -> (var x)
-      case '"': buffer.read(); return readRegex();                      // #"..." regex
-      case '#': buffer.read(); return readSymbolicValue();              // ##Inf / ##-Inf / ##NaN
-      case '<': buffer.read(); throw Util.runtimeException("Unreadable form");
-      case '^': buffer.read(); return readMeta();                      // #^meta form (deprecated ^)
-      case '?': buffer.read(); return readConditional();               // #? / #?@ reader conditional
-      case '=': buffer.read(); return readEval();                       // #=form read-eval
-      case ':': buffer.read(); return readNamespaceMap();               // #:ns{...} / #::{...}
-      default:
-        // Anything that is not a dispatch macro is a tagged literal: the original unreads the
-        // char and hands it to CtorReader, which reads the tag as a symbol. So #foo, #*foo, and
-        // #my.Record all land here (the char is left unconsumed for readTagged to read). read
-        // failures (a char that cannot start a symbol) surface as the same tag/symbol errors.
-        return readTagged();
-    }
-  }
-
-  // #"..." - chars up to the closing quote; a backslash keeps the next char literally (so \d
-  // stays \d for Pattern.compile).
-  private Object readRegex() throws IOException {
-    Buffer b = buffer;
-    StringBuilder sb = new StringBuilder();
-    while (true) {
-      int ch = b.read();
-      if (ch == '"') break;
-      if (ch == -1) throw Util.runtimeException("EOF while reading regex");
-      sb.append((char) ch);
-      if (ch == '\\') {
-        int ch2 = b.read();
-        if (ch2 == -1) throw Util.runtimeException("EOF while reading regex");
-        sb.append((char) ch2);
-      }
-    }
-    return Pattern.compile(sb.toString());
-  }
-
-  // ## symbolic values.
-  private Object readSymbolicValue() throws IOException {
-    Object form = readForm();
-    if (!(form instanceof Symbol)) throw Util.runtimeException("Invalid token: ##" + form);
-    if (form.equals(SYM_INF)) return Double.POSITIVE_INFINITY;
-    if (form.equals(SYM_NEG_INF)) return Double.NEGATIVE_INFINITY;
-    if (form.equals(SYM_NAN)) return Double.NaN;
-    throw Util.runtimeException("Unknown symbolic value: ##" + form);
-  }
-
-  // #tag form - reads the tag symbol and a form, then applies the matching data reader.
-  private Object readTagged() throws IOException {
-    Object tagObj = readForm();
-    if (!(tagObj instanceof Symbol)) throw Util.runtimeException("Reader tag must be a symbol");
-    Symbol tag = (Symbol) tagObj;
-    Object form = readForm();
-    // In :preserve mode, or while discarding a non-matching #? branch (*suppress-read*), the tag
-    // is not applied -- it is kept verbatim as a TaggedLiteral. This is what lets a dead branch
-    // hold a #js or a #some.nonexistent.Record with no data reader without blowing up, and what
-    // lets :preserve round-trip them. Matches the original's CtorReader.
-    if (isPreserveReadCond() || RT.suppressRead())
-      return TaggedLiteral.create(tag, form);
-    // A dotted tag name is a record constructor (#my.Record[...] / #my.Record{...}); a plain tag
-    // is a data reader. The original decides the same way, and BEFORE any *data-readers* lookup.
-    if (tag.getName().contains("."))
-      return readRecord(form, tag);
-    IFn reader = dataReaderFor(tag);
-    if (reader != null) return reader.invoke(form);
-    // No registered reader: fall back to *default-data-reader-fn*, called as (f tag form).
-    IFn defaultReader = (IFn) RT.var("clojure.core", "*default-data-reader-fn*").deref();
-    if (defaultReader != null) return defaultReader.invoke(tag, form);
-    throw Util.runtimeException("No reader function for tag " + tag);
-  }
-
-  // #my.Record[v0 v1 ...] positional, or #my.Record{:k v ...} map. Port of the original's
-  // readRecord. Gated on *read-eval* because it constructs an arbitrary class.
-  private Object readRecord(Object form, Symbol recordName) {
-    if (!RT.booleanCast(RT.READEVAL.deref()))
-      throw Util.runtimeException("Record construction syntax can only be used when *read-eval* == true");
-
-    Class recordClass = RT.classForNameNonLoading(recordName.toString());
-
-    boolean shortForm;
-    if (form instanceof IPersistentMap)
-      shortForm = false;                        // #Rec{:k v} -> (Rec/create {...})
-    else if (form instanceof IPersistentVector)
-      shortForm = true;                         // #Rec[v ...] -> positional constructor
     else
-      throw Util.runtimeException("Unreadable constructor form starting with \"#" + recordName + "\"");
+        return false;
+}
 
-    if (shortForm) {
-      IPersistentVector recordEntries = (IPersistentVector) form;
-      boolean ctorFound = false;
-      for (java.lang.reflect.Constructor ctor : recordClass.getConstructors())
-        if (ctor.getParameterTypes().length == recordEntries.count())
-          ctorFound = true;
-      if (!ctorFound)
-        throw Util.runtimeException("Unexpected number of constructor arguments to "
-            + recordClass.toString() + ": got " + recordEntries.count());
-      return Reflector.invokeConstructor(recordClass, RT.toArray(recordEntries));
+public static class ConditionalReader extends AFn {
+
+	final static private Object READ_STARTED = new Object();
+	final static public Keyword DEFAULT_FEATURE = Keyword.intern(null, "default");
+	final static public IPersistentSet RESERVED_FEATURES =
+		RT.set(Keyword.intern(null, "else"), Keyword.intern(null, "none"));
+
+	public static boolean hasFeature(Object feature, Object opts) {
+		if (! (feature instanceof Keyword))
+			throw Util.runtimeException("Feature should be a keyword: " + feature);
+
+		if(DEFAULT_FEATURE.equals(feature))
+			return true;
+
+		IPersistentSet custom = (IPersistentSet) ((IPersistentMap)opts).valAt(OPT_FEATURES);
+		return custom != null && custom.contains(feature);
+	}
+
+	public static Object readCondDelimited(PushbackReader r, boolean splicing, Object opts, Object pendingForms) {
+		Object result = READ_STARTED;
+		Object form; // The most recently ready form
+		boolean toplevel = (pendingForms == null);
+		pendingForms = ensurePending(pendingForms);
+
+		final int firstline =
+				(r instanceof LineNumberingPushbackReader) ?
+						((LineNumberingPushbackReader) r).getLineNumber() : -1;
+
+		for(; ;) {
+			if(result == READ_STARTED) {
+				// Read the next feature
+				form = read(r, false, READ_EOF, ')', READ_FINISHED, true, opts, pendingForms, null);
+
+				if (form == READ_EOF) {
+					if (firstline < 0)
+						throw Util.runtimeException("EOF while reading");
+					else
+						throw Util.runtimeException("EOF while reading, starting at line " + firstline);
+				} else if (form == READ_FINISHED) {
+					break; // read-cond form is done
+				}
+
+				if(RESERVED_FEATURES.contains(form))
+					throw Util.runtimeException("Feature name " + form + " is reserved.");
+
+				if (hasFeature(form, opts)) {
+
+					//Read the form corresponding to the feature, and assign it to result if everything is kosher
+
+					form = read(r, false, READ_EOF, ')', READ_FINISHED, true, opts, pendingForms, (Resolver) RT.READER_RESOLVER.deref());
+
+					if (form == READ_EOF) {
+						if (firstline < 0)
+							throw Util.runtimeException("EOF while reading");
+						else
+							throw Util.runtimeException("EOF while reading, starting at line " + firstline);
+					} else if (form == READ_FINISHED) {
+						if (firstline < 0)
+							throw Util.runtimeException("read-cond requires an even number of forms.");
+						else
+							throw Util.runtimeException("read-cond starting on line " + firstline + " requires an even number of forms");
+					} else {
+						result = form;
+					}
+				}
+			}
+
+			// When we already have a result, or when the feature didn't match, discard the next form in the reader
+			try {
+				Var.pushThreadBindings(RT.map(RT.SUPPRESS_READ, RT.T));
+				form = read(r, false, READ_EOF, ')', READ_FINISHED, true, opts, pendingForms, (Resolver) RT.READER_RESOLVER.deref());
+
+				if (form == READ_EOF) {
+					if (firstline < 0)
+						throw Util.runtimeException("EOF while reading");
+					else
+						throw Util.runtimeException("EOF while reading, starting at line " + firstline);
+				} else if (form == READ_FINISHED) {
+					break;
+				}
+			}
+			finally {
+				Var.popThreadBindings();
+			}
+
+		}
+
+		if (result == READ_STARTED)  // no features matched
+            return r;
+
+		if (splicing) {
+			if(! (result instanceof List))
+				throw Util.runtimeException("Spliced form list in read-cond-splicing must implement java.util.List");
+
+			if(toplevel)
+				throw Util.runtimeException("Reader conditional splicing not allowed at the top level.");
+
+			((List)pendingForms).addAll(0, (List)result);
+
+			return r;
+		} else {
+			return result;
+		}
+	};
+
+    private static void checkConditionalAllowed(Object opts) {
+        IPersistentMap mopts = (IPersistentMap)opts;
+        if(! (opts != null && (COND_ALLOW.equals(mopts.valAt(OPT_READ_COND)) ||
+                               COND_PRESERVE.equals(mopts.valAt(OPT_READ_COND)))))
+            throw Util.runtimeException("Conditional read not allowed");
     }
 
-    IPersistentMap vals = (IPersistentMap) form;
-    for (ISeq s = RT.keys(vals); s != null; s = s.next()) {
-      if (!(s.first() instanceof Keyword))
-        throw Util.runtimeException(
-            "Unreadable defrecord form: key must be of type clojure.lang.Keyword, got " + s.first().toString());
-    }
-    return Reflector.invokeStaticMethod(recordClass, "create", new Object[]{vals});
-  }
+	public Object invoke(Object reader, Object mode, Object opts, Object pendingForms) {
+		checkConditionalAllowed(opts);
 
-  // #=form -- evaluate at read time. Port of the original's EvalReader. The '=' has been consumed.
-  // *read-eval* is checked before reading the form, as the original does: false/nil throws. This
-  // is not a general eval -- it handles exactly the forms print-dup / the Compiler's constant
-  // serialization emit: a class name, (var ns/name), a (Ctor. ...) call, a static-member call, or
-  // a (var-fn ...) application.
-  private Object readEval() throws IOException {
-    if (!RT.booleanCast(RT.READEVAL.deref()))
-      throw Util.runtimeException("EvalReader not allowed when *read-eval* is false.");
+		PushbackReader r = (PushbackReader) reader;
+		int ch = read1(r);
+		if (ch == -1)
+			throw Util.runtimeException("EOF while reading character");
 
-    Object o = readForm();
-    if (o instanceof Symbol)
-      return RT.classForName(o.toString());
-    if (o instanceof IPersistentList) {
-      Symbol fs = (Symbol) RT.first(o);
-      if (fs.equals(THE_VAR)) {
-        Symbol vs = (Symbol) RT.second(o);
-        return RT.var(vs.getNamespace(), vs.getName());
-      }
-      if (fs.getName().endsWith(".")) {
-        Object[] args = RT.toArray(RT.next(o));
-        return Reflector.invokeConstructor(
-            RT.classForName(fs.getName().substring(0, fs.getName().length() - 1)), args);
-      }
-      if (Compiler.namesStaticMember(fs)) {
-        Object[] args = RT.toArray(RT.next(o));
-        return Reflector.invokeStaticMethod(fs.getNamespace(), fs.getName(), args);
-      }
-      Object v = Compiler.maybeResolveIn(Compiler.currentNS(), fs);
-      if (v instanceof Var)
-        return ((IFn) v).applyTo(RT.next(o));
-      throw Util.runtimeException("Can't resolve " + fs);
-    }
-    throw new IllegalArgumentException("Unsupported #= form");
-  }
+		boolean splicing = false;
 
-  // ---- Reader conditionals #? / #?@ --------------------------------------------------------
-  // Port of the original's ConditionalReader. The '#?' has been consumed. In :allow mode a single
-  // matching branch is spliced in (#?@) or returned (#?); in :preserve mode the whole thing is
-  // kept as a ReaderConditional. Requires opts to carry :read-cond -> :allow / :preserve.
+		if (ch == '@') {
+			splicing = true;
+			ch = read1(r);
+		}
 
-  private static final Object READ_STARTED = new Object();
-  private static final Keyword DEFAULT_FEATURE = Keyword.intern(null, "default");
-  private static final IPersistentSet RESERVED_FEATURES =
-      RT.set(Keyword.intern(null, "else"), Keyword.intern(null, "none"));
-  // Marks that we are lexically inside a reader conditional, gating :preserve (matching the
-  // original's private READ_COND_ENV var).
-  private static final Var READ_COND_ENV = Var.create(null).setDynamic();
+		while(isWhitespace(ch))
+			ch = read1(r);
 
-  private Object readConditional() throws IOException {
-    checkConditionalAllowed();
-    int ch = buffer.read();                 // char after '#?'
-    if (ch == -1) throw Util.runtimeException("EOF while reading character");
-    boolean splicing = false;
-    if (ch == '@') { splicing = true; ch = buffer.read(); }
-    while (isWhitespace(ch)) ch = buffer.read();
-    if (ch == -1) throw Util.runtimeException("EOF while reading character");
-    if (ch != '(') throw Util.runtimeException("read-cond body must be a list");
-    // '(' consumed. A splice is "at the top level" iff nothing has established a pending context.
-    boolean toplevel = (pendingForms == null);
-    Var.pushThreadBindings(RT.map(READ_COND_ENV, RT.T));
-    try {
-      if (isPreserveReadCond()) {
-        // Keep it verbatim. readList reads the body to ')' (the '(' is already consumed).
-        Object form = readList();
-        return ReaderConditional.create(form, splicing);
-      }
-      return readCondDelimited(splicing, toplevel);
-    } finally {
-      Var.popThreadBindings();
-    }
-  }
+		if (ch == -1)
+			throw Util.runtimeException("EOF while reading character");
 
-  // Reads feature/form pairs to the closing ')'. The first matching feature's form becomes the
-  // result; everything else is read and discarded (with *suppress-read* bound, so tagged/record
-  // literals in dead branches are not applied). Returns the matched form, or SKIP for no match /
-  // for a splice (which prepends its forms to pendingForms).
-  private Object readCondDelimited(boolean splicing, boolean toplevel) throws IOException {
-    Object result = READ_STARTED;
-    int firstline = lineNumber();
-    while (true) {
-      if (result == READ_STARTED) {
-        Object feature = read0(')');
-        if (feature == READ_EOF) throw condEof(firstline);
-        if (feature == READ_FINISHED) break;
-        if (RESERVED_FEATURES.contains(feature))
-          throw Util.runtimeException("Feature name " + feature + " is reserved.");
-        if (hasFeature(feature)) {
-          Object form = read0(')');
-          if (form == READ_EOF) throw condEof(firstline);
-          if (form == READ_FINISHED) {
-            if (firstline < 0)
-              throw Util.runtimeException("read-cond requires an even number of forms.");
-            throw Util.runtimeException(
-                "read-cond starting on line " + firstline + " requires an even number of forms");
-          }
-          result = form;
-        }
-      }
-      // Discard the next form: the non-matching feature's form, or everything past a match.
-      Var.pushThreadBindings(RT.map(RT.SUPPRESS_READ, RT.T));
-      try {
-        Object form = read0(')');
-        if (form == READ_EOF) throw condEof(firstline);
-        if (form == READ_FINISHED) break;
-      } finally {
-        Var.popThreadBindings();
-      }
-    }
+		if(ch != '(')
+			throw Util.runtimeException("read-cond body must be a list");
 
-    if (result == READ_STARTED)            // no feature matched: a no-op, like whitespace
-      return SKIP;
+		try {
+			Var.pushThreadBindings(RT.map(READ_COND_ENV, RT.T));
 
-    if (splicing) {
-      if (!(result instanceof java.util.List))
-        throw Util.runtimeException("Spliced form list in read-cond-splicing must implement java.util.List");
-      if (toplevel)
-        throw Util.runtimeException("Reader conditional splicing not allowed at the top level.");
-      pendingForms.addAll(0, (java.util.List) result);
-      return SKIP;
-    }
-    return result;
-  }
+			if (isPreserveReadCond(opts)) {
+				IFn listReader = getMacro(ch); // should always be a list
+				Object form = listReader.invoke(r, ch, opts, ensurePending(pendingForms));
 
-  private RuntimeException condEof(int firstline) {
-    if (firstline < 0) return Util.runtimeException("EOF while reading");
-    return Util.runtimeException("EOF while reading, starting at line " + firstline);
-  }
+				return ReaderConditional.create(form, splicing);
+			} else {
+				return readCondDelimited(r, splicing, opts, pendingForms);
+			}
+		} finally {
+			Var.popThreadBindings();
+		}
+	}
+}
 
-  private boolean hasFeature(Object feature) {
-    if (!(feature instanceof Keyword))
-      throw Util.runtimeException("Feature should be a keyword: " + feature);
-    if (DEFAULT_FEATURE.equals(feature)) return true;
-    IPersistentSet custom = (IPersistentSet) ((IPersistentMap) opts).valAt(OPT_FEATURES);
-    return custom != null && custom.contains(feature);
-  }
+/*
+public static void main(String[] args) throws Exception{
+	//RT.init();
+	PushbackReader rdr = new PushbackReader( new java.io.StringReader( "(+ 21 21)" ) );
+	Object input = LispReader.read(rdr, false, new Object(), false );
+	System.out.println(Compiler.eval(input));
+}
 
-  private void checkConditionalAllowed() {
-    Object rc = (opts instanceof IPersistentMap) ? ((IPersistentMap) opts).valAt(OPT_READ_COND) : null;
-    if (!(COND_ALLOW.equals(rc) || COND_PRESERVE.equals(rc)))
-      throw Util.runtimeException("Conditional read not allowed");
-  }
+public static void main(String[] args){
+	LineNumberingPushbackReader r = new LineNumberingPushbackReader(new InputStreamReader(System.in));
+	OutputStreamWriter w = new OutputStreamWriter(System.out);
+	Object ret = null;
+	try
+		{
+		for(; ;)
+			{
+			ret = LispReader.read(r, true, null, false);
+			RT.print(ret, w);
+			w.write('\n');
+			if(ret != null)
+				w.write(ret.getClass().toString());
+			w.write('\n');
+			w.flush();
+			}
+		}
+	catch(Exception e)
+		{
+		e.printStackTrace();
+		}
+}
+ */
 
-  private boolean isPreserveReadCond() {
-    if (RT.booleanCast(READ_COND_ENV.deref()) && opts instanceof IPersistentMap)
-      return COND_PRESERVE.equals(((IPersistentMap) opts).valAt(OPT_READ_COND));
-    return false;
-  }
-
-  // #:ns{...} / #::{...} / #::alias{...} - the leading "#:" has been consumed. Unqualified keys
-  // get the namespace; keys with the "_" namespace become unqualified; already-qualified keys are
-  // left alone.
-  private Object readNamespaceMap() throws IOException {
-    Buffer b = buffer;
-    boolean auto = false;
-    if (b.peek() == ':') { b.read(); auto = true; }   // #::
-
-    Object osym = null;
-    int nc = b.peek();
-    if (nc == '{') {
-      // no namespace symbol before the map (osym stays null)
-    } else if (nc != -1 && isWhitespace(nc)) {
-      int c = skipWhitespace();
-      if (!(auto && c == '{'))
-        throw Util.runtimeException("Namespaced map must specify a namespace");
-    } else {
-      osym = readForm();                              // the namespace symbol (or EOF -> error)
-      if (skipWhitespace() != '{')
-        throw Util.runtimeException("Namespaced map must specify a map");
-    }
-
-    String nsname;
-    if (auto) {
-      if (osym == null) {
-        nsname = (resolver != null) ? resolver.currentNS().getName()
-                                    : currentNS().getName().getName();
-      } else if (osym instanceof Symbol && ((Symbol) osym).getNamespace() == null) {
-        Symbol alias = Symbol.intern(((Symbol) osym).getName());
-        Symbol resolved;
-        if (resolver != null) {
-          resolved = resolver.resolveAlias(alias);
-        } else {
-          Namespace rns = currentNS().lookupAlias(alias);
-          resolved = (rns != null) ? rns.getName() : null;
-        }
-        if (resolved == null)
-          throw Util.runtimeException("Unknown auto-resolved namespace alias: " + osym);
-        nsname = resolved.getName();
-      } else {
-        throw Util.runtimeException("Namespaced map must specify a valid namespace: " + osym);
-      }
-    } else if (osym instanceof Symbol && ((Symbol) osym).getNamespace() == null) {
-      nsname = ((Symbol) osym).getName();
-    } else {
-      throw Util.runtimeException("Namespaced map must specify a valid namespace: " + osym);
-    }
-
-    b.read();                                          // consume '{'
-    ArrayList<Object> kvs = readDelimitedList('}');
-    if ((kvs.size() & 1) == 1)
-      throw Util.runtimeException("Namespaced map literal must contain an even number of forms");
-    Object[] out = new Object[kvs.size()];
-    for (int i = 0; i < kvs.size(); i += 2) {
-      out[i] = qualifyKey(kvs.get(i), nsname);
-      out[i + 1] = kvs.get(i + 1);
-    }
-    return RT.map(out);                                // RT.map does the duplicate-key check
-  }
-
-  private static Object qualifyKey(Object key, String nsname) {
-    if (key instanceof Keyword) {
-      Keyword kw = (Keyword) key;
-      if (kw.getNamespace() == null) return Keyword.intern(nsname, kw.getName());
-      if (kw.getNamespace().equals("_")) return Keyword.intern(null, kw.getName());
-      return key;
-    }
-    if (key instanceof Symbol) {
-      Symbol sym = (Symbol) key;
-      if (sym.getNamespace() == null) return Symbol.intern(nsname, sym.getName());
-      if (sym.getNamespace().equals("_")) return Symbol.intern(null, sym.getName());
-      return key;
-    }
-    return key;
-  }
-
-  // Looks up a data reader: *data-readers* first, then default-data-readers (#inst, #uuid).
-  private static IFn dataReaderFor(Symbol tag) {
-    Object r = RT.get(RT.var("clojure.core", "*data-readers*").deref(), tag);
-    if (r == null) r = RT.get(RT.var("clojure.core", "default-data-readers").deref(), tag);
-    return (IFn) r;
-  }
-
-  // ^meta form. TODO: attach source line/column here once the Buffer's line counting is wired up.
-  private static final Keyword TAG_KEY = Keyword.intern(null, "tag");
-  private static final Keyword PARAM_TAGS_KEY = Keyword.intern(null, "param-tags");
-
-  private Object readMeta() throws IOException {
-    // The '^' has been consumed; this is its position.
-    int line = lineNumber();
-    int column = columnNumber();
-
-    Object meta = readForm();
-    if (meta instanceof Symbol || meta instanceof String)
-      meta = RT.map(TAG_KEY, meta);
-    else if (meta instanceof Keyword)
-      meta = RT.map(meta, Boolean.TRUE);
-    else if (meta instanceof IPersistentVector)
-      meta = RT.map(PARAM_TAGS_KEY, meta);
-    else if (!(meta instanceof IPersistentMap))
-      throw new IllegalArgumentException("Metadata must be Symbol,Keyword,String,Vector or Map");
-
-    Object o = readForm();
-    if (!(o instanceof IMeta))
-      throw new IllegalArgumentException("Metadata can only be applied to IMetas");
-    // Source position goes on seqs only, and never overrides an explicit ^{:line n}.
-    if (line >= 0 && o instanceof ISeq) {
-      meta = RT.assoc(meta, RT.LINE_KEY, RT.get(meta, RT.LINE_KEY, line));
-      meta = RT.assoc(meta, RT.COLUMN_KEY, RT.get(meta, RT.COLUMN_KEY, column));
-    }
-    if (o instanceof IReference) {
-      ((IReference) o).resetMeta((IPersistentMap) meta);
-      return o;
-    }
-    IPersistentMap ometa = RT.meta(o);
-    for (ISeq s = RT.seq(meta); s != null; s = s.next()) {
-      IMapEntry e = (IMapEntry) s.first();
-      ometa = (IPersistentMap) RT.assoc(ometa, e.getKey(), e.getValue());
-    }
-    return ((IObj) o).withMeta(ometa);
-  }
-
-  private void skipLine() throws IOException {
-    Buffer b = buffer;
-    while (true) {
-      int c = b.read();
-      if (c == -1 || c == '\n' || c == '\r') return;
-    }
-  }
-
-  // ASCII whitespace (plus comma) lookup for the hot path; matches `ch == ',' ||
-  // Character.isWhitespace(ch)` for ch < 128.
-  private static final boolean[] WS = new boolean[128];
-  static {
-    WS[','] = true;
-    for (int i = 0; i < 128; i++) if (Character.isWhitespace(i)) WS[i] = true;
-  }
-
-  private static boolean isMacro(int ch) {
-    return ch >= 0 && ch < 128 && MACRO[ch];
-  }
-
-  // Terminating macros are all macros except #, ' and %: those three may appear inside a token,
-  // so they don't terminate one.
-  private static boolean isTerminatingMacro(int ch) {
-    return ch != '#' && ch != '\'' && ch != '%' && isMacro(ch);
-  }
-
-  // Consumes leading whitespace; returns the next non-whitespace char (not consumed),
-  // or -1 at end of input. Scans the backing array directly to avoid per-char peek/read.
-  private int skipWhitespace() throws IOException {
-    Buffer b = buffer;
-    while (true) {
-      char[] a = b.buffer;
-      int p = b.pos, end = b.posEnd;
-      while (p < end) {
-        char c = a[p];
-        if (!isWhitespace(c)) { b.pos = p; return c; }
-        p++;
-      }
-      b.pos = p;
-      if (!b.refill()) return -1;
-    }
-  }
-
-  // Looks ahead `offset` characters past the current position without consuming.
-  private int peekAt(int offset) throws IOException {
-    Buffer b = buffer;
-    while (b.pos + offset >= b.posEnd) {
-      if (!b.refill()) return -1;
-    }
-    return b.buffer[b.pos + offset];
-  }
-
-  private Object readNumber() throws IOException {
-    Buffer b = buffer;
-    b.startNewToken();
-    // Scan the token directly over the backing array, stopping at whitespace, a macro
-    // character, or end of input.
-    int p = b.pos;
-    char[] a = b.buffer;
-    while (true) {
-      char c = a[p];
-      if (c == Buffer.SENTINEL && p == b.posEnd) {   // maybe end of buffered input
-        b.pos = p;
-        if (!b.refill()) { a = b.buffer; p = b.posEnd; break; }  // EOF (refill may have compacted)
-        a = b.buffer;                                 // may have grown
-        p = b.pos;                                    // may have shifted (compaction)
-        continue;
-      }
-      if (isWhitespace(c) || isMacro(c)) break;
-      p++;
-    }
-    b.pos = p;
-
-    int start = b.getTokenStart();
-    int end = p;
-    Object n = parseNumber(a, start, end);
-    if (n == null) {
-      throw new NumberFormatException("Invalid number: " + new String(a, start, end - start));
-    }
-    return n;
-  }
-
-  private Object readToken() throws IOException {
-    Buffer b = buffer;
-    b.startNewToken();
-    // Scan the token directly, stopping at whitespace, a terminating macro, or end of
-    // input. Note: #, ' and % do NOT terminate a token. Along the way, flag whether the token has
-    // a '/' or a non-leading ':' - if not, it is a plain symbol/keyword and can skip the full
-    // matchSymbol machinery.
-    int ts = b.getTokenStart();
-    int p = b.pos;
-    char[] a = b.buffer;
-    boolean special = false;
-    while (true) {
-      char c = a[p];
-      if (c == Buffer.SENTINEL && p == b.posEnd) {
-        b.pos = p;
-        if (!b.refill()) { a = b.buffer; ts = b.getTokenStart(); p = b.posEnd; break; }
-        a = b.buffer;
-        ts = b.getTokenStart();
-        p = b.pos;
-        continue;
-      }
-      if (isWhitespace(c) || isTerminatingMacro(c)) break;
-      if (c == '/' || (c == ':' && p != ts)) special = true;
-      p++;
-    }
-    b.pos = p;
-    return interpretToken(a, ts, p, special);
-  }
-
-  // Reads a string form (opening quote already consumed).
-  private Object readStringForm() throws IOException {
-    Buffer b = buffer;
-    b.startNewToken();
-    // Fast path: no escapes. The content stays contiguous in the buffer across refills,
-    // so on the closing quote we can slice it out in one shot.
-    int p = b.pos;
-    char[] a = b.buffer;
-    while (true) {
-      char c = a[p];
-      if (c == Buffer.SENTINEL && p == b.posEnd) {
-        b.pos = p;
-        if (!b.refill()) throw Util.runtimeException("EOF while reading string");
-        a = b.buffer;
-        p = b.pos;
-        continue;
-      }
-      if (c == '"') {
-        String s = new String(a, b.getTokenStart(), p - b.getTokenStart());
-        b.pos = p + 1;               // consume closing quote
-        return s;
-      }
-      if (c == '\\') break;          // an escape: switch to the in-place decode path
-      p++;
-    }
-    // Decode path (first backslash reached). Build the decoded string in a StringBuilder rather
-    // than writing it back into the buffer. The buffer is shared: read+string captures a form's
-    // source text straight out of it (via the pin), and line/column counting rescans it lazily.
-    // Decoding in place would overwrite that source region -- collapsing e.g. \n to a real newline
-    // both corrupts the captured source and makes the line counter see a phantom line break. So we
-    // only ever *consume* from the buffer here (leaving its bytes intact), as the original reader's
-    // StringReader does. Only strings that actually contain an escape pay for the StringBuilder.
-    StringBuilder sb = new StringBuilder();
-    sb.append(a, b.getTokenStart(), p - b.getTokenStart());   // the clean prefix before the escape
-    b.pos = p;                                                // position the read cursor at the backslash
-    while (true) {
-      int ch = b.read();
-      if (ch == '"')
-        return sb.toString();
-      if (ch == -1)
-        throw Util.runtimeException("EOF while reading string");
-      if (ch == '\\')
-        ch = readStringEscape();
-      sb.append((char) ch);
-    }
-  }
-
-  // Decodes one string escape (backslash already consumed), returning the resulting char.
-  private char readStringEscape() throws IOException {
-    Buffer b = buffer;
-    int ch = b.read();
-    if (ch == -1) throw Util.runtimeException("EOF while reading string");
-    switch (ch) {
-      case 't': return '\t';
-      case 'r': return '\r';
-      case 'n': return '\n';
-      case '\\': return '\\';
-      case '"': return '"';
-      case 'b': return '\b';
-      case 'f': return '\f';
-      case 'u': {
-        int d = b.read();
-        if (Character.digit(d, 16) == -1)
-          throw Util.runtimeException("Invalid unicode escape: \\u" + (char) d);
-        return (char) readUnicodeChar(d, 16, 4, true);
-      }
-      default:
-        if (Character.isDigit(ch)) {
-          int uc = readUnicodeChar(ch, 8, 3, false);
-          if (uc > 0377)
-            throw Util.runtimeException("Octal escape sequence must be in range [0, 377].");
-          return (char) uc;
-        }
-        throw Util.runtimeException("Unsupported escape character: \\" + (char) ch);
-    }
-  }
-
-  // initch already read, reads up to length-1 more base-`base` digits, stopping (and leaving the
-  // delimiter) on whitespace/macro/EOF.
-  private int readUnicodeChar(int initch, int base, int length, boolean exact) throws IOException {
-    Buffer b = buffer;
-    int uc = Character.digit(initch, base);
-    if (uc == -1) throw new IllegalArgumentException("Invalid digit: " + (char) initch);
-    int i = 1;
-    for (; i < length; i++) {
-      int ch = b.peek();
-      if (ch == -1 || isWhitespace(ch) || isMacro(ch)) break;   // leave delimiter unconsumed
-      int d = Character.digit(ch, base);
-      if (d == -1) throw new IllegalArgumentException("Invalid digit: " + (char) ch);
-      b.read();
-      uc = uc * base + d;
-    }
-    if (i != length && exact)
-      throw new IllegalArgumentException("Invalid character length: " + i + ", should be: " + length);
-    return uc;
-  }
-
-  // Reads a character form (backslash already consumed).
-  private Object readCharacterForm() throws IOException {
-    Buffer b = buffer;
-    b.startNewToken();
-    if (b.peek() == -1) throw Util.runtimeException("EOF while reading character");
-    // The first char after '\' is always part of the token, even a macro or whitespace char.
-    int p = b.pos + 1;
-    char[] a = b.buffer;
-    while (true) {
-      char c = a[p];
-      if (c == Buffer.SENTINEL && p == b.posEnd) {
-        b.pos = p;
-        if (!b.refill()) { a = b.buffer; p = b.posEnd; break; }  // EOF (refill may have compacted)
-        a = b.buffer;
-        p = b.pos;
-        continue;
-      }
-      if (isWhitespace(c) || isTerminatingMacro(c)) break;
-      p++;
-    }
-    b.pos = p;
-    return interpretCharacter(new String(a, b.getTokenStart(), p - b.getTokenStart()));
-  }
-
-  private static Object interpretCharacter(String token) {
-    int len = token.length();
-    if (len == 1) return token.charAt(0);
-    switch (token) {
-      case "newline": return '\n';
-      case "space": return ' ';
-      case "tab": return '\t';
-      case "backspace": return '\b';
-      case "formfeed": return '\f';
-      case "return": return '\r';
-      default:
-        char c0 = token.charAt(0);
-        if (c0 == 'u') {
-          char c = (char) readUnicodeChar(token, 1, 4, 16);
-          if (c >= '\ud800' && c <= '\udfff')
-            throw Util.runtimeException("Invalid character constant: \\u" + Integer.toString(c, 16));
-          return c;
-        }
-        if (c0 == 'o') {
-          int n = len - 1;
-          if (n > 3)
-            throw Util.runtimeException("Invalid octal escape sequence length: " + n);
-          int uc = readUnicodeChar(token, 1, n, 8);
-          if (uc > 0377)
-            throw Util.runtimeException("Octal escape sequence must be in range [0, 377].");
-          return (char) uc;
-        }
-        throw Util.runtimeException("Unsupported character: \\" + token);
-    }
-  }
-
-  private static int readUnicodeChar(String token, int offset, int length, int base) {
-    if (token.length() != offset + length)
-      throw new IllegalArgumentException("Invalid unicode character: \\" + token);
-    int uc = 0;
-    for (int i = offset; i < offset + length; i++) {
-      int d = Character.digit(token.charAt(i), base);
-      if (d == -1)
-        throw new IllegalArgumentException("Invalid digit: " + token.charAt(i));
-      uc = uc * base + d;
-    }
-    return uc;
-  }
-
-  // nil / true / false, then symbol/keyword. `special` is true when the token contains a '/'
-  // or a non-leading ':', which are the only cases needing the full matchSymbol logic; the
-  // common plain symbol/keyword goes straight to Symbol.intern / Keyword.intern.
-  private Object interpretToken(char[] a, int start, int end, boolean special) {
-    int len = end - start;
-    if (!special) {
-      char c0 = a[start];
-      if (c0 == ':') {
-        if (len >= 2)   // plain keyword :name
-          return internPlain(a, start, len, true);
-        // ":" alone falls through to the full path (invalid token)
-      } else {
-        if (len == 3 && c0 == 'n' && a[start + 1] == 'i' && a[start + 2] == 'l')
-          return null;
-        if (len == 4 && c0 == 't' && a[start + 1] == 'r' && a[start + 2] == 'u' && a[start + 3] == 'e')
-          return Boolean.TRUE;
-        if (len == 5 && c0 == 'f' && a[start + 1] == 'a' && a[start + 2] == 'l'
-            && a[start + 3] == 's' && a[start + 4] == 'e')
-          return Boolean.FALSE;
-        return internPlain(a, start, len, false);   // plain symbol
-      }
-    }
-    String s = new String(a, start, len);
-    Object ret = matchSymbol(s, resolver);
-    if (ret != null) return ret;
-    throw Util.runtimeException("Invalid token: " + s);
-  }
-
-  // Per-reader cache from a token's char range to its interned Symbol/Keyword, so a repeated
-  // plain token (extremely common in real code) skips the String allocation and the
-  // Symbol/Keyword intern. Lazily allocated; a hash collision just recomputes (still correct).
-  // Keyed on the whole range including any leading ':', so symbols and keywords never collide.
-  private char[][] tokKey;
-  private Object[] tokVal;
-  private int tokSeen;
-  private static final int TOK_MASK = 1023;
-  private static final int TOK_CACHE_AFTER = 32;   // don't allocate the cache for small reads
-
-  private Object internPlain(char[] a, int start, int len, boolean keyword) {
-    char[][] keys = tokKey;
-    if (keys == null) {
-      if (++tokSeen <= TOK_CACHE_AFTER)
-        return keyword ? Keyword.intern(Symbol.intern(new String(a, start + 1, len - 1)))
-                       : Symbol.intern(new String(a, start, len));
-      keys = tokKey = new char[TOK_MASK + 1][];
-      tokVal = new Object[TOK_MASK + 1];
-    }
-    int h = 0;
-    for (int i = 0; i < len; i++) h = h * 31 + a[start + i];
-    int idx = h & TOK_MASK;
-    char[] k = keys[idx];
-    if (k != null && k.length == len) {
-      int i = 0;
-      while (i < len && k[i] == a[start + i]) i++;
-      if (i == len) return tokVal[idx];
-    }
-    Object v = keyword
-        ? Keyword.intern(Symbol.intern(new String(a, start + 1, len - 1)))
-        : Symbol.intern(new String(a, start, len));
-    keys[idx] = java.util.Arrays.copyOfRange(a, start, start + len);
-    tokVal[idx] = v;
-    return v;
-  }
-
-  // Hand-rolled equivalent of the original matchSymbol, avoiding a regex on this hot path.
-  // Reproduces, without allocating a Matcher:
-  //   symbolPat      = [:]?([\D&&[^/]].*/)?(/|[\D&&[^/]][^/]*)
-  //   arraySymbolPat = ([\D&&[^/:]].*)/([1-9])
-  // plus the ::-autoresolve and validity checks. See symMatch for the greedy semantics.
-  private static final int SYM_NO_MATCH = -1;
-  private static final int SYM_NS_PRESENT = 1;      // group1 (namespace) present
-  private static final int SYM_NS_COLON_SLASH = 2;  // group1 ends with ":/"
-
-  private static Object matchSymbol(String s, Resolver resolver) {
-    int n = s.length();
-    // symbolPat's leading [:]? is greedy: try consuming a leading ':' first, then not.
-    int r = (s.charAt(0) == ':') ? symMatch(s, 1) : SYM_NO_MATCH;
-    if (r == SYM_NO_MATCH) r = symMatch(s, 0);
-
-    if (r != SYM_NO_MATCH) {
-      boolean nsPresent = (r & SYM_NS_PRESENT) != 0;
-      boolean nsEndsColonSlash = (r & SYM_NS_COLON_SLASH) != 0;
-      // (ns endsWith ":/") || (name endsWith ":") || (s contains "::" at index >= 1)
-      if ((nsPresent && nsEndsColonSlash)
-          || s.charAt(n - 1) == ':'
-          || s.indexOf("::", 1) != -1)
-        return null;
-      if (n >= 2 && s.charAt(0) == ':' && s.charAt(1) == ':') {
-        // ::-autoresolve. ::ns/name resolves ns as an alias, ::name against the current namespace.
-        Symbol ks = Symbol.intern(s.substring(2));
-        if (resolver != null) {
-          // A bound *reader-resolver* decides the namespace symbol.
-          Symbol nsym = (ks.getNamespace() != null)
-              ? resolver.resolveAlias(Symbol.intern(ks.getNamespace()))
-              : resolver.currentNS();
-          if (nsym != null)
-            return Keyword.intern(nsym.getName(), ks.getName());
-          return null;
-        }
-        // Default path (RT.readString / the Compiler): alias lookup on the current namespace only,
-        // no Namespace/find.
-        Namespace kns;
-        if (ks.getNamespace() != null)
-          kns = currentNS().lookupAlias(Symbol.intern(ks.getNamespace()));
-        else
-          kns = currentNS();
-        if (kns != null)
-          return Keyword.intern(kns.name.getName(), ks.getName());
-        return null;
-      }
-      boolean isKeyword = s.charAt(0) == ':';
-      Symbol sym = Symbol.intern(isKeyword ? s.substring(1) : s);
-      return isKeyword ? Keyword.intern(sym) : sym;
-    }
-
-    // arraySymbolPat: ([\D&&[^/:]].*)/([1-9]) - ns/N with N a single 1-9. The '/' and digit
-    // are the last two chars; the first char is non-digit, non-'/', non-':'.
-    if (n >= 3) {
-      char last = s.charAt(n - 1);
-      char c0 = s.charAt(0);
-      if (last >= '1' && last <= '9' && s.charAt(n - 2) == '/'
-          && !isDigit(c0) && c0 != '/' && c0 != ':')
-        return Symbol.intern(s.substring(0, n - 2), s.substring(n - 1));
-    }
-    return null;
-  }
-
-  // Simulates symbolPat matching ([\D&&[^/]].*/)?(/|[\D&&[^/]][^/]*) against s[p0..], with the
-  // regex's greedy .* (so group1, the namespace, extends to the LAST '/'). Returns SYM_NO_MATCH,
-  // or SYM_NS_PRESENT/SYM_NS_COLON_SLASH flags (0 == matched with no namespace). Note \D means
-  // "not [0-9]"; the token's first char is never a digit (the reader dispatches those to numbers).
-  private static int symMatch(String s, int p0) {
-    int n = s.length();
-    if (p0 >= n) return SYM_NO_MATCH;                 // group2 needs at least one char
-    char first = s.charAt(p0);
-    int lastSlash = s.lastIndexOf('/');
-    if (lastSlash < p0) lastSlash = -1;               // no '/' in s[p0..]
-
-    if (lastSlash < 0) {                              // no namespace: group2 = s[p0..]
-      return isDigit(first) ? SYM_NO_MATCH : 0;       // group2's first char must be non-digit
-    }
-
-    // Namespace present: group1 = [\D&&[^/]].*/ (first char non-digit, non-'/').
-    if (first != '/' && !isDigit(first)) {
-      // Greedy: group1 ends at the last '/', so group2 = s[lastSlash+1 ..].
-      if (lastSlash + 1 < n && !isDigit(s.charAt(lastSlash + 1))) {
-        int flags = SYM_NS_PRESENT;
-        if (lastSlash - 1 >= p0 && s.charAt(lastSlash - 1) == ':')
-          flags |= SYM_NS_COLON_SLASH;                // group1 ends with ":/"
-        return flags;
-      }
-      // group2 invalid at the last '/'. The only productive backtrack is group2 = "/" (a
-      // single trailing slash), which needs the token to end with "//".
-      if (s.charAt(n - 1) == '/' && n - 2 >= p0 && s.charAt(n - 2) == '/') {
-        int flags = SYM_NS_PRESENT;
-        if (n - 3 >= p0 && s.charAt(n - 3) == ':')
-          flags |= SYM_NS_COLON_SLASH;
-        return flags;
-      }
-    }
-    // No namespace: group2 can only be a lone "/".
-    if (n - p0 == 1 && first == '/') return 0;
-    return SYM_NO_MATCH;
-  }
-
-  private static Namespace currentNS() {
-    return (Namespace) RT.CURRENT_NS.deref();
-  }
-
-  // Classifies and parses a number token directly, without regex, for the common
-  // forms (decimal long, hex, octal, double). Delegates to matchNumber only for the
-  // rarer tails: radix (NrDDD), ratios, N/M suffixes, over-long magnitudes, and
-  // invalid tokens. Reproduces the original's pattern precedence exactly - in particular
-  // that intPat is tried before floatPat, so a leading-zero integer ("08") is invalid
-  // while a leading-zero float ("08.5") is a double.
-  private static Object parseNumber(char[] a, int start, int end) {
-    int i = start;
-    boolean neg = false;
-    char c0 = a[i];
-    if (c0 == '+' || c0 == '-') { neg = (c0 == '-'); i++; }
-    if (i >= end) return matchNumber(str(a, start, end));  // sign only (shouldn't happen)
-    int bodyStart = i;
-    char b0 = a[bodyStart];
-
-    // A lone zero (with optional sign): 0, +0, -0.
-    if (b0 == '0' && bodyStart + 1 == end) return 0L;
-
-    if (b0 == '0') {
-      // Hex: 0[xX][0-9A-Fa-f]+
-      char b1 = a[bodyStart + 1];
-      if (b1 == 'x' || b1 == 'X') {
-        Long mag = parseMag(a, bodyStart + 2, end, 16);
-        if (mag != null) return neg ? -mag : (long) mag;
-        return matchNumber(str(a, start, end));            // empty/invalid/overflow/N
-      }
-      // A float can start with 0 ("0.5", "08.5", "0e3"); a plain integer starting with
-      // 0 is octal ("0777") or invalid ("08"). Distinguish by the char after the digits.
-      int j = bodyStart;
-      while (j < end && isDigit(a[j])) j++;
-      if (j < end && (a[j] == '.' || a[j] == 'e' || a[j] == 'E')) {
-        if (isFloat(a, bodyStart, end)) return Double.parseDouble(str(a, start, end));
-        return matchNumber(str(a, start, end));            // e.g. "1.5M", "1e"
-      }
-      Long mag = parseMag(a, bodyStart + 1, end, 8);        // octal 0[0-7]+
-      if (mag != null) return neg ? -mag : (long) mag;
-      return matchNumber(str(a, start, end));              // "08", "0N", "0/5", ...
-    }
-
-    // Leading digit 1-9: decimal integer, or a double, or a rarer form.
-    int j = bodyStart;
-    while (j < end && isDigit(a[j])) j++;
-    if (j == end) {
-      Long mag = parseMag(a, bodyStart, end, 10);           // [1-9][0-9]*
-      if (mag != null) return neg ? -mag : (long) mag;
-      return matchNumber(str(a, start, end));              // overflow -> BigInt
-    }
-    char cj = a[j];
-    if (cj == '.' || cj == 'e' || cj == 'E') {
-      if (isFloat(a, bodyStart, end)) return Double.parseDouble(str(a, start, end));
-    }
-    return matchNumber(str(a, start, end));                // radix, ratio, N, M, invalid
-  }
-
-  private static String str(char[] a, int start, int end) {
-    return new String(a, start, end - start);
-  }
-
-  private static boolean isDigit(char c) {
-    return c >= '0' && c <= '9';
-  }
-
-  private static int digitVal(char c, int base) {
-    int d;
-    if (c >= '0' && c <= '9') d = c - '0';
-    else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
-    else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
-    else return -1;
-    return d < base ? d : -1;
-  }
-
-  // Parses [i,end) as an unsigned magnitude in the given base (<= 16). Returns null if
-  // any character is not a valid digit, the run is empty, or the value overflows a long
-  // (in which case the caller falls back to matchNumber's BigInteger handling). A magnitude
-  // that fits a long always has bitLength < 64, so it maps to Long just like Clojure does.
-  private static Long parseMag(char[] a, int i, int end, int base) {
-    if (i >= end) return null;
-    long val = 0;
-    for (; i < end; i++) {
-      int d = digitVal(a[i], base);
-      if (d < 0) return null;
-      if (val > (Long.MAX_VALUE - d) / base) return null;  // overflow -> BigInt path
-      val = val * base + d;
-    }
-    return val;
-  }
-
-  // True iff [i,end) matches floatPat's magnitude grammar: [0-9]+(\.[0-9]*)?([eE][-+]?[0-9]+)?
-  // Only called once a '.' or exponent is known present, so it never accepts a bare integer
-  // (which intPat would have claimed first).
-  private static boolean isFloat(char[] a, int i, int end) {
-    int ds = i;
-    while (i < end && isDigit(a[i])) i++;
-    if (i == ds) return false;                 // need at least one leading digit
-    if (i < end && a[i] == '.') {
-      i++;
-      while (i < end && isDigit(a[i])) i++;
-    }
-    if (i < end && (a[i] == 'e' || a[i] == 'E')) {
-      i++;
-      if (i < end && (a[i] == '+' || a[i] == '-')) i++;
-      int es = i;
-      while (i < end && isDigit(a[i])) i++;
-      if (i == es) return false;               // exponent needs at least one digit
-    }
-    return i == end;
-  }
-
-  // --- Faithful port of the original matchNumber ---
-
-  private static final Pattern intPat =
-      Pattern.compile("([-+]?)(?:(0)|([1-9][0-9]*)|0[xX]([0-9A-Fa-f]+)|0([0-7]+)|([1-9][0-9]?)[rR]([0-9A-Za-z]+)|0[0-9]+)(N)?");
-  private static final Pattern ratioPat = Pattern.compile("([-+]?[0-9]+)/([0-9]+)");
-  private static final Pattern floatPat = Pattern.compile("([-+]?[0-9]+(\\.[0-9]*)?([eE][-+]?[0-9]+)?)(M)?");
-
-  private static Object matchNumber(String s) {
-    Matcher m = intPat.matcher(s);
-    if (m.matches()) {
-      if (m.group(2) != null) {
-        if (m.group(8) != null)
-          return BigInt.ZERO;
-        return Numbers.num(0);
-      }
-      boolean negate = m.group(1).equals("-");
-      String n;
-      int radix = 10;
-      if ((n = m.group(3)) != null)
-        radix = 10;
-      else if ((n = m.group(4)) != null)
-        radix = 16;
-      else if ((n = m.group(5)) != null)
-        radix = 8;
-      else if ((n = m.group(7)) != null)
-        radix = Integer.parseInt(m.group(6));
-      if (n == null)
-        return null;
-      BigInteger bn = new BigInteger(n, radix);
-      if (negate)
-        bn = bn.negate();
-      if (m.group(8) != null)
-        return BigInt.fromBigInteger(bn);
-      return bn.bitLength() < 64 ? Numbers.num(bn.longValue()) : BigInt.fromBigInteger(bn);
-    }
-    m = floatPat.matcher(s);
-    if (m.matches()) {
-      if (m.group(4) != null)
-        return new BigDecimal(m.group(1));
-      return Double.parseDouble(s);
-    }
-    m = ratioPat.matcher(s);
-    if (m.matches()) {
-      String numerator = m.group(1);
-      if (numerator.startsWith("+"))
-        numerator = numerator.substring(1);
-      return Numbers.divide(
-          Numbers.reduceBigInt(BigInt.fromBigInteger(new BigInteger(numerator))),
-          Numbers.reduceBigInt(BigInt.fromBigInteger(new BigInteger(m.group(2)))));
-    }
-    return null;
-  }
 }

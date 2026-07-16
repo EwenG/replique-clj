@@ -2,16 +2,16 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
-  <!-- A fork of Clojure 1.12.5 whose LispReader is replaced by the Buffer-backed reader
-       from the lijeur project. The artifactId is deliberately still `clojure`, so this jar
-       can be substituted for org.clojure:clojure on a classpath. -->
+  <!-- Clojure 1.12.5, vendored byte-identical to upstream, with a self-contained Maven build
+       (no Ant). The artifactId is deliberately still `clojure`, so this jar can be substituted
+       for org.clojure:clojure on a classpath. -->
   <groupId>replique-clj</groupId>
   <artifactId>clojure</artifactId>
   <name>replique-clj</name>
   <packaging>jar</packaging>
   <version>1.12.5-r1</version>
 
-  <description>Clojure 1.12.5 with a fast, Buffer-backed LispReader.</description>
+  <description>Clojure 1.12.5, vendored verbatim, with a self-contained Maven build.</description>
 
   <licenses>
     <license>
@@ -149,9 +149,9 @@
                 </systemProperty>
               </systemProperties>
               <!-- Namespaces AOT-compiled into the jar (clojure.lang.Compile takes one per
-                   argument). This is the bootstrap: the JVM running Compile is running OUR
-                   freshly-built classes, so clojure/core.clj is read by the new LispReader.
-                   If the reader is broken, this is the step that fails. -->
+                   argument). This is the bootstrap: the JVM running Compile is running the
+                   freshly-built classes above, reading and compiling clojure/core.clj and the
+                   rest of the standard library into target/classes. -->
               <arguments>
                 <argument>clojure.core</argument>
                 <argument>clojure.core.protocols</argument>
@@ -188,7 +188,8 @@
         </executions>
       </plugin>
 
-      <!-- JUnit tests for the reader (test/java). -->
+      <!-- JUnit tests under test/java (currently none: the source is stock Clojure, covered by
+           the vendored Clojure test suite; see the clojure-test profile below). -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
@@ -220,9 +221,8 @@
 
   <profiles>
     <!-- Clojure's own test suite (test/clojure), via upstream's own runner script. NOT bound to
-         the default `test` phase: it is currently RED, because several test namespaces cannot even
-         be read yet (reader conditionals, record literals, #^). See the gap list in LispReader's
-         class doc and in the README. It is the driver for the remaining work.
+         the default `test` phase; run it explicitly. Because the source is byte-identical to the
+         clojure-1.12.5 tag, it behaves exactly as it does on upstream Clojure.
          Run with: mvn test -Pclojure-test -->
     <profile>
       <id>clojure-test</id>

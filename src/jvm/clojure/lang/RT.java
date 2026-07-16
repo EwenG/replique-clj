@@ -1892,9 +1892,8 @@ static public Object readString(String s){
 }
 
 static public Object readString(String s, Object opts) {
-	// The reader owns the whole string, so nothing else can read from it concurrently: take
-	// LispReader's chunked path rather than the character-at-a-time PushbackReader one.
-	return LispReader.readString(s, opts);
+	PushbackReader r = new PushbackReader(new StringReader(s));
+	return LispReader.read(r, opts);
 }
 
 static public void print(Object x, Writer w) throws IOException{
