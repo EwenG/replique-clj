@@ -4,17 +4,44 @@ Clojure 1.12.5, vendored from the upstream `clojure-1.12.5` tag, with a self-con
 The jar is published as `replique-clj/clojure:1.12.5-r1`, deliberately keeping the artifactId
 `clojure`, so it can be dropped onto a classpath in place of `org.clojure/clojure`.
 
+**Requires Java 21+**, unlike upstream 1.12.5, which runs on Java 8. See
+[Divergence from upstream](#divergence-from-upstream).
+
 ## What this is (and isn't)
 
 - **This fork does not promise to stay byte-identical to upstream.** Divergence in `src` is on the
   table where it earns its keep. Judge a change on its merits — a benchmark, a bug, the vendored
   test suite passing — not on whether it perturbs the diff against the tag.
-- **As it stands, `src` and `test` are unmodified** (`git diff clojure-1.12.5 -- src test` is
-  empty), so behaviour is stock Clojure 1.12.5: the reader, the compiler, the numerics, source
-  metadata (`:line` / `:column` on lists and `^meta` seqs). That is a description of the current
-  state, not a constraint on future ones.
-- **What differs today is the build** and the packaging (`groupId` / `version`). See
+- **Behaviour is stock Clojure 1.12.5** — the reader, the numerics, source metadata (`:line` /
+  `:column` on lists and `^meta` seqs) — with the compiler diverging as listed below.
+- **The rest of the difference is the build** and the packaging (`groupId` / `version`). See
   [Build](#build) and [The build vs. upstream's](#the-build-vs-upstreams).
+
+## Divergence from upstream
+
+`git diff clojure-1.12.5 -- src test` lists it; `test` is untouched. Today it is one change:
+
+- **`Compiler.writeClassFile` defers the compiler's own class-file writes to virtual threads**, and
+  joins them at each namespace boundary. Class-file I/O is ~13% of AOT wall time (~2800 files for
+  the standard library); deferring it takes the full standard-library AOT build from ~3.55s to
+  ~3.34s (**~6%**) on an M1. The public `writeClassFile` stays synchronous — `clojure.core/proxy`
+  writes a proxy class and immediately resolves it *by name* off the classpath, so deferring that
+  particular write races the read and produces a truncated class file. Only the two compiler-
+  internal call sites defer.
+
+  This is what costs the Java 21 baseline: the executor is a static field of `Compiler`, so on an
+  older JVM the class would not initialise at all. It does not change the bytecode the Clojure
+  compiler *emits* — that is pinned to `V1_8` and stays Java 8 class files; it is `clojure.lang.*`
+  itself that now needs 21.
+
+  **The Java 21 floor is deliberate, and it is not bought by the speedup.** Virtual threads are not
+  load-bearing here: a 4-thread platform pool measures the same within noise, because file I/O pins
+  the carrier thread and the virtual threads buy no extra concurrency over carriers. The ~6% comes
+  from *deferring* the writes, not from what they run on, and a platform pool would deliver it on
+  Java 8. Virtual threads are the chosen shape anyway — this fork targets modern JVMs and upstream
+  1.12 is already the last release on a Java 8 baseline. If you ever need the Java 8 floor back,
+  swap `Executors.newVirtualThreadPerTaskExecutor()` for a small fixed platform pool and drop
+  `maven.compiler.release` — nothing else in the design depends on it.
 
 > **History.** An earlier iteration replaced the `LispReader` with a faster, `Buffer`-backed reader
 > (ported from the sibling *lijeur* project). It was reverted, and the measurements say that was the
@@ -54,6 +81,9 @@ non-direct-linked ones go through `Var.getRawRoot`.
 assembly plugin is not configured here. Wire it back up if you want those artifacts.
 
 ### Using the jar standalone
+
+Needs a **Java 21+** runtime (see [Divergence from upstream](#divergence-from-upstream)); on an
+older JVM `clojure.lang.Compiler` fails to initialise.
 
 Clojure 1.12 pulls in `org.clojure/spec.alpha` and `org.clojure/core.specs.alpha` at boot, and this
 jar does not bundle them. They are declared as dependencies (so downstream Maven/deps consumers get

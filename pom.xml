@@ -23,8 +23,14 @@
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <maven.compiler.source>1.8</maven.compiler.source>
-    <maven.compiler.target>1.8</maven.compiler.target>
+
+    <!-- Java 21, not upstream's 8: Compiler.writeClassFile hands class-file writes to virtual
+         threads (Executors.newVirtualThreadPerTaskExecutor, JDK 21+), and the executor is a static
+         field of Compiler, so on an older JVM the class would fail to initialise at all rather than
+         only when AOT-compiling. This raises the runtime floor for the whole jar. Note it does not
+         change the bytecode the *Clojure* compiler emits: that is pinned to V1_8 in Compiler.java
+         and stays Java 8 class files. -->
+    <maven.compiler.release>21</maven.compiler.release>
 
     <!-- Direct linking is how Clojure builds its own core: it compiles core's calls as static
          invocations instead of Var dereferences. Turn it off to get redefinable core Vars.

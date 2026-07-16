@@ -5241,7 +5241,9 @@ static public class ObjExpr implements Expr{
 
 		bytecode = cw.toByteArray();
 		if(RT.booleanCast(COMPILE_FILES.deref()))
-			writeClassFile(internalName, bytecode);
+			// safe to defer: getCompiledClass() defines this class from the bytes above, so it is
+			// never loaded from disk within the namespace being compiled
+			writeClassFileAsync(internalName, bytecode);
 //		else
 //			getCompiledClass();
 	}
@@ -8243,30 +8245,94 @@ public static Object load(Reader rdr, String sourcePath, String sourceName) {
 	return ret;
 }
 
-static public void writeClassFile(String internalName, byte[] bytecode) throws IOException{
+// Writing the .class files is ~13% of AOT wall time (~2800 files for the standard library), so the
+// compiler's own writes are handed to virtual threads and joined at each namespace boundary instead
+// of blocking the compile thread one file at a time.
+//
+// Only writeClassFileAsync is deferred, and only two call sites use it: ObjExpr.compile (the fn /
+// deftype classes, which are the bulk) and compile() (the namespace __init class). Both are safe
+// because their classes are handed to the DynamicClassLoader as in-memory bytes and are never read
+// back off disk within the namespace being compiled.
+//
+// writeClassFile itself stays synchronous, and that is deliberate: it is public API, and its
+// callers in Clojure source do read back what they just wrote. clojure.core/proxy writes the proxy
+// class and then immediately resolves it *by name* (core_proxy.clj: get-proxy-class ->
+// RT/loadClassForName), which finds it on the classpath because *compile-path* is normally on the
+// classpath. Deferring that write races the read and yields a truncated class file.
+//
+// The namespace-boundary join is likewise not optional: once a namespace is compiled a later one
+// may `require` it and load the __init class straight off disk.
+static final java.util.concurrent.ExecutorService CLASS_FILE_WRITER =
+	java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+
+static final java.util.Queue<java.util.concurrent.Future<?>> PENDING_WRITES =
+	new java.util.concurrent.ConcurrentLinkedQueue<java.util.concurrent.Future<?>>();
+
+// Directory creation is a syscall per path component, and the set of directories is tiny next to
+// the number of class files landing in them.
+static final java.util.Set<String> KNOWN_DIRS =
+	java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+// Blocks until every class file written so far has hit disk, rethrowing the first failure. Called
+// at each namespace boundary; safe to call when nothing is pending.
+static public void awaitClassFileWrites(){
+	java.util.concurrent.Future<?> f;
+	Throwable failure = null;
+	while((f = PENDING_WRITES.poll()) != null)
+		{
+		try
+			{
+			f.get();
+			}
+		catch(InterruptedException e)
+			{
+			Thread.currentThread().interrupt();
+			if(failure == null) failure = e;
+			}
+		catch(java.util.concurrent.ExecutionException e)
+			{
+			// drain the rest before reporting, so no write outlives this barrier
+			if(failure == null) failure = e.getCause() != null ? e.getCause() : e;
+			}
+		}
+	if(failure != null)
+		throw Util.sneakyThrow(failure);
+}
+
+// Resolves internalName to its .class path, creating the directory if this is the first class to
+// land in it.
+static java.nio.file.Path classFilePath(String internalName){
 	String genPath = (String) COMPILE_PATH.deref();
 	if(genPath == null)
 		throw Util.runtimeException("*compile-path* not set");
-	String[] dirs = internalName.split("/");
-	String p = genPath;
-	for(int i = 0; i < dirs.length - 1; i++)
+	int slash = internalName.lastIndexOf('/');
+	if(slash > 0)
 		{
-		p += File.separator + dirs[i];
-		(new File(p)).mkdir();
+		String dir = genPath + File.separator
+		             + internalName.substring(0, slash).replace('/', File.separatorChar);
+		if(KNOWN_DIRS.add(dir))
+			(new File(dir)).mkdirs();
 		}
-	String path = genPath + File.separator + internalName + ".class";
-	File cf = new File(path);
-	cf.createNewFile();
-	FileOutputStream cfs = new FileOutputStream(cf);
-	try
-		{
-		cfs.write(bytecode);
-		cfs.flush();
-		}
-	finally
-		{
-		cfs.close();
-		}
+	return (new File(genPath + File.separator
+	                 + internalName.replace('/', File.separatorChar) + ".class")).toPath();
+}
+
+// Public API, and synchronous: callers such as clojure.core/proxy resolve the class by name
+// immediately after writing it. See the note on CLASS_FILE_WRITER.
+static public void writeClassFile(String internalName, byte[] bytecode) throws IOException{
+	java.nio.file.Files.write(classFilePath(internalName), bytecode);
+}
+
+// Compiler-internal: the write is deferred and joined by awaitClassFileWrites() at the next
+// namespace boundary. Only for classes that are not read back off disk before then.
+static void writeClassFileAsync(String internalName, final byte[] bytecode) throws IOException{
+	final java.nio.file.Path path = classFilePath(internalName);
+	PENDING_WRITES.add(CLASS_FILE_WRITER.submit(new java.util.concurrent.Callable<Void>(){
+		public Void call() throws IOException {
+			java.nio.file.Files.write(path, bytecode);
+			return null;
+			}
+		}));
 }
 
 public static void pushNS(){
@@ -8479,7 +8545,9 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 		//end of class
 		cv.visitEnd();
 
-		writeClassFile(objx.internalName, cw.toByteArray());
+		// safe to defer: joined by awaitClassFileWrites() below, before any later namespace can
+		// require this one and load the __init class off disk
+		writeClassFileAsync(objx.internalName, cw.toByteArray());
 		}
 	catch(LispReader.ReaderException e)
 		{
@@ -8488,6 +8556,10 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 	finally
 		{
 		Var.popThreadBindings();
+		// every class file this namespace produced must be on disk before the next one is
+		// compiled: *compile-path* is usually on the classpath, so the next namespace's
+		// `require` may load them straight off disk
+		awaitClassFileWrites();
 		}
 	return ret;
 }
