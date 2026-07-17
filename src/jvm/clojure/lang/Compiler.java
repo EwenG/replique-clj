@@ -350,6 +350,24 @@ static IAnalysisSink analysisSink(){
 	return (IAnalysisSink) ANALYSIS_SINK.deref();
 }
 
+// [line, column, endLine, endColumn] for a source symbol. Prefers the precise
+// span the reader attached (Layer 1); falls back to the enclosing form's
+// line/column with -1 ends when the symbol carries no reader position.
+static int[] symbolPosition(Symbol sym){
+	IPersistentMap m = sym.meta();
+	if(m != null && m.containsKey(RT.LINE_KEY))
+		{
+		Object el = m.valAt(LispReader.END_LINE_KEY);
+		Object ec = m.valAt(LispReader.END_COLUMN_KEY);
+		int line = ((Number) m.valAt(RT.LINE_KEY)).intValue();
+		int col = ((Number) m.valAt(RT.COLUMN_KEY)).intValue();
+		return new int[]{line, col,
+		                 el != null ? ((Number) el).intValue() : line,
+		                 ec != null ? ((Number) ec).intValue() : col};
+		}
+	return new int[]{lineDeref(), columnDeref(), -1, -1};
+}
+
     public enum C{
 	STATEMENT,  //value ignored
 	EXPRESSION, //value required
@@ -583,7 +601,10 @@ static class DefExpr implements Expr{
             mm = (IPersistentMap) RT.assoc(mm, RT.LINE_KEY, LINE.get()).assoc(RT.COLUMN_KEY, COLUMN.get()).assoc(RT.FILE_KEY, source_path);
             IAnalysisSink sink = analysisSink();
             if(sink != null)
-                sink.varDef(v, (String) source_path, lineDeref(), columnDeref());
+                {
+                int[] pos = symbolPosition(sym);
+                sink.varDef(v, (String) source_path, pos[0], pos[1], pos[2], pos[3]);
+                }
 			if (docstring != null)
 			  mm = (IPersistentMap) RT.assoc(mm, RT.DOC_KEY, docstring);
 //			mm = mm.without(RT.DOC_KEY)
@@ -7924,7 +7945,11 @@ private static Expr analyzeSymbol(Symbol sym) {
 		registerVar(v);
 		IAnalysisSink sink = analysisSink();
 		if(sink != null)
-			sink.varUsage(v, currentNS(), (String) SOURCE_PATH.deref(), lineDeref(), columnDeref());
+			{
+			int[] pos = symbolPosition(sym);
+			sink.varUsage(v, currentNS(), (String) SOURCE_PATH.deref(),
+			              pos[0], pos[1], pos[2], pos[3]);
+			}
 		return new VarExpr(v, tag);
 		}
 	else if(o instanceof Class)

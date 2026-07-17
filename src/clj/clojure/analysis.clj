@@ -20,18 +20,23 @@
   (:import [clojure.lang IAnalysisSink Compiler Var]))
 
 ;; model:
-;;   :usages  {target-var #{ {:from-ns :source :line :column} ... }}
-;;   :defs    {var         {:source :line :column} }
+;;   :usages  {target-var #{ {:from-ns :source :line :column :end-line :end-column} ... }}
+;;   :defs    {var         {:source :line :column :end-line :end-column} }
 (defonce ^:private model (atom {:usages {} :defs {}}))
+
+(defn- span [source line column end-line end-column]
+  (cond-> {:source source :line line :column column}
+    (nat-int? end-line)   (assoc :end-line end-line)
+    (nat-int? end-column) (assoc :end-column end-column)))
 
 (deftype AnalysisSink []
   IAnalysisSink
-  (varUsage [_ target from-ns source line column]
+  (varUsage [_ target from-ns source line column end-line end-column]
     (swap! model update-in [:usages target] (fnil conj #{})
-           {:from-ns from-ns :source source :line line :column column})
+           (assoc (span source line column end-line end-column) :from-ns from-ns))
     nil)
-  (varDef [_ v source line column]
-    (swap! model assoc-in [:defs v] {:source source :line line :column column})
+  (varDef [_ v source line column end-line end-column]
+    (swap! model assoc-in [:defs v] (span source line column end-line end-column))
     nil))
 
 (defn reset-model!

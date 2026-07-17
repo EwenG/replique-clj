@@ -60,6 +60,12 @@ static Symbol READ_COND_SPLICING = Symbol.intern("clojure.core", "read-cond-spli
 static Keyword UNKNOWN = Keyword.intern(null, "unknown");
 //static Symbol DEREF_BANG = Symbol.intern("clojure.core", "deref!");
 
+// Source-position metadata keys attached to symbols during analysis
+// (Layer 1). :line/:column reuse RT's keys; end positions are exclusive
+// (the column just past the last character). See doc/analysis-and-reload.md.
+static final Keyword END_LINE_KEY = Keyword.intern(null, "end-line");
+static final Keyword END_COLUMN_KEY = Keyword.intern(null, "end-column");
+
 static IFn[] macros = new IFn[256];
 static IFn[] dispatchMacros = new IFn[256];
 //static Pattern symbolPat = Pattern.compile("[:]?([\\D&&[^:/]][^:/]*/)?[\\D&&[^:/]][^:/]*");
@@ -131,6 +137,22 @@ public static interface Resolver{
 
 static boolean isWhitespace(int ch){
 	return Character.isWhitespace(ch) || ch == ',';
+}
+
+// True when the compiler wants source positions recorded (analysis is on).
+static boolean positionsRequested(){
+	return Compiler.ANALYSIS_SINK.deref() != null;
+}
+
+static private Object attachSourcePosition(IObj o, int line, int column, int endLine, int endColumn){
+	IPersistentMap meta = o.meta();
+	if(meta == null)
+		meta = PersistentArrayMap.EMPTY;
+	meta = meta.assoc(RT.LINE_KEY, line)
+	           .assoc(RT.COLUMN_KEY, column)
+	           .assoc(END_LINE_KEY, endLine)
+	           .assoc(END_COLUMN_KEY, endColumn);
+	return o.withMeta(meta);
 }
 
 static void unread(PushbackReader r, int ch) {
@@ -303,8 +325,26 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 				unread(r, ch2);
 				}
 
+			// Layer 1: when analysis is on and we have a line-numbering reader,
+			// capture the symbol's precise start/end position and attach it as
+			// metadata. Gated so normal reads are byte-for-byte unaffected.
+			boolean recordPos = (r instanceof LineNumberingPushbackReader) && positionsRequested();
+			int startLine = -1, startColumn = -1;
+			if(recordPos)
+				{
+				LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
+				startLine = lr.getLineNumber();
+				startColumn = lr.getColumnNumber() - 1;
+				}
 			String token = readToken(r, (char) ch);
-			return interpretToken(token, resolver);
+			Object ret = interpretToken(token, resolver);
+			if(recordPos && ret instanceof Symbol)
+				{
+				LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
+				ret = attachSourcePosition((IObj) ret, startLine, startColumn,
+				                           lr.getLineNumber(), lr.getColumnNumber());
+				}
+			return ret;
 			}
 		}
 	catch(Exception e)
