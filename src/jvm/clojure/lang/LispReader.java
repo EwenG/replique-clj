@@ -344,6 +344,18 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 				ret = attachSourcePosition((IObj) ret, startLine, startColumn,
 				                           lr.getLineNumber(), lr.getColumnNumber());
 				}
+			else if(recordPos && ret instanceof Keyword)
+				{
+				// Keywords can't carry metadata, so emit the occurrence directly.
+				IAnalysisSink sink = Compiler.analysisSink();
+				if(sink != null)
+					{
+					LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
+					sink.keywordUsage((Keyword) ret, Compiler.currentNS(),
+					                  (String) Compiler.SOURCE_PATH.deref(),
+					                  startLine, startColumn, lr.getLineNumber(), lr.getColumnNumber());
+					}
+				}
 			return ret;
 			}
 		}

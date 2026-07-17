@@ -350,6 +350,42 @@ static IAnalysisSink analysisSink(){
 	return (IAnalysisSink) ANALYSIS_SINK.deref();
 }
 
+// True when sym carries a reader-attached position, i.e. it was written in
+// source rather than introduced by macroexpansion. Lets analysis skip
+// synthetic symbols (gensyms, macro plumbing) - the "free synthetic-form
+// filtering" from the design.
+static boolean isSourceSymbol(Symbol sym){
+	IPersistentMap m = sym.meta();
+	return m != null && m.containsKey(RT.LINE_KEY);
+}
+
+// Carry orig's reader position onto cls (the class symbol split out of a
+// Foo. constructor form), trimming the trailing dot from the end column, so
+// (Foo. ...) records a class usage at Foo. No-op when orig has no position
+// (analysis off), keeping normal macroexpansion unchanged.
+static Symbol carryClassPosition(Symbol orig, Symbol cls){
+	IPersistentMap m = orig.meta();
+	if(m == null || !m.containsKey(RT.LINE_KEY))
+		return cls;
+	Object ec = m.valAt(LispReader.END_COLUMN_KEY);
+	IPersistentMap nm = RT.map(RT.LINE_KEY, m.valAt(RT.LINE_KEY),
+	                           RT.COLUMN_KEY, m.valAt(RT.COLUMN_KEY),
+	                           LispReader.END_LINE_KEY, m.valAt(LispReader.END_LINE_KEY),
+	                           LispReader.END_COLUMN_KEY, ec instanceof Number ? ((Number) ec).intValue() - 1 : ec);
+	return (Symbol) cls.withMeta(nm);
+}
+
+// Emit a class-usage event positioned at sym, when analysis is on and sym is
+// source-written.
+static void sinkClassUsage(Class c, Symbol sym){
+	IAnalysisSink sink = analysisSink();
+	if(sink != null && isSourceSymbol(sym))
+		{
+		int[] pos = symbolPosition(sym);
+		sink.classUsage(c, currentNS(), (String) SOURCE_PATH.deref(), pos[0], pos[1], pos[2], pos[3]);
+		}
+}
+
 // [line, column, endLine, endColumn] for a source symbol. Prefers the precise
 // span the reader attached (Layer 1); falls back to the enclosing form's
 // line/column with -1 ends when the symbol carries no reader position.
@@ -1087,6 +1123,8 @@ static public abstract class HostExpr implements Expr, MaybePrimitiveExpr{
 			}
 		else if(stringOk && form instanceof String)
 			c = RT.classForNameNonLoading((String) form);
+		if(c != null && form instanceof Symbol)
+			sinkClassUsage(c, (Symbol) form);
 		return c;
 	}
 
@@ -7353,6 +7391,13 @@ private static LocalBinding registerLocal(Symbol sym, Symbol tag, Expr init, boo
 	ObjMethod method = (ObjMethod) METHOD.deref();
 	method.locals = (IPersistentMap) RT.assoc(method.locals, b, b);
 	method.indexlocals = (IPersistentMap) RT.assoc(method.indexlocals, num, b);
+	IAnalysisSink sink = analysisSink();
+	if(sink != null && isSourceSymbol(sym))
+		{
+		int[] pos = symbolPosition(sym);
+		sink.localDef(b, sym.name, currentNS(), (String) SOURCE_PATH.deref(),
+		              pos[0], pos[1], pos[2], pos[3]);
+		}
 	return b;
 }
 
@@ -7609,6 +7654,15 @@ public static Object macroexpand1(Object x) {
 		Var v = isMacro(op);
 		if(v != null)
 			{
+				IAnalysisSink sink = analysisSink();
+				if(sink != null)
+					{
+					int[] pos = (op instanceof Symbol) ? symbolPosition((Symbol) op)
+					                                    : new int[]{lineDeref(), columnDeref(), -1, -1};
+					sink.macroExpansion(v, currentNS(), (String) SOURCE_PATH.deref(),
+					                    pos[0], pos[1], pos[2], pos[3]);
+					}
+
 				checkSpecs(v, form);
 
 				try
@@ -7678,7 +7732,7 @@ public static Object macroexpand1(Object x) {
 					//(StringBuilder. "foo") => (new StringBuilder "foo")	
 					//else 
 					if(idx == sname.length() - 1)
-						return RT.listStar(NEW, Symbol.intern(sname.substring(0, idx)), form.next());
+						return RT.listStar(NEW, carryClassPosition(sym, Symbol.intern(sname.substring(0, idx))), form.next());
 					}
 				}
 			}
@@ -7904,6 +7958,13 @@ private static Expr analyzeSymbol(Symbol sym) {
 		LocalBinding b = referenceLocal(sym);
 		if(b != null)
             {
+            IAnalysisSink sink = analysisSink();
+            if(sink != null && isSourceSymbol(sym))
+                {
+                int[] pos = symbolPosition(sym);
+                sink.localUsage(b, currentNS(), (String) SOURCE_PATH.deref(),
+                                pos[0], pos[1], pos[2], pos[3]);
+                }
             return new LocalBindingExpr(b, tag);
             }
 		}
@@ -7915,6 +7976,7 @@ private static Expr analyzeSymbol(Symbol sym) {
 			Class c = HostExpr.maybeClass(nsSym, false);
 			if(c != null)
 				{
+				sinkClassUsage(c, sym);
 				if(Reflector.getField(c, sym.name, true) != null)
 					{
 					List<Executable> maybeOverloads = QualifiedMethodExpr.methodOverloads(c, sym.name, QualifiedMethodExpr.MethodKind.STATIC);
@@ -7953,7 +8015,10 @@ private static Expr analyzeSymbol(Symbol sym) {
 		return new VarExpr(v, tag);
 		}
 	else if(o instanceof Class)
+		{
+		sinkClassUsage((Class) o, sym);
 		return new ConstantExpr(o);
+		}
 	else if(o instanceof Symbol)
 			return new UnresolvedVarExpr((Symbol) o);
 
