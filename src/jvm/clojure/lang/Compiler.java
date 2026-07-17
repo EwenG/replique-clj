@@ -341,6 +341,15 @@ static final public Var CLEAR_ROOT = Var.create(null).setDynamic();
 //LocalBinding -> Set<LocalBindingExpr>
 static final public Var CLEAR_SITES = Var.create(null).setDynamic();
 
+//IAnalysisSink or null - when bound to a non-null sink, analysis emits
+//semantic events (var usages/defs, ...) into it. Default null => no events,
+//just a null check per potential event. See doc/analysis-and-reload.md.
+static final public Var ANALYSIS_SINK = Var.create(null).setDynamic();
+
+static IAnalysisSink analysisSink(){
+	return (IAnalysisSink) ANALYSIS_SINK.deref();
+}
+
     public enum C{
 	STATEMENT,  //value ignored
 	EXPRESSION, //value required
@@ -572,6 +581,9 @@ static class DefExpr implements Expr{
             Object source_path = SOURCE_PATH.get();
             source_path = source_path == null ? "NO_SOURCE_FILE" : source_path;
             mm = (IPersistentMap) RT.assoc(mm, RT.LINE_KEY, LINE.get()).assoc(RT.COLUMN_KEY, COLUMN.get()).assoc(RT.FILE_KEY, source_path);
+            IAnalysisSink sink = analysisSink();
+            if(sink != null)
+                sink.varDef(v, (String) source_path, lineDeref(), columnDeref());
 			if (docstring != null)
 			  mm = (IPersistentMap) RT.assoc(mm, RT.DOC_KEY, docstring);
 //			mm = mm.without(RT.DOC_KEY)
@@ -7910,6 +7922,9 @@ private static Expr analyzeSymbol(Symbol sym) {
 		if(RT.booleanCast(RT.get(v.meta(),RT.CONST_KEY)))
 			return analyze(C.EXPRESSION, RT.list(QUOTE, v.get()));
 		registerVar(v);
+		IAnalysisSink sink = analysisSink();
+		if(sink != null)
+			sink.varUsage(v, currentNS(), (String) SOURCE_PATH.deref(), lineDeref(), columnDeref());
 		return new VarExpr(v, tag);
 		}
 	else if(o instanceof Class)
