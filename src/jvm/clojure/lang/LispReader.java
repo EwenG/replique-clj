@@ -1149,6 +1149,10 @@ public static class SyntaxQuoteReader extends AFn{
 				else
 					sym = Compiler.resolveSymbol(sym);
 				}
+			// A var/class reference written inside this syntax-quote template
+			// (e.g. a defmacro body) is quoted, so analysis never sees it as a
+			// reference. Capture it here, positioned at the symbol as written.
+			Compiler.sinkSyntaxQuoteRef(form, sym);
 			ret = RT.list(Compiler.QUOTE, sym);
 			}
 		else if(isUnquote(form))
@@ -1193,10 +1197,16 @@ public static class SyntaxQuoteReader extends AFn{
 
 		if(form instanceof IObj && RT.meta(form) != null)
 			{
-			//filter line and column numbers
-			IPersistentMap newMeta = ((IObj) form).meta().without(RT.LINE_KEY).without(RT.COLUMN_KEY);
+			IPersistentMap full = ((IObj) form).meta();
+			//filter line and column numbers - incl. the Layer 1 end-line/end-column,
+			//so an analysed syntax-quote does not stamp the macro *body* position onto
+			//emitted symbols (which would make them look source-written, and record a
+			//phantom usage, at every expansion site). When analysis is off, END keys
+			//are absent and the attached meta stays the full original - upstream-identical.
+			IPersistentMap newMeta = full.without(RT.LINE_KEY).without(RT.COLUMN_KEY)
+			                             .without(END_LINE_KEY).without(END_COLUMN_KEY);
 			if(newMeta.count() > 0)
-				return RT.list(WITH_META, ret, syntaxQuote(((IObj) form).meta()));
+				return RT.list(WITH_META, ret, syntaxQuote(positionsRequested() ? newMeta : full));
 			}
 		return ret;
 	}

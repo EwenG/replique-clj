@@ -404,6 +404,48 @@ static int[] symbolPosition(Symbol sym){
 	return new int[]{lineDeref(), columnDeref(), -1, -1};
 }
 
+// A var or class reference written inside a syntax-quote template - e.g. the
+// body of a defmacro: `(helper ~x) or `(Foo. ~x). Such references are quoted,
+// so they never reach analyzeSymbol/maybeClass; SyntaxQuoteReader calls this to
+// capture them at read time, positioned at the symbol as written. orig is the
+// symbol as read (carrying the reader position); resolved is the fully-qualified
+// symbol syntax-quote produced. Only source-written references are recorded, and
+// the lookups never throw - a not-yet-defined or unresolvable reference is
+// silently skipped (usages are keyed by Var/Class identity, so we need the
+// object, not just the name).
+static void sinkSyntaxQuoteRef(Object orig, Symbol resolved){
+	if(analysisSink() == null || !(orig instanceof Symbol) || !isSourceSymbol((Symbol) orig))
+		return;
+	Symbol origSym = (Symbol) orig;
+	if(resolved.ns != null)
+		{
+		Namespace ns = Namespace.find(Symbol.intern(resolved.ns));
+		if(ns != null)
+			{
+			Var v = ns.findInternedVar(Symbol.intern(resolved.name));
+			if(v != null)
+				{
+				int[] pos = symbolPosition(origSym);
+				analysisSink().varUsage(v, currentNS(), (String) SOURCE_PATH.deref(),
+				                        pos[0], pos[1], pos[2], pos[3]);
+				}
+			}
+		}
+	else
+		{
+		String cname = resolved.name;
+		boolean ctor = cname.endsWith(".");
+		if(ctor)
+			cname = cname.substring(0, cname.length() - 1);
+		if(cname.indexOf('.') > 0)
+			{
+			Class c = RT.classForNameNonLoading(cname);
+			if(c != null)
+				sinkClassUsage(c, ctor ? carryClassPosition(origSym, Symbol.intern(cname)) : origSym);
+			}
+		}
+}
+
     public enum C{
 	STATEMENT,  //value ignored
 	EXPRESSION, //value required
@@ -7657,10 +7699,17 @@ public static Object macroexpand1(Object x) {
 				IAnalysisSink sink = analysisSink();
 				if(sink != null)
 					{
-					int[] pos = (op instanceof Symbol) ? symbolPosition((Symbol) op)
-					                                    : new int[]{lineDeref(), columnDeref(), -1, -1};
+					// Record the macro *usage* only for a source-written call (the
+					// macro name is textually present); an expansion-introduced
+					// macro call - macro emitting another macro - has no position
+					// and is captured at that macro's body instead. The dependency
+					// edge is recorded regardless: stale reload needs a->b even
+					// when b is only reached via expansion.
+					boolean src = (op instanceof Symbol) && isSourceSymbol((Symbol) op);
+					int[] pos = src ? symbolPosition((Symbol) op)
+					                : new int[]{lineDeref(), columnDeref(), -1, -1};
 					sink.macroExpansion(v, currentNS(), (String) SOURCE_PATH.deref(),
-					                    pos[0], pos[1], pos[2], pos[3]);
+					                    pos[0], pos[1], pos[2], pos[3], src);
 					}
 
 				checkSpecs(v, form);
@@ -8005,8 +8054,12 @@ private static Expr analyzeSymbol(Symbol sym) {
 		if(RT.booleanCast(RT.get(v.meta(),RT.CONST_KEY)))
 			return analyze(C.EXPRESSION, RT.list(QUOTE, v.get()));
 		registerVar(v);
+		// Only record references textually present in source (carrying a reader
+		// position). Symbols conjured by macroexpansion have no position; a
+		// syntax-quoted reference in a macro's *body* is captured at read time
+		// (sinkSyntaxQuoteRef) instead, so it isn't double-counted here.
 		IAnalysisSink sink = analysisSink();
-		if(sink != null)
+		if(sink != null && isSourceSymbol(sym))
 			{
 			int[] pos = symbolPosition(sym);
 			sink.varUsage(v, currentNS(), (String) SOURCE_PATH.deref(),

@@ -88,11 +88,16 @@ void classUsage(Class c, Namespace fromNs, String source,
 
 /**
  * A macro expansion: {@code fromNs} expanded a call to macro var {@code macro}
- * at this position. Records both a usage of the macro (macro calls bypass
- * {@link #varUsage}) and the compile-time dependency edge fromNs -&gt; macro
- * that drives macro-aware stale reload (design §9).
+ * at this position. Always records the compile-time dependency edge fromNs -&gt;
+ * macro that drives macro-aware stale reload (design §9). Records a *usage* of
+ * the macro (macro calls bypass {@link #varUsage}) only when
+ * {@code recordUsage} is true, i.e. the call is source-written - the macro name
+ * is textually present at this position. An expansion-introduced macro call (a
+ * macro emitting another macro call) passes {@code false}: the edge is still
+ * needed, but the usage is captured at the emitting macro's body instead.
  */
 void macroExpansion(Var macro, Namespace fromNs, String source,
-                    int line, int column, int endLine, int endColumn);
+                    int line, int column, int endLine, int endColumn,
+                    boolean recordUsage);
 
 }

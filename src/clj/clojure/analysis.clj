@@ -170,15 +170,21 @@
                                  (assoc (span source line column el ec) :from-ns from-ns)
                                  (current-fid m))))
     nil)
-  (macroExpansion [_ macro from-ns source line column el ec]
+  (macroExpansion [_ macro from-ns source line column el ec record-usage?]
     (swap! model (fn [m]
                    (let [fid    (current-fid m)
                          ns-sym (ns-name from-ns)
-                         sp     (assoc (span source line column el ec) :from-ns from-ns :macro true)]
-                     (-> m
-                         (record-usage :usages macro sp fid)
-                         (update-in [:macro-deps ns-sym macro] (fnil conj #{}) fid)
-                         (add-fact fid [:macro-dep ns-sym macro fid])))))
+                         ;; Always record the compile-time edge (stale reload needs
+                         ;; it even for expansion-introduced calls); record the
+                         ;; macro *usage* only for a source-written call.
+                         m      (-> m
+                                    (update-in [:macro-deps ns-sym macro] (fnil conj #{}) fid)
+                                    (add-fact fid [:macro-dep ns-sym macro fid]))]
+                     (if record-usage?
+                       (record-usage m :usages macro
+                                     (assoc (span source line column el ec) :from-ns from-ns :macro true)
+                                     fid)
+                       m))))
     nil))
 
 ;; --- drivers ---------------------------------------------------------------
