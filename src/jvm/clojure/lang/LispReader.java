@@ -155,6 +155,23 @@ static private Object attachSourcePosition(IObj o, int line, int column, int end
 	return o.withMeta(meta);
 }
 
+// True when we should attach source positions to a collection read from r.
+static boolean recordingPositions(PushbackReader r){
+	return (r instanceof LineNumberingPushbackReader) && positionsRequested();
+}
+
+// Attach a full span to a collection literal read from r, given its captured
+// start position. Only fires under analysis (rec), so normal reads keep their
+// current metadata. The end is the reader position just past the closing delim.
+static Object attachCollectionPosition(Object coll, PushbackReader r, boolean rec, int startLine, int startColumn){
+	if(rec && coll instanceof IObj)
+		{
+		LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
+		return attachSourcePosition((IObj) coll, startLine, startColumn, lr.getLineNumber(), lr.getColumnNumber());
+		}
+	return coll;
+}
+
 static void unread(PushbackReader r, int ch) {
 	if(ch != -1)
 		try
@@ -1305,6 +1322,12 @@ public static class ListReader extends AFn{
 			Object meta = RT.meta(s);
 			meta = RT.assoc(meta, RT.LINE_KEY, RT.get(meta, RT.LINE_KEY, line));
 			meta = RT.assoc(meta, RT.COLUMN_KEY, RT.get(meta,RT.COLUMN_KEY, column));
+			if(positionsRequested() && r instanceof LineNumberingPushbackReader)
+				{
+				LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
+				meta = RT.assoc(meta, END_LINE_KEY, lr.getLineNumber());
+				meta = RT.assoc(meta, END_COLUMN_KEY, lr.getColumnNumber());
+				}
 			return s.withMeta((IPersistentMap)meta);
 			}
 		else
@@ -1399,7 +1422,11 @@ public static class EvalReader extends AFn{
 public static class VectorReader extends AFn{
 	public Object invoke(Object reader, Object leftparen, Object opts, Object pendingForms) {
 		PushbackReader r = (PushbackReader) reader;
-		return LazilyPersistentVector.create(readDelimitedList(']', r, true, opts, ensurePending(pendingForms)));
+		boolean rec = recordingPositions(r);
+		int sl = rec ? ((LineNumberingPushbackReader) r).getLineNumber() : -1;
+		int sc = rec ? ((LineNumberingPushbackReader) r).getColumnNumber() - 1 : -1;
+		Object v = LazilyPersistentVector.create(readDelimitedList(']', r, true, opts, ensurePending(pendingForms)));
+		return attachCollectionPosition(v, r, rec, sl, sc);
 	}
 
 }
@@ -1407,10 +1434,13 @@ public static class VectorReader extends AFn{
 public static class MapReader extends AFn{
 	public Object invoke(Object reader, Object leftparen, Object opts, Object pendingForms) {
 		PushbackReader r = (PushbackReader) reader;
+		boolean rec = recordingPositions(r);
+		int sl = rec ? ((LineNumberingPushbackReader) r).getLineNumber() : -1;
+		int sc = rec ? ((LineNumberingPushbackReader) r).getColumnNumber() - 1 : -1;
 		Object[] a = readDelimitedList('}', r, true, opts, ensurePending(pendingForms)).toArray();
 		if((a.length & 1) == 1)
 			throw Util.runtimeException("Map literal must contain an even number of forms");
-		return RT.map(a);
+		return attachCollectionPosition(RT.map(a), r, rec, sl, sc);
 	}
 
 }
@@ -1418,7 +1448,11 @@ public static class MapReader extends AFn{
 public static class SetReader extends AFn{
 	public Object invoke(Object reader, Object leftbracket, Object opts, Object pendingForms) {
 		PushbackReader r = (PushbackReader) reader;
-		return PersistentHashSet.createWithCheck(readDelimitedList('}', r, true, opts, ensurePending(pendingForms)));
+		boolean rec = recordingPositions(r);
+		int sl = rec ? ((LineNumberingPushbackReader) r).getLineNumber() : -1;
+		int sc = rec ? ((LineNumberingPushbackReader) r).getColumnNumber() - 1 : -1;
+		Object s = PersistentHashSet.createWithCheck(readDelimitedList('}', r, true, opts, ensurePending(pendingForms)));
+		return attachCollectionPosition(s, r, rec, sl, sc);
 	}
 
 }

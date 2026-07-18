@@ -17,10 +17,21 @@ package clojure.lang;
  * a null check per potential event and emits nothing, so normal compilation,
  * AOT and REPL use are unaffected.
  *
- * This is Layer 0 of the analysis feature (var definitions and usages only).
  * See doc/analysis-and-reload.md for the full design.
  */
 public interface IAnalysisSink{
+
+/**
+ * Marks the start of analysis of one top-level form (design §7.3). All events
+ * emitted until the matching {@link #endForm} belong to this form and are
+ * filed under it for retract-and-replace. Calls nest (a top-level {@code (do
+ * ...)} evals its children as separate forms); the innermost active form owns
+ * the events.
+ */
+void beginForm(String source, int line, int column);
+
+/** Marks the end of the current top-level form (see {@link #beginForm}). */
+void endForm();
 
 /**
  * A var reference resolved during analysis. {@code target} is the referenced

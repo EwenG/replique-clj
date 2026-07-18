@@ -8321,15 +8321,33 @@ public static Object load(Reader rdr, String sourcePath, String sourceName) {
 	Object readerOpts = readerOpts(sourceName);
 	try
 		{
-		for(Object r = LispReader.read(pushbackReader, false, EOF, false, readerOpts); r != EOF;
-			r = LispReader.read(pushbackReader, false, EOF, false, readerOpts))
+		// One analysis form spans read+eval of a top-level form, so read-time
+		// facts (keyword usages) and eval-time facts (var/local/class/macro)
+		// land in the same form. beginForm is issued before read at the form's
+		// start position; endForm after eval.
+		while(true)
 			{
-			consumeWhitespaces(pushbackReader);
-			LINE_AFTER.set(pushbackReader.getLineNumber());
-			COLUMN_AFTER.set(pushbackReader.getColumnNumber());
-			ret = eval(r,false);
-			LINE_BEFORE.set(pushbackReader.getLineNumber());
-			COLUMN_BEFORE.set(pushbackReader.getColumnNumber());
+			IAnalysisSink sink = analysisSink();
+			if(sink != null)
+				sink.beginForm(sourcePath, pushbackReader.getLineNumber(), pushbackReader.getColumnNumber());
+			Object r;
+			try
+				{
+				r = LispReader.read(pushbackReader, false, EOF, false, readerOpts);
+				if(r == EOF)
+					break;
+				consumeWhitespaces(pushbackReader);
+				LINE_AFTER.set(pushbackReader.getLineNumber());
+				COLUMN_AFTER.set(pushbackReader.getColumnNumber());
+				ret = eval(r,false);
+				LINE_BEFORE.set(pushbackReader.getLineNumber());
+				COLUMN_BEFORE.set(pushbackReader.getColumnNumber());
+				}
+			finally
+				{
+				if(sink != null)
+					sink.endForm();
+				}
 			}
 		}
 	catch(LispReader.ReaderException e)

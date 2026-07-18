@@ -62,6 +62,10 @@ public int getColumnNumber(){
 	return _columnNumber;
 }
 
+// Seed the column, so a reader over a single form snippet reports positions
+// absolute to its source file (used by the single-form analysis driver).
+public void setColumnNumber(int column) { _columnNumber = column; }
+
 public int read() throws IOException{
     int c = super.read();
     _prev = _atLineStart;
