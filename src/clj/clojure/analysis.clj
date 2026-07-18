@@ -36,21 +36,29 @@
 ;;   :forms           {fid {:ns :source :line :column :defines #{var} :facts [instr]}}
 ;;   :entity->form    {var fid}     the form that currently defines each var
 ;;   :ns->forms       {ns-sym #{fid}}
-;;   :form-stack      [fid]         active forms (nested loads)
-;;   :next-fid        long
+;;   :next-fid        long          global unique-id source for forms (shared)
 (def ^:private empty-model
   {:usages {} :defs {} :locals {} :keyword-usages {} :class-usages {} :macro-deps {}
-   :forms {} :entity->form {} :ns->forms {} :form-stack [] :next-fid 0
+   :forms {} :entity->form {} :ns->forms {} :next-fid 0
    :ns-mtime {}})  ; ns-sym -> source file last-modified time, for staleness (§9)
 
 (defonce ^:private model (atom empty-model))
+
+;; The stack of active (nested) top-level forms is per-thread, not part of the
+;; shared model: with-sink binds it to a fresh atom for each analysis. This keeps
+;; "which form am I inside" thread-local (matching the thread-local sink binding),
+;; so concurrent analyses on different threads cannot stamp facts with each other's
+;; form ids. Only the recorded facts - and :next-fid, the global id source - live
+;; in the shared model. nil when no analysis is in flight; current-fid then yields
+;; nil and facts are simply recorded without provenance.
+(def ^:private ^:dynamic *form-stack* nil)
 
 (defn- span [source line column end-line end-column]
   (cond-> {:source source :line line :column column}
     (nat-int? end-line)   (assoc :end-line end-line)
     (nat-int? end-column) (assoc :end-column end-column)))
 
-(defn- current-fid [m] (peek (:form-stack m)))
+(defn- current-fid [] (when-let [s *form-stack*] (peek @s)))
 
 (defn- add-fact [m fid instr]
   (if fid (update-in m [:forms fid :facts] conj instr) m))
@@ -94,23 +102,25 @@
 ;; --- model mutators (called by the sink and by drivers) --------------------
 
 (defn- begin-form! [source line column]
-  (swap! model
-         (fn [m]
-           (let [fid (:next-fid m)]
-             (-> m
-                 (update :next-fid inc)
-                 (update :form-stack conj fid)
-                 (assoc-in [:forms fid] {:source source :line line :column column
-                                         :defines #{} :facts []})))))
+  ;; Allocate a globally-unique fid from the shared model, then push it on this
+  ;; thread's form stack. The fid used is (dec :next-fid) after the atomic bump.
+  (let [m'  (swap! model
+                   (fn [m]
+                     (let [fid (:next-fid m)]
+                       (-> m
+                           (update :next-fid inc)
+                           (assoc-in [:forms fid] {:source source :line line :column column
+                                                   :defines #{} :facts []})))))
+        fid (dec (:next-fid m'))]
+    (when *form-stack* (swap! *form-stack* conj fid)))
   nil)
 
 (defn- end-form! []
-  (swap! model
-         (fn [m]
-           (let [fid (peek (:form-stack m))
-                 m   (update m :form-stack pop)]
-             (if (nil? fid)
-               m
+  (let [fid (current-fid)]
+    (when *form-stack* (swap! *form-stack* pop))
+    (when fid
+      (swap! model
+             (fn [m]
                (let [fe (get-in m [:forms fid])]
                  (if (and (empty? (:facts fe)) (empty? (:defines fe)))
                    (update m :forms dissoc fid)          ; drop empty forms (e.g. outer do, EOF)
@@ -125,25 +135,26 @@
   (beginForm [_ source line column] (begin-form! source line column))
   (endForm [_] (end-form!))
   (varUsage [_ target from-ns source line column el ec]
-    (swap! model (fn [m]
-                   (record-usage m :usages target
-                                 (assoc (span source line column el ec) :from-ns from-ns)
-                                 (current-fid m))))
+    (let [fid (current-fid)]
+      (swap! model (fn [m]
+                     (record-usage m :usages target
+                                   (assoc (span source line column el ec) :from-ns from-ns)
+                                   fid))))
     nil)
   (varDef [_ v source line column el ec]
-    (swap! model (fn [m]
-                   (let [fid (current-fid m)
-                         old (get-in m [:entity->form v])
-                         m   (if (and old (not= old fid)) (retract-form m old) m)]
-                     (-> m
-                         (assoc-in [:defs v] (span source line column el ec))
-                         (assoc-in [:entity->form v] fid)
-                         (update-in [:forms fid :defines] (fnil conj #{}) v)
-                         (add-fact fid [:defs v])))))
+    (let [fid (current-fid)]
+      (swap! model (fn [m]
+                     (let [old (get-in m [:entity->form v])
+                           m   (if (and old (not= old fid)) (retract-form m old) m)]
+                       (-> m
+                           (assoc-in [:defs v] (span source line column el ec))
+                           (assoc-in [:entity->form v] fid)
+                           (update-in [:forms fid :defines] (fnil conj #{}) v)
+                           (add-fact fid [:defs v]))))))
     nil)
   (localDef [_ binding name ns source line column el ec]
-    (swap! model (fn [m]
-                   (let [fid (current-fid m)]
+    (let [fid (current-fid)]
+      (swap! model (fn [m]
                      (-> m
                          (update-in [:locals binding]
                                     (fn [cur] (merge (span source line column el ec)
@@ -151,29 +162,31 @@
                          (add-fact fid [:locals binding])))))
     nil)
   (localUsage [_ binding ns source line column el ec]
-    (swap! model (fn [m]
-                   (let [fid (current-fid m)
-                         sp  (assoc (span source line column el ec) :ns ns)]
+    (let [fid (current-fid)
+          sp  (assoc (span source line column el ec) :ns ns)]
+      (swap! model (fn [m]
                      (-> m
                          (update-in [:locals binding :uses] (fnil conj #{}) sp)
                          (add-fact fid [:local-use binding sp])))))
     nil)
   (keywordUsage [_ kw from-ns source line column el ec]
-    (swap! model (fn [m]
-                   (record-usage m :keyword-usages kw
-                                 (assoc (span source line column el ec) :from-ns from-ns)
-                                 (current-fid m))))
+    (let [fid (current-fid)]
+      (swap! model (fn [m]
+                     (record-usage m :keyword-usages kw
+                                   (assoc (span source line column el ec) :from-ns from-ns)
+                                   fid))))
     nil)
   (classUsage [_ c from-ns source line column el ec]
-    (swap! model (fn [m]
-                   (record-usage m :class-usages c
-                                 (assoc (span source line column el ec) :from-ns from-ns)
-                                 (current-fid m))))
+    (let [fid (current-fid)]
+      (swap! model (fn [m]
+                     (record-usage m :class-usages c
+                                   (assoc (span source line column el ec) :from-ns from-ns)
+                                   fid))))
     nil)
   (macroExpansion [_ macro from-ns source line column el ec record-usage?]
-    (swap! model (fn [m]
-                   (let [fid    (current-fid m)
-                         ns-sym (ns-name from-ns)
+    (let [fid (current-fid)]
+     (swap! model (fn [m]
+                   (let [ns-sym (ns-name from-ns)
                          ;; Always record the compile-time edge (stale reload needs
                          ;; it even for expansion-introduced calls); record the
                          ;; macro *usage* only for a source-written call.
@@ -185,7 +198,7 @@
                                      (assoc (span source line column el ec) :from-ns from-ns :macro true)
                                      fid)
                        m))))
-    nil))
+    nil)))
 
 ;; --- drivers ---------------------------------------------------------------
 
@@ -195,7 +208,11 @@
   (reset! model empty-model))
 
 (defn- with-sink [thunk]
-  (push-thread-bindings {Compiler/ANALYSIS_SINK (->AnalysisSink)})
+  ;; Bind the sink and a fresh per-thread form stack together, for the same
+  ;; dynamic extent: every form begin/end and fact recorded on this thread
+  ;; during the analysis uses this thread's own stack.
+  (push-thread-bindings {Compiler/ANALYSIS_SINK (->AnalysisSink)
+                         #'*form-stack*         (atom [])})
   (try (thunk) (finally (pop-thread-bindings))))
 
 (defn run-analysis
