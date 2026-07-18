@@ -130,19 +130,26 @@
                          (update-in [:ns->forms owner] (fnil conj #{}) fid)))))))))
   nil)
 
+;; Invariant: a fact is recorded ONLY when a form is open (current-fid non-nil).
+;; Without a form there is nowhere to file the fact's undo-record, so it could
+;; never be retracted (a ghost in the index) - and for defs it would even write a
+;; bogus [:forms nil] entry. So every sink method is a no-op when no form is open.
+;; This never drops anything real: load / require / eval-form! always open a form;
+;; only a bare eval outside a form window (an unsupported use of run-analysis)
+;; would land here, and that was never retractable anyway.
 (deftype AnalysisSink []
   IAnalysisSink
   (beginForm [_ source line column] (begin-form! source line column))
   (endForm [_] (end-form!))
   (varUsage [_ target from-ns source line column el ec]
-    (let [fid (current-fid)]
+    (when-let [fid (current-fid)]
       (swap! model (fn [m]
                      (record-usage m :usages target
                                    (assoc (span source line column el ec) :from-ns from-ns)
                                    fid))))
     nil)
   (varDef [_ v source line column el ec]
-    (let [fid (current-fid)]
+    (when-let [fid (current-fid)]
       (swap! model (fn [m]
                      (let [old (get-in m [:entity->form v])
                            m   (if (and old (not= old fid)) (retract-form m old) m)]
@@ -153,7 +160,7 @@
                            (add-fact fid [:defs v]))))))
     nil)
   (localDef [_ binding name ns source line column el ec]
-    (let [fid (current-fid)]
+    (when-let [fid (current-fid)]
       (swap! model (fn [m]
                      (-> m
                          (update-in [:locals binding]
@@ -162,29 +169,29 @@
                          (add-fact fid [:locals binding])))))
     nil)
   (localUsage [_ binding ns source line column el ec]
-    (let [fid (current-fid)
-          sp  (assoc (span source line column el ec) :ns ns)]
-      (swap! model (fn [m]
-                     (-> m
-                         (update-in [:locals binding :uses] (fnil conj #{}) sp)
-                         (add-fact fid [:local-use binding sp])))))
+    (when-let [fid (current-fid)]
+      (let [sp (assoc (span source line column el ec) :ns ns)]
+        (swap! model (fn [m]
+                       (-> m
+                           (update-in [:locals binding :uses] (fnil conj #{}) sp)
+                           (add-fact fid [:local-use binding sp]))))))
     nil)
   (keywordUsage [_ kw from-ns source line column el ec]
-    (let [fid (current-fid)]
+    (when-let [fid (current-fid)]
       (swap! model (fn [m]
                      (record-usage m :keyword-usages kw
                                    (assoc (span source line column el ec) :from-ns from-ns)
                                    fid))))
     nil)
   (classUsage [_ c from-ns source line column el ec]
-    (let [fid (current-fid)]
+    (when-let [fid (current-fid)]
       (swap! model (fn [m]
                      (record-usage m :class-usages c
                                    (assoc (span source line column el ec) :from-ns from-ns)
                                    fid))))
     nil)
   (macroExpansion [_ macro from-ns source line column el ec record-usage?]
-    (let [fid (current-fid)]
+    (when-let [fid (current-fid)]
      (swap! model (fn [m]
                    (let [ns-sym (ns-name from-ns)
                          ;; Always record the compile-time edge (stale reload needs
@@ -435,8 +442,21 @@
   "Remove vars interned in ns-sym that the model no longer records a definition
   for (their defining form vanished from source). Warns - but still unmaps - if
   a pruned var still has recorded usages (design §9.3: reflective uses can't be
-  seen, so warn-and-prune, don't block). Returns the pruned symbols."
+  seen, so warn-and-prune, don't block). Returns the pruned symbols.
+
+  PRECONDITION: only valid immediately after a full (re)analysis of ns-sym under
+  the sink - i.e. `load-ns!` of the same namespace, which `stale-reload!` does.
+  \"Not in :defs\" means \"deleted from source\" only when :defs was just fully
+  repopulated; otherwise a var absent from :defs (e.g. one created by a runtime
+  `intern` rather than a `def` form, or simply never analysed) would be wrongly
+  unmapped. Refuses to run on a namespace the model has never analysed (no forms
+  in :ns->forms), turning misuse into a loud error instead of silent data loss."
   [ns-sym]
+  (when-not (seq (get-in @model [:ns->forms ns-sym]))
+    (throw (ex-info (str "prune-ns! refused: " ns-sym " has no analysed forms in the model. "
+                         "Run (load-ns! '" ns-sym ") first - prune is only valid right after "
+                         "a full analysis, else it would unmap vars it simply never recorded.")
+                    {:ns ns-sym})))
   (let [m @model
         the-ns* (the-ns ns-sym)
         defined (set (for [^Var v (keys (:defs m)) :when (identical? the-ns* (.ns v))] v))
