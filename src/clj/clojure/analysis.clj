@@ -239,10 +239,23 @@
 (defn- ns->source-path [ns-sym]
   (str (.. (name ns-sym) (replace \- \_) (replace \. \/)) ".clj"))
 
+(defn- resource->file
+  "The File a file: resource URL points at. Prefer URL.toURI (which decodes %20
+  and friends), but classloaders sometimes hand back URLs with un-encoded
+  characters - most commonly a literal space in a path like /Users/x/My
+  Project/... - which toURI rejects with URISyntaxException. Fall back to the raw
+  path in that case (where the space is already literal, so File is correct)
+  instead of letting the exception abort the whole reload."
+  [^java.net.URL u]
+  (try
+    (java.io.File. (.toURI u))
+    (catch java.net.URISyntaxException _
+      (java.io.File. (.getPath u)))))
+
 (defn- ns-source-mtime [ns-sym]
   (when-let [u (io/resource (ns->source-path ns-sym))]
     (when (= "file" (.getProtocol u))
-      (.lastModified (java.io.File. (.toURI u))))))
+      (.lastModified (resource->file u)))))
 
 (defn- record-ns-mtime! [ns-sym]
   (swap! model assoc-in [:ns-mtime ns-sym] (ns-source-mtime ns-sym))
