@@ -248,7 +248,7 @@
   (swap! model assoc-in [:ns-mtime ns-sym] (ns-source-mtime ns-sym))
   nil)
 
-(defn snapshot-hashes!
+(defn snapshot-mtimes!
   "Record the current source-file modification time of every analysed namespace,
   so later staleness checks have a reference point. Call after a cold analysis."
   []
@@ -269,7 +269,13 @@
   "Single-form analysis (design §8, finest scope). Reads one top-level form from
   form-str positioned at file/line/column, evaluates it in ns-sym under the
   sink, and updates the model for just that form (retract-on-redefine replaces
-  the prior version of a def form). Returns the eval result."
+  the prior version of a def form). Returns the eval result.
+
+  Caveat: the retraction unit is the whole form. Top-level (do ...) is NOT split
+  here (unlike Compiler.load), so re-evaluating one def previously loaded inside a
+  multi-def form (e.g. (do (def a) (def b))) retracts that form's siblings from
+  the model - they stay interned at runtime but drop out of the index until
+  re-analysed."
   [ns-sym file line column form-str]
   (let [rdr (doto (LineNumberingPushbackReader. (StringReader. form-str))
               (.setLineNumber (int line))
@@ -385,11 +391,15 @@
 
 (defn changed-namespaces
   "Analysed namespaces whose source-file modification time differs from the
-  recorded baseline (edited since last analysis/reload)."
+  recorded baseline (edited since last analysis/reload). Namespaces whose source
+  can no longer be resolved to a file (mtime nil - moved, deleted, or now behind
+  a jar) are skipped: reloading them would only fail, so they are not flagged."
   []
   (let [m @model]
     (set (for [ns-sym (keys (:ns->forms m))
-               :when (not= (ns-source-mtime ns-sym) (get-in m [:ns-mtime ns-sym]))]
+               :let [now (ns-source-mtime ns-sym)]
+               :when (and (some? now)
+                          (not= now (get-in m [:ns-mtime ns-sym])))]
            ns-sym))))
 
 (defn- macro-owner [^Var mv] (ns-name (.ns mv)))
@@ -438,29 +448,47 @@
             (into order remaining)
             (recur (into order ready) (into placed ready) (reduce disj remaining ready))))))))
 
+(defn ns-def-vars
+  "The vars the model currently records a `def` form for in ns-sym. This is the
+  set `:defs` restricts to one namespace, and it is exactly the population
+  prune-ns! is allowed to consider: only vars the compiler saw defined by a
+  top-level def can be judged 'deleted from source' by their disappearance."
+  [m ns-sym]
+  (let [the-ns* (the-ns ns-sym)]
+    (set (for [^Var v (keys (:defs m)) :when (identical? the-ns* (.ns v))] v))))
+
 (defn prune-ns!
-  "Remove vars interned in ns-sym that the model no longer records a definition
-  for (their defining form vanished from source). Warns - but still unmaps - if
-  a pruned var still has recorded usages (design §9.3: reflective uses can't be
+  "Remove vars whose defining `def` form vanished from source. `prior-defs` is
+  the set of def-vars the model recorded for ns-sym *before* the reload that
+  just ran (capture it with `ns-def-vars` immediately before `load-ns!`); a var
+  is pruned when it was in `prior-defs`, is no longer in the freshly reloaded
+  :defs, and is still interned under the same identity. Warns - but still unmaps
+  - if a pruned var has recorded usages (design §9.3: reflective uses can't be
   seen, so warn-and-prune, don't block). Returns the pruned symbols.
 
-  PRECONDITION: only valid immediately after a full (re)analysis of ns-sym under
-  the sink - i.e. `load-ns!` of the same namespace, which `stale-reload!` does.
-  \"Not in :defs\" means \"deleted from source\" only when :defs was just fully
-  repopulated; otherwise a var absent from :defs (e.g. one created by a runtime
-  `intern` rather than a `def` form, or simply never analysed) would be wrongly
-  unmapped. Refuses to run on a namespace the model has never analysed (no forms
-  in :ns->forms), turning misuse into a loud error instead of silent data loss."
-  [ns-sym]
+  Gating on `prior-defs` (not `ns-interns` minus :defs) is deliberate: vars that
+  were never recorded as a `def` are never candidates, so intern-created vars
+  are left alone. In particular a `defprotocol`'s method vars (created by
+  `intern`, never a DefExpr - see core_deftype.clj) are never in :defs and so
+  are never pruned; the cost is that a genuinely *deleted* protocol method (or a
+  deleted `defonce`, which :reload also does not re-def) leaks a stale interned
+  var until a cold reanalysis. That is the safe direction: never unmap a live
+  protocol method and break its dispatch.
+
+  PRECONDITION: only valid immediately after `load-ns!` of ns-sym (which
+  `stale-reload!` does), so :defs has just been fully repopulated. Refuses to run
+  on a namespace the model has never analysed (no forms in :ns->forms), turning
+  misuse into a loud error instead of silent data loss."
+  [ns-sym prior-defs]
   (when-not (seq (get-in @model [:ns->forms ns-sym]))
     (throw (ex-info (str "prune-ns! refused: " ns-sym " has no analysed forms in the model. "
                          "Run (load-ns! '" ns-sym ") first - prune is only valid right after "
                          "a full analysis, else it would unmap vars it simply never recorded.")
                     {:ns ns-sym})))
-  (let [m @model
-        the-ns* (the-ns ns-sym)
-        defined (set (for [^Var v (keys (:defs m)) :when (identical? the-ns* (.ns v))] v))
-        gone (remove defined (vals (ns-interns ns-sym)))]
+  (let [live (ns-def-vars @model ns-sym)
+        interned (set (vals (ns-interns ns-sym)))
+        gone (filter (fn [^Var v] (and (contains? interned v) (not (contains? live v))))
+                     prior-defs)]
     (doseq [^Var v gone]
       (when-let [us (seq (find-usages v))]
         (binding [*out* *err*]
@@ -482,8 +510,11 @@
   (let [m @model
         order (topo-order (stale-namespaces) #(macro-dep-nses m %))]
     (doseq [ns-sym order]
-      (load-ns! ns-sym)
-      (when prune (prune-ns! ns-sym)))
+      ;; Snapshot the ns's def-vars BEFORE load-ns! retracts them, so prune can
+      ;; tell which def forms vanished (see prune-ns!).
+      (let [prior (when prune (ns-def-vars @model ns-sym))]
+        (load-ns! ns-sym)
+        (when prune (prune-ns! ns-sym prior))))
     order))
 
 (defn snapshot
