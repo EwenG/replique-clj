@@ -368,8 +368,9 @@ static Symbol carryClassPosition(Symbol orig, Symbol cls){
 	if(m == null || !m.containsKey(RT.LINE_KEY))
 		return cls;
 	Object ec = m.valAt(LispReader.END_COLUMN_KEY);
+	Object col = m.valAt(RT.COLUMN_KEY);
 	IPersistentMap nm = RT.map(RT.LINE_KEY, m.valAt(RT.LINE_KEY),
-	                           RT.COLUMN_KEY, m.valAt(RT.COLUMN_KEY),
+	                           RT.COLUMN_KEY, col != null ? col : columnDeref(),
 	                           LispReader.END_LINE_KEY, m.valAt(LispReader.END_LINE_KEY),
 	                           LispReader.END_COLUMN_KEY, ec instanceof Number ? ((Number) ec).intValue() - 1 : ec);
 	return (Symbol) cls.withMeta(nm);
@@ -393,10 +394,15 @@ static int[] symbolPosition(Symbol sym){
 	IPersistentMap m = sym.meta();
 	if(m != null && m.containsKey(RT.LINE_KEY))
 		{
+		Object c = m.valAt(RT.COLUMN_KEY);
 		Object el = m.valAt(LispReader.END_LINE_KEY);
 		Object ec = m.valAt(LispReader.END_COLUMN_KEY);
 		int line = ((Number) m.valAt(RT.LINE_KEY)).intValue();
-		int col = ((Number) m.valAt(RT.COLUMN_KEY)).intValue();
+		// isSourceSymbol only requires :line, so a macro that propagates just the
+		// line (e.g. (vary-meta sym assoc :line (:line (meta &form)))) yields a
+		// symbol with no :column. Fall back to the enclosing form's column then,
+		// mirroring the null-guarded end keys below, rather than NPEing the compile.
+		int col = c != null ? ((Number) c).intValue() : columnDeref();
 		return new int[]{line, col,
 		                 el != null ? ((Number) el).intValue() : line,
 		                 ec != null ? ((Number) ec).intValue() : col};
