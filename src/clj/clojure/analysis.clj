@@ -222,12 +222,28 @@
                          #'*form-stack*         (atom [])})
   (try (thunk) (finally (pop-thread-bindings))))
 
+(declare record-ns-mtime!)
+
 (defn run-analysis
   "Invoke thunk with the analysis sink installed on this thread, so any
   compilation it triggers (load / require / eval) populates the model,
-  form by form."
+  form by form. Returns the thunk's value.
+
+  Also records the source mtime of every namespace this run (re)compiled, so the
+  run establishes its own staleness baseline. Without it a cold analysis leaves
+  every namespace with a nil baseline, and the next `changed-namespaces` would
+  report them all as changed (nil baseline != current mtime), making the first
+  `stale-reload!` re-evaluate the whole codebase. Only namespaces actually
+  touched this run are snapshotted (their :ns->forms changed); baselines for
+  untouched namespaces - e.g. ones edited but not yet reloaded - are left intact,
+  so a pending staleness flag elsewhere is not silently cleared."
   [thunk]
-  (with-sink thunk))
+  (let [before (:ns->forms @model)
+        result (with-sink thunk)]
+    (doseq [ns-sym (keys (:ns->forms @model))
+            :when (not= (get before ns-sym) (get-in @model [:ns->forms ns-sym]))]
+      (record-ns-mtime! ns-sym))
+    result))
 
 (defn retract-ns!
   "Remove every fact produced by ns-sym's forms from the model, preserving all
@@ -263,7 +279,10 @@
 
 (defn snapshot-mtimes!
   "Record the current source-file modification time of every analysed namespace,
-  so later staleness checks have a reference point. Call after a cold analysis."
+  so later staleness checks have a reference point. `run-analysis` already
+  baselines the namespaces it compiles, so this is not needed after a plain cold
+  analysis; use it to force-rebaseline the entire model (e.g. to deliberately
+  clear all pending staleness flags at once)."
   []
   (doseq [ns-sym (keys (:ns->forms @model))] (record-ns-mtime! ns-sym))
   nil)
@@ -278,11 +297,31 @@
   (run-analysis #(require ns-sym :reload))
   (record-ns-mtime! ns-sym))
 
+(defn- retract-forms-at
+  "Retract any previously-analysed top-level form recorded at exactly this source
+  position. Re-evaluating an edited form thus replaces its facts instead of
+  leaving the old version's behind. The varDef retract-on-redefine tap only
+  covers forms that (re)define a var - a non-def form (defmethod, a registry
+  swap!, a bare call) has no var identity to key on, so without this its old
+  usages/keyword/class facts would accumulate as phantoms. Matching is by
+  (source, line, column); a form whose start position shifted is not caught here
+  (its var defs are still handled by entity->form; for non-defs, prefer load-ns!
+  when positions move)."
+  [m source line column]
+  (reduce retract-form m
+          (vec (for [[fid fe] (:forms m)
+                     :when (and (= source (:source fe))
+                                (= line (:line fe))
+                                (= column (:column fe)))]
+                 fid))))
+
 (defn eval-form!
   "Single-form analysis (design §8, finest scope). Reads one top-level form from
-  form-str positioned at file/line/column, evaluates it in ns-sym under the
-  sink, and updates the model for just that form (retract-on-redefine replaces
-  the prior version of a def form). Returns the eval result.
+  form-str positioned at file/line/column, evaluates it in ns-sym under the sink,
+  and updates the model for just that form. Any prior form recorded at the same
+  file/line/column is retracted first, so re-evaluating an edited form replaces
+  its facts - both for defs (also covered by retract-on-redefine) and for non-def
+  forms (which have no var to key retraction on). Returns the eval result.
 
   Caveat: the retraction unit is the whole form. Top-level (do ...) is NOT split
   here (unlike Compiler.load), so re-evaluating one def previously loaded inside a
@@ -299,6 +338,7 @@
                                Compiler/SOURCE      file
                                (var *ns*)           (the-ns ns-sym)})
         (try
+          (swap! model retract-forms-at file line column)
           (begin-form! file line column)
           (try
             (let [form (read {:eof ::eof} rdr)]
@@ -349,8 +389,15 @@
 
 ;; --- requires / imports (read from live namespace state, design §4) --------
 
-(defn- default-imports []
-  (set (vals (ns-imports (create-ns (gensym "clojure.analysis._blank"))))))
+;; The default java.lang.* auto-imports every namespace gets for free. A fresh
+;; empty namespace has exactly these, so we read them off one - but only ONCE
+;; (cached in a delay) and with the throwaway namespace removed afterwards, so
+;; repeated unused-imports calls do not grow the global namespace registry.
+(def ^:private default-imports
+  (delay
+    (let [n (gensym "clojure.analysis._blank")]
+      (try (set (vals (ns-imports (create-ns n))))
+           (finally (remove-ns n))))))
 
 (defn ns-referenced-namespaces
   "Namespace-name symbols whose vars or namespaced keywords are referenced from
@@ -389,7 +436,7 @@
   "User-imported classes in ns-sym that are never referenced from it.
   Returns {imported-sym class}. java.lang.* auto-imports are excluded."
   [ns-sym]
-  (let [defaults (default-imports)
+  (let [defaults @default-imports
         used? (fn [c] (some #(= ns-sym (some-> (:from-ns %) ns-name)) (find-class-usages c)))]
     (into {} (for [[sym c] (ns-imports ns-sym)
                    :when (and (not (contains? defaults c)) (not (used? c)))]
@@ -513,22 +560,58 @@
                                (update :entity->form dissoc v)))))
     (mapv #(.sym ^Var %) gone)))
 
+(defn- topo-respected?
+  "True when `order` already loads every namespace after all its macro-deps
+  (per dep-fn). Deps outside `order` are ignored - they were not reloaded, so
+  they are already current."
+  [order dep-fn]
+  (let [idx (zipmap order (range))]
+    (every? (fn [x] (every? (fn [y] (or (nil? (idx y)) (< (idx y) (idx x))))
+                            (dep-fn x)))
+            order)))
+
 (defn stale-reload!
   "Macro-aware stale reload (design §9.2). Computes the stale set (changed
   namespaces + their transitive macro-dependents), reloads each via load-ns! in
-  macro-dependency order (macro definers before their users, which then
-  re-expand the new macros), and optionally prunes vanished vars (:prune true).
-  Returns the reload order."
+  macro-dependency order (macro definers before their users, which then re-expand
+  the new macros), and optionally prunes vanished vars (:prune true). Returns the
+  final reload order.
+
+  Two-pass, to handle a macro dependency introduced by the very edit being
+  reloaded (design §9.2). The first-pass order comes from the pre-reload macro
+  graph, which cannot yet know an edge that only this edit adds (e.g. ns A newly
+  requires and expands ns B's macro): A could be ordered before B and expand B's
+  stale macro. Pass 1 reloads in that best-guess order, which recompiles every
+  edited file and so completes the macro graph. We then recompute the order from
+  the now-complete graph; if pass 1 already respected it (the common case - no
+  new cross-ns macro edge) we are done at no extra cost, otherwise a namespace
+  expanded a stale macro and we reload once more in the corrected order. Two
+  passes always suffice: after pass 1 the on-disk source is fixed and every
+  edited file has been analysed, so the recomputed graph - and its order - is
+  stable.
+
+  Limitation: this repairs *stale* expansion (the macro exists but is the old
+  version). An edit that calls a macro which did not exist in the dependency's
+  old version can still make pass 1 error if misordered; ordering by the new
+  requires would be needed for that, which this does not do."
   [& {:keys [prune]}]
-  (let [m @model
-        order (topo-order (stale-namespaces) #(macro-dep-nses m %))]
-    (doseq [ns-sym order]
-      ;; Snapshot the ns's def-vars BEFORE load-ns! retracts them, so prune can
-      ;; tell which def forms vanished (see prune-ns!).
-      (let [prior (when prune (ns-def-vars @model ns-sym))]
-        (load-ns! ns-sym)
-        (when prune (prune-ns! ns-sym prior))))
-    order))
+  (let [reload! (fn [order]
+                  (doseq [ns-sym order]
+                    ;; Snapshot the ns's def-vars BEFORE load-ns! retracts them,
+                    ;; so prune can tell which def forms vanished (see prune-ns!).
+                    (let [prior (when prune (ns-def-vars @model ns-sym))]
+                      (load-ns! ns-sym)
+                      (when prune (prune-ns! ns-sym prior)))))
+        stale  (stale-namespaces)
+        order1 (topo-order stale #(macro-dep-nses @model %))]
+    (reload! order1)
+    ;; Pass 1 completed the macro graph; re-derive the order from it.
+    (let [dep-fn  #(macro-dep-nses @model %)]
+      (if (topo-respected? order1 dep-fn)
+        order1
+        (let [order2 (topo-order stale dep-fn)]
+          (reload! order2)
+          order2)))))
 
 (defn snapshot
   "The whole model, for inspection/tests."

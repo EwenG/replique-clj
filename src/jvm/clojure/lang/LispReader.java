@@ -1203,6 +1203,9 @@ public static class SyntaxQuoteReader extends AFn{
 			//emitted symbols (which would make them look source-written, and record a
 			//phantom usage, at every expansion site). When analysis is off, END keys
 			//are absent and the attached meta stays the full original - upstream-identical.
+			//Known cost (analysis-and-reload.md §11): a form carrying other metadata too
+			//(a type hint / user meta) loses :line/:column under analysis, so macro-body
+			//diagnostics for it report the enclosing form's line, unlike a plain require.
 			IPersistentMap newMeta = full.without(RT.LINE_KEY).without(RT.COLUMN_KEY)
 			                             .without(END_LINE_KEY).without(END_COLUMN_KEY);
 			if(newMeta.count() > 0)
