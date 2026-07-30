@@ -314,6 +314,21 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 				return returnOnValue;
 			}
 
+			// ch is the first char of an actual datum (whitespace and no-op macros
+			// - ; comments, #_ discards - have already been skipped/continued past).
+			// For a top-level read under analysis, report it as the form's true
+			// start, correcting beginForm's pre-scan guess. No-op iterations report
+			// too and then continue; the datum finally returned reports last and wins.
+			if(!isRecursive && (r instanceof LineNumberingPushbackReader) && positionsRequested())
+				{
+				IAnalysisSink sink = Compiler.analysisSink();
+				if(sink != null)
+					{
+					LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
+					sink.formStart(lr.getLineNumber(), lr.getColumnNumber() - 1);
+					}
+				}
+
 			if(Character.isDigit(ch))
 				{
 				Object n = readNumber(r, (char) ch);

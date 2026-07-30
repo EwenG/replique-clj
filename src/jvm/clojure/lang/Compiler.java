@@ -8343,6 +8343,27 @@ static void consumeWhitespaces(LineNumberingPushbackReader pushbackReader) {
 	LispReader.unread(pushbackReader, ch);
 }
 
+// Like consumeWhitespaces, but also skips ; line-comments, leaving the reader
+// near the start of the next form (or EOF). Only a best-effort guess for
+// beginForm: it does not skip #_ discards or non-selected reader-conditional
+// branches, so the reader reports the form's exact start via IAnalysisSink.
+// formStart during read (see LispReader.read). Called only when an analysis sink
+// is installed, so the ordinary compile path is unaffected.
+static void consumeWhitespacesAndComments(LineNumberingPushbackReader pushbackReader) {
+	int ch = LispReader.read1(pushbackReader);
+	while(true) {
+		if(LispReader.isWhitespace(ch))
+			ch = LispReader.read1(pushbackReader);
+		else if(ch == ';') {
+			do { ch = LispReader.read1(pushbackReader); }
+			while(ch != -1 && ch != '\n' && ch != '\r');
+		}
+		else
+			break;
+	}
+	LispReader.unread(pushbackReader, ch);
+}
+
 private static final Object OPTS_COND_ALLOWED = RT.mapUniqueKeys(LispReader.OPT_READ_COND, LispReader.COND_ALLOW);
 private static Object readerOpts(String sourceName) {
     if(sourceName != null && sourceName.endsWith(".cljc"))
@@ -8382,13 +8403,23 @@ public static Object load(Reader rdr, String sourcePath, String sourceName) {
 		{
 		// One analysis form spans read+eval of a top-level form, so read-time
 		// facts (keyword usages) and eval-time facts (var/local/class/macro)
-		// land in the same form. beginForm is issued before read at the form's
-		// start position; endForm after eval.
+		// land in the same form. beginForm is issued before read; the reader
+		// reports the form's exact start via formStart during read; endForm
+		// after eval.
 		while(true)
 			{
 			IAnalysisSink sink = analysisSink();
 			if(sink != null)
+				{
+				// Position beginForm near the form with a best-effort pre-scan;
+				// the reader then reports the exact start via formStart once it
+				// commits to the datum, past any #_ discard or non-selected
+				// reader-conditional branch this pre-scan cannot skip. Gated on
+				// sink so the off path (AOT, require, REPL) stays byte-for-byte
+				// stock - read() skips leading whitespace/comments itself there.
+				consumeWhitespacesAndComments(pushbackReader);
 				sink.beginForm(sourcePath, pushbackReader.getLineNumber(), pushbackReader.getColumnNumber());
+				}
 			Object r;
 			try
 				{

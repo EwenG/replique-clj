@@ -30,6 +30,18 @@ public interface IAnalysisSink{
  */
 void beginForm(String source, int line, int column);
 
+/**
+ * Reports the true start position of the current top-level form, issued by the
+ * reader once it commits to the datum - i.e. after skipping any leading
+ * whitespace, {@code ;} comment, {@code #_} discard or non-selected
+ * reader-conditional branch. {@link #beginForm} opens the form at a pre-scan
+ * guess (so read-time events have somewhere to land); this corrects that guess
+ * to the form itself, so position-keyed retraction matches on re-eval. May be
+ * called more than once while a form is open (once per skipped no-op); the last
+ * call - the datum actually returned - wins.
+ */
+void formStart(int line, int column);
+
 /** Marks the end of the current top-level form (see {@link #beginForm}). */
 void endForm();
 

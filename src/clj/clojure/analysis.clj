@@ -25,16 +25,27 @@
   (:import [clojure.lang IAnalysisSink Compiler Var LineNumberingPushbackReader]
            [java.io StringReader]))
 
+;; Vars are keyed by their fully-qualified name symbol (my.ns/foo), not by Var
+;; object identity: a var deleted and later redefined mints a NEW Var object, so
+;; identity keys would strand a deleted var's references under a dead key and pin
+;; the dead Var (and its root value) in memory. A name key is stable across that
+;; churn, keeps a deleted-but-referenced var findable as a tombstone (:defs entry
+;; with :removed true), and matches Clojure's late binding (callers re-resolve the
+;; name). The sink receives resolved Var objects and converts them via var-key.
 ;; model keys:
-;;   :usages          {var   #{span}}       span = {:source :line :column :end-line :end-column :from-ns}
-;;   :defs            {var   span}
+;;   :usages          {qsym  #{span}}       qsym = fully-qualified var name (my.ns/foo)
+;;                                          span = {:source :line :column :end-line :end-column :from-ns}
+;;   :defs            {qsym  {:span span :removed bool}}
+;;                                          :removed = def deleted from source but still
+;;                                          referenced (a tombstone; dropped once its last
+;;                                          usage disappears - see retract-instr)
 ;;   :locals          {binding {:ns :name ...span :uses #{span}}}
 ;;   :keyword-usages  {kw    #{span}}
 ;;   :class-usages    {class #{span}}
-;;   :macro-deps      {ns-sym {macro-var #{fid}}}   compile-time edges (§9)
+;;   :macro-deps      {ns-sym {macro-qsym #{fid}}}   compile-time edges (§9)
 ;; provenance:
-;;   :forms           {fid {:ns :source :line :column :defines #{var} :facts [instr]}}
-;;   :entity->form    {var fid}     the form that currently defines each var
+;;   :forms           {fid {:ns :source :line :column :defines #{qsym} :facts [instr]}}
+;;   :entity->form    {qsym fid}    the form that currently defines each var
 ;;   :ns->forms       {ns-sym #{fid}}
 ;;   :next-fid        long          global unique-id source for forms (shared)
 (def ^:private empty-model
@@ -53,10 +64,26 @@
 ;; nil and facts are simply recorded without provenance.
 (def ^:private ^:dynamic *form-stack* nil)
 
+;; When bound to an atom, begin-form! logs every fid it allocates here. load-ns!
+;; uses this to roll back a failed reload precisely - retracting exactly the forms
+;; that reload created (wherever endForm filed them) - instead of resetting the
+;; whole shared model, which would clobber facts other threads committed meanwhile.
+;; nil outside load-ns!, so ordinary analyses pay nothing for it.
+(def ^:private ^:dynamic *created-fids* nil)
+
 (defn- span [source line column end-line end-column]
   (cond-> {:source source :line line :column column}
     (nat-int? end-line)   (assoc :end-line end-line)
     (nat-int? end-column) (assoc :end-column end-column)))
+
+(defn- var-key
+  "Canonical model key for a var: its fully-qualified name symbol (my.ns/foo).
+  Stable across ns-unmap+redef churn (a redefinition mints a new Var object under
+  the same name), so a deleted var's references stay findable and no dead Var is
+  pinned in the model. `v` is always a live, resolved var here (the sink is only
+  handed vars the compiler resolved), so its namespace is non-nil."
+  [^Var v]
+  (symbol (str (ns-name (.ns v))) (str (.sym v))))
 
 (defn- current-fid [] (when-let [s *form-stack*] (peek @s)))
 
@@ -75,10 +102,23 @@
 
 (defn- retract-instr [m [op a b c]]
   (case op
-    :usages         (-> m (update-in [:usages a] disj b) (drop-empty :usages a))
+    ;; Dropping a usage garbage-collects a tombstoned def once its LAST reference
+    ;; goes: a def deleted from source (see :defs below) lingers only to keep its
+    ;; surviving references findable, so when none remain the tombstone is dead.
+    :usages         (let [m (-> m (update-in [:usages a] disj b) (drop-empty :usages a))]
+                      (if (and (nil? (get-in m [:usages a]))
+                               (get-in m [:defs a :removed]))
+                        (update m :defs dissoc a)
+                        m))
     :keyword-usages (-> m (update-in [:keyword-usages a] disj b) (drop-empty :keyword-usages a))
     :class-usages   (-> m (update-in [:class-usages a] disj b) (drop-empty :class-usages a))
-    :defs           (update m :defs dissoc a)
+    ;; A def whose form is retracted (deleted from source) but that other forms
+    ;; still reference becomes a tombstone, not a deletion, so tooling can flag the
+    ;; now-dangling references; with no references left it is dropped outright. A
+    ;; normal reload re-runs varDef right after, clearing :removed either way.
+    :defs           (if (seq (get-in m [:usages a]))
+                      (assoc-in m [:defs a :removed] true)
+                      (update m :defs dissoc a))
     :locals         (update m :locals dissoc a)
     :local-use      (cond-> m (get-in m [:locals a]) (update-in [:locals a :uses] disj b))
     :macro-dep      (let [m (update-in m [:macro-deps a b] disj c)]
@@ -99,6 +139,36 @@
         m))
     m))
 
+;; The precise inverse of retract-instr/retract-form, used only by load-ns! to
+;; roll back a failed reload: it re-adds one previously-retracted form (and its
+;; facts) into the live model, without disturbing any other form. `snap` is the
+;; pre-reload model the form is restored from; the two lossy instrs (:defs carries
+;; only the qsym, :locals only the binding) recover their index value from it. For
+;; :defs that value is the WHOLE entry {:span :removed}, so a def's tombstone state
+;; round-trips with its span - restoring only the span could leave a var falsely
+;; tombstoned (or falsely healthy) after rollback. Must mirror retract-instr
+;; op-for-op - if you add a fact op there, add it here.
+(defn- reinstate-instr [snap m [op a b c]]
+  (case op
+    :usages         (update-in m [:usages a] (fnil conj #{}) b)
+    :keyword-usages (update-in m [:keyword-usages a] (fnil conj #{}) b)
+    :class-usages   (update-in m [:class-usages a] (fnil conj #{}) b)
+    :defs           (assoc-in m [:defs a] (get-in snap [:defs a]))
+    :locals         (assoc-in m [:locals a] (get-in snap [:locals a]))
+    :local-use      (cond-> m (get-in m [:locals a]) (update-in [:locals a :uses] (fnil conj #{}) b))
+    :macro-dep      (update-in m [:macro-deps a b] (fnil conj #{}) c)
+    m))
+
+(defn- reinstate-form [m snap fid]
+  (if-let [fe (get-in snap [:forms fid])]
+    (let [m (assoc-in m [:forms fid] fe)
+          m (reduce (partial reinstate-instr snap) m (:facts fe))
+          m (reduce (fn [m v] (assoc-in m [:entity->form v] fid)) m (:defines fe))]
+      (if-let [owner (:ns fe)]
+        (update-in m [:ns->forms owner] (fnil conj #{}) fid)
+        m))
+    m))
+
 ;; --- model mutators (called by the sink and by drivers) --------------------
 
 (defn- begin-form! [source line column]
@@ -112,7 +182,18 @@
                            (assoc-in [:forms fid] {:source source :line line :column column
                                                    :defines #{} :facts []})))))
         fid (dec (:next-fid m'))]
-    (when *form-stack* (swap! *form-stack* conj fid)))
+    (when *form-stack* (swap! *form-stack* conj fid))
+    (when *created-fids* (swap! *created-fids* conj fid)))
+  nil)
+
+(defn- form-start! [line column]
+  ;; The reader reports the top-level form's true start once it commits to the
+  ;; datum - past any leading whitespace, ; comment, #_ discard or non-selected
+  ;; reader-conditional branch that beginForm's pre-scan could not skip. Correct
+  ;; the open form's position so retract-forms-at / eval-form! key on the form
+  ;; itself, not the junk before it.
+  (when-let [fid (current-fid)]
+    (swap! model update-in [:forms fid] #(assoc % :line line :column column)))
   nil)
 
 (defn- end-form! []
@@ -140,24 +221,27 @@
 (deftype AnalysisSink []
   IAnalysisSink
   (beginForm [_ source line column] (begin-form! source line column))
+  (formStart [_ line column] (form-start! line column))
   (endForm [_] (end-form!))
   (varUsage [_ target from-ns source line column el ec]
     (when-let [fid (current-fid)]
       (swap! model (fn [m]
-                     (record-usage m :usages target
+                     (record-usage m :usages (var-key target)
                                    (assoc (span source line column el ec) :from-ns from-ns)
                                    fid))))
     nil)
   (varDef [_ v source line column el ec]
     (when-let [fid (current-fid)]
-      (swap! model (fn [m]
-                     (let [old (get-in m [:entity->form v])
-                           m   (if (and old (not= old fid)) (retract-form m old) m)]
-                       (-> m
-                           (assoc-in [:defs v] (span source line column el ec))
-                           (assoc-in [:entity->form v] fid)
-                           (update-in [:forms fid :defines] (fnil conj #{}) v)
-                           (add-fact fid [:defs v]))))))
+      (let [k (var-key v)]
+        (swap! model (fn [m]
+                       (let [old (get-in m [:entity->form k])
+                             m   (if (and old (not= old fid)) (retract-form m old) m)]
+                         (-> m
+                             ;; Fresh entry (no :removed): a (re)definition un-tombstones.
+                             (assoc-in [:defs k] {:span (span source line column el ec)})
+                             (assoc-in [:entity->form k] fid)
+                             (update-in [:forms fid :defines] (fnil conj #{}) k)
+                             (add-fact fid [:defs k])))))))
     nil)
   (localDef [_ binding name ns source line column el ec]
     (when-let [fid (current-fid)]
@@ -194,14 +278,15 @@
     (when-let [fid (current-fid)]
      (swap! model (fn [m]
                    (let [ns-sym (ns-name from-ns)
+                         mk     (var-key macro)
                          ;; Always record the compile-time edge (stale reload needs
                          ;; it even for expansion-introduced calls); record the
                          ;; macro *usage* only for a source-written call.
                          m      (-> m
-                                    (update-in [:macro-deps ns-sym macro] (fnil conj #{}) fid)
-                                    (add-fact fid [:macro-dep ns-sym macro fid]))]
+                                    (update-in [:macro-deps ns-sym mk] (fnil conj #{}) fid)
+                                    (add-fact fid [:macro-dep ns-sym mk fid]))]
                      (if record-usage?
-                       (record-usage m :usages macro
+                       (record-usage m :usages mk
                                      (assoc (span source line column el ec) :from-ns from-ns :macro true)
                                      fid)
                        m))))
@@ -217,9 +302,13 @@
 (defn- with-sink [thunk]
   ;; Bind the sink and a fresh per-thread form stack together, for the same
   ;; dynamic extent: every form begin/end and fact recorded on this thread
-  ;; during the analysis uses this thread's own stack.
-  (push-thread-bindings {Compiler/ANALYSIS_SINK (->AnalysisSink)
-                         #'*form-stack*         (atom [])})
+  ;; during the analysis uses this thread's own stack. *created-fids* is inherited
+  ;; when a caller (load-ns!) has already established it - so that caller sees every
+  ;; fid this analysis allocates, for rollback - and is otherwise given a throwaway
+  ;; atom so begin-form! always has somewhere to log.
+  (push-thread-bindings (cond-> {Compiler/ANALYSIS_SINK (->AnalysisSink)
+                                 #'*form-stack*         (atom [])}
+                          (nil? *created-fids*) (assoc #'*created-fids* (atom []))))
   (try (thunk) (finally (pop-thread-bindings))))
 
 (declare record-ns-mtime!)
@@ -291,11 +380,33 @@
   "Single-namespace analysis (design §8): retract ns-sym's prior forms, then
   reload the namespace under the sink so the model is replaced cleanly. Removes
   defs deleted from source and stale non-def forms that retract-on-redefine
-  alone would miss. Refreshes the stored source mtime."
+  alone would miss. Refreshes the stored source mtime.
+
+  Atomic: retract + reload + mtime update either all take effect or, if the
+  reload throws (typically an edited source with a compile/syntax error), none
+  do - ns-sym is reverted to its prior state and the error re-thrown. Without the
+  rollback a failed reload leaves ns-sym's facts retracted but never replaced, so
+  every var in the namespace (even ones that still compile) drops out of the index.
+
+  The rollback reverts ONLY ns-sym, via swap!: it retracts exactly the forms this
+  reload created (tracked in *created-fids*, wherever endForm filed them) and
+  reinstates ns-sym's prior forms from a pre-retract snapshot. It never reset!s the
+  whole model, so facts other threads committed by concurrent analyses between the
+  snapshot and the failure are preserved (design §7.3)."
   [ns-sym]
-  (retract-ns! ns-sym)
-  (run-analysis #(require ns-sym :reload))
-  (record-ns-mtime! ns-sym))
+  (let [snapshot @model
+        old-fids (get-in snapshot [:ns->forms ns-sym])]
+    (binding [*created-fids* (atom [])]
+      (try
+        (retract-ns! ns-sym)
+        (run-analysis #(require ns-sym :reload))
+        (record-ns-mtime! ns-sym)
+        (catch Throwable t
+          (swap! model
+                 (fn [m]
+                   (let [m (reduce retract-form m @*created-fids*)]
+                     (reduce (fn [m fid] (reinstate-form m snapshot fid)) m old-fids))))
+          (throw t))))))
 
 (defn- retract-forms-at
   "Retract any previously-analysed top-level form recorded at exactly this source
@@ -353,12 +464,12 @@
   "Usage sites recorded for var v: a set of spans
   {:from-ns :source :line :column :end-line :end-column [:macro]}."
   [^Var v]
-  (get-in @model [:usages v]))
+  (get-in @model [:usages (var-key v)]))
 
 (defn definition
   "Definition site recorded for var v: a span, or nil."
   [^Var v]
-  (get-in @model [:defs v]))
+  (:span (get-in @model [:defs (var-key v)])))
 
 (defn find-keyword-usages
   "Occurrence sites recorded for keyword kw. Auto-resolved keywords are indexed
@@ -372,8 +483,9 @@
   (get-in @model [:class-usages c]))
 
 (defn macro-deps
-  "Compile-time macro dependency edges. No arg: {ns-sym #{macro-var}}. With a
-  namespace symbol: the set of macro vars it expanded (design §9)."
+  "Compile-time macro dependency edges. No arg: {ns-sym #{macro-qsym}}. With a
+  namespace symbol: the set of macro var names (qualified symbols) it expanded
+  (design §9)."
   ([] (reduce-kv (fn [acc ns mm] (assoc acc ns (set (keys mm)))) {} (:macro-deps @model)))
   ([ns-sym] (set (keys (get-in @model [:macro-deps ns-sym])))))
 
@@ -407,7 +519,9 @@
         from? (fn [uses] (some #(= ns-sym (some-> (:from-ns %) ns-name)) uses))]
     (into #{}
           (concat
-           (for [[^Var v uses] (:usages m) :when (from? uses)] (ns-name (.ns v)))
+           (for [[qsym uses] (:usages m)
+                 :when (and (namespace qsym) (from? uses))]
+             (symbol (namespace qsym)))
            (for [[kw uses] (:keyword-usages m)
                  :when (and (namespace kw) (from? uses))]
              (symbol (namespace kw)))))))
@@ -427,7 +541,7 @@
   [ns-sym]
   (let [uses (:usages @model)
         core (the-ns 'clojure.core)
-        used? (fn [v] (some #(= ns-sym (some-> (:from-ns %) ns-name)) (get uses v)))]
+        used? (fn [^Var v] (some #(= ns-sym (some-> (:from-ns %) ns-name)) (get uses (var-key v))))]
     (into {} (for [[sym ^Var v] (ns-refers ns-sym)
                    :when (and (not (identical? core (.ns v))) (not (used? v)))]
                [sym v]))))
@@ -462,7 +576,9 @@
                           (not= now (get-in m [:ns-mtime ns-sym])))]
            ns-sym))))
 
-(defn- macro-owner [^Var mv] (ns-name (.ns mv)))
+(defn- macro-owner
+  "The macro-defining namespace symbol for a macro key (a qualified symbol)."
+  [macro-key] (symbol (namespace macro-key)))
 
 (defn- reverse-macro-graph
   "macro-defining-ns -> #{namespaces that expand a macro from it}."
@@ -509,22 +625,32 @@
             (recur (into order ready) (into placed ready) (reduce disj remaining ready))))))))
 
 (defn ns-def-vars
-  "The vars the model currently records a `def` form for in ns-sym. This is the
-  set `:defs` restricts to one namespace, and it is exactly the population
-  prune-ns! is allowed to consider: only vars the compiler saw defined by a
-  top-level def can be judged 'deleted from source' by their disappearance."
+  "The fully-qualified name symbols the model currently records a healthy `def`
+  form for in ns-sym (tombstones - :removed defs - excluded). This is exactly the
+  population prune-ns! is allowed to consider: only vars the compiler saw defined
+  by a top-level def can be judged 'deleted from source' by their disappearance."
   [m ns-sym]
-  (let [the-ns* (the-ns ns-sym)]
-    (set (for [^Var v (keys (:defs m)) :when (identical? the-ns* (.ns v))] v))))
+  (let [nsname (str (ns-name (the-ns ns-sym)))]
+    (set (for [[k entry] (:defs m)
+               :when (and (= nsname (namespace k)) (not (:removed entry)))]
+           k))))
 
 (defn prune-ns!
-  "Remove vars whose defining `def` form vanished from source. `prior-defs` is
-  the set of def-vars the model recorded for ns-sym *before* the reload that
-  just ran (capture it with `ns-def-vars` immediately before `load-ns!`); a var
-  is pruned when it was in `prior-defs`, is no longer in the freshly reloaded
-  :defs, and is still interned under the same identity. Warns - but still unmaps
-  - if a pruned var has recorded usages (design §9.3: reflective uses can't be
-  seen, so warn-and-prune, don't block). Returns the pruned symbols.
+  "Unmap the *runtime* vars whose defining `def` form vanished from source.
+  `prior-defs` is the set of def name-symbols the model recorded for ns-sym
+  *before* the reload that just ran (capture it with `ns-def-vars` immediately
+  before `load-ns!`); a var is pruned when it was in `prior-defs`, no longer has a
+  healthy def in the freshly reloaded model, and is still interned. Warns - but
+  still unmaps - if a pruned var has recorded usages (design §9.3: reflective uses
+  can't be seen, so warn-and-prune, don't block). Returns the pruned symbols.
+
+  Model-side, nothing to do here: load-ns!'s retract already handled the vanished
+  def - a deleted def still referenced by other forms became a tombstone in :defs
+  (:removed true, its usages preserved so the now-dangling references stay
+  findable), one with no references left was dropped outright, and either way
+  :entity->form was cleared by retract-form. This function only reconciles the
+  live namespace: `require :reload` re-defs existing vars but never *removes* a var
+  whose def was deleted, so the interned var would linger and shadow the source.
 
   Gating on `prior-defs` (not `ns-interns` minus :defs) is deliberate: vars that
   were never recorded as a `def` are never candidates, so intern-created vars
@@ -545,20 +671,18 @@
                          "Run (load-ns! '" ns-sym ") first - prune is only valid right after "
                          "a full analysis, else it would unmap vars it simply never recorded.")
                     {:ns ns-sym})))
-  (let [live (ns-def-vars @model ns-sym)
-        interned (set (vals (ns-interns ns-sym)))
-        gone (filter (fn [^Var v] (and (contains? interned v) (not (contains? live v))))
+  (let [live     (ns-def-vars @model ns-sym)   ; healthy def qsyms after reload
+        interned (ns-interns ns-sym)           ; {simple-sym var}
+        gone (filter (fn [k] (and (contains? interned (symbol (name k)))
+                                  (not (contains? live k))))
                      prior-defs)]
-    (doseq [^Var v gone]
-      (when-let [us (seq (find-usages v))]
+    (doseq [k gone]
+      (when-let [us (seq (get-in @model [:usages k]))]
         (binding [*out* *err*]
-          (println "WARN: pruning" (str v) "still referenced at"
+          (println "WARN: pruning" (str k) "still referenced at"
                    (vec (for [s us] [(some-> (:from-ns s) ns-name) (:line s) (:column s)])))))
-      (ns-unmap ns-sym (.sym v))
-      (swap! model (fn [m] (-> m (update :usages dissoc v)
-                               (update :defs dissoc v)
-                               (update :entity->form dissoc v)))))
-    (mapv #(.sym ^Var %) gone)))
+      (ns-unmap ns-sym (symbol (name k))))
+    (mapv #(symbol (name %)) gone)))
 
 (defn- topo-respected?
   "True when `order` already loads every namespace after all its macro-deps
@@ -576,6 +700,13 @@
   macro-dependency order (macro definers before their users, which then re-expand
   the new macros), and optionally prunes vanished vars (:prune true). Returns the
   final reload order.
+
+  Fail-fast, like require: if a namespace fails to compile, load-ns! re-throws and
+  the reload stops there (namespaces later in the order, and the second pass, do
+  not run). This is intentional - it surfaces the error immediately rather than
+  pressing on. No staleness is lost: load-ns! advances a namespace's mtime baseline
+  only on a successful load, so the failed namespace and any not yet reached stay
+  stale (see changed-namespaces) and are retried on the next stale-reload! call.
 
   Two-pass, to handle a macro dependency introduced by the very edit being
   reloaded (design §9.2). The first-pass order comes from the pre-reload macro
