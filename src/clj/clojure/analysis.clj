@@ -71,6 +71,15 @@
 ;; nil outside load-ns!, so ordinary analyses pay nothing for it.
 (def ^:private ^:dynamic *created-fids* nil)
 
+;; When bound to an atom (holding a set), retract-instr logs here every var whose
+;; usage set it just emptied - the candidates for tombstone GC. A driver sweeps
+;; ONLY these keys when its operation finishes (sweep-tombstones), instead of
+;; scanning the whole :defs map. Being per-operation and thread-local, thread A
+;; only ever sweeps tombstones A itself emptied, so it cannot GC a tombstone that
+;; thread B's concurrent reload has transiently emptied mid-retract (design §7.3).
+;; nil when no driver established it, so bare retract-form calls pay nothing.
+(def ^:private ^:dynamic *emptied-tombstones* nil)
+
 (defn- span [source line column end-line end-column]
   (cond-> {:source source :line line :column column}
     (nat-int? end-line)   (assoc :end-line end-line)
@@ -102,20 +111,23 @@
 
 (defn- retract-instr [m [op a b c]]
   (case op
-    ;; Dropping a usage garbage-collects a tombstoned def once its LAST reference
-    ;; goes: a def deleted from source (see :defs below) lingers only to keep its
-    ;; surviving references findable, so when none remain the tombstone is dead.
+    ;; When this drop empties a's usage set, note a as a tombstone-GC candidate for
+    ;; the driver to sweep after re-analysis (see *emptied-tombstones* / sweep-
+    ;; tombstones). The conj is a side effect inside a swap! fn, but idempotent - a
+    ;; retried swap re-adds the same key to a set, and sweep re-checks emptiness
+    ;; before dropping, so an extra candidate from a discarded attempt is harmless.
     :usages         (let [m (-> m (update-in [:usages a] disj b) (drop-empty :usages a))]
-                      (if (and (nil? (get-in m [:usages a]))
-                               (get-in m [:defs a :removed]))
-                        (update m :defs dissoc a)
-                        m))
+                      (when (and *emptied-tombstones* (nil? (get-in m [:usages a])))
+                        (swap! *emptied-tombstones* conj a))
+                      m)
     :keyword-usages (-> m (update-in [:keyword-usages a] disj b) (drop-empty :keyword-usages a))
     :class-usages   (-> m (update-in [:class-usages a] disj b) (drop-empty :class-usages a))
     ;; A def whose form is retracted (deleted from source) but that other forms
     ;; still reference becomes a tombstone, not a deletion, so tooling can flag the
     ;; now-dangling references; with no references left it is dropped outright. A
-    ;; normal reload re-runs varDef right after, clearing :removed either way.
+    ;; normal reload re-runs varDef right after, clearing :removed either way. The
+    ;; tombstone is later GC'd by sweep-tombstones (NOT here, and NOT in the :usages
+    ;; branch) - see that fn for why the collection must wait for a reload boundary.
     :defs           (if (seq (get-in m [:usages a]))
                       (assoc-in m [:defs a :removed] true)
                       (update m :defs dissoc a))
@@ -138,6 +150,28 @@
         (-> m (update-in [:ns->forms owner] disj fid) (drop-empty :ns->forms owner))
         m))
     m))
+
+(defn- sweep-tombstones
+  "GC the tombstones among `candidates` (var keys whose usage set was emptied this
+  operation, collected in *emptied-tombstones*) whose last reference is now truly
+  gone: drop each :defs entry that is still :removed and still has no usages.
+
+  Runs at a reload boundary (after load-ns! / eval-form! / retract-ns! finishes),
+  NOT inside retract-instr: a reload first retracts the namespace's old forms and
+  only then re-analyses, so a var the reloaded namespace still references has its
+  usage set transiently emptied mid-reload and re-filled moments later. GC-ing
+  eagerly on that empty window would delete a cross-namespace tombstone that in
+  fact survives the reload (the reference comes right back) - and, on a plain
+  successful reload of the referencing namespace, strand the re-added usage under
+  no :defs entry. Deferring to the stable end state, and re-checking emptiness
+  here, avoids both. Sweeping only this operation's own candidates (not the whole
+  :defs map) keeps it O(touched) and confines it to tombstones this thread emptied."
+  [m candidates]
+  (reduce (fn [m k]
+            (if (and (get-in m [:defs k :removed]) (empty? (get-in m [:usages k])))
+              (update m :defs dissoc k)
+              m))
+          m candidates))
 
 ;; The precise inverse of retract-instr/retract-form, used only by load-ns! to
 ;; roll back a failed reload: it re-adds one previously-retracted form (and its
@@ -301,14 +335,13 @@
 
 (defn- with-sink [thunk]
   ;; Bind the sink and a fresh per-thread form stack together, for the same
-  ;; dynamic extent: every form begin/end and fact recorded on this thread
-  ;; during the analysis uses this thread's own stack. *created-fids* is inherited
-  ;; when a caller (load-ns!) has already established it - so that caller sees every
-  ;; fid this analysis allocates, for rollback - and is otherwise given a throwaway
-  ;; atom so begin-form! always has somewhere to log.
-  (push-thread-bindings (cond-> {Compiler/ANALYSIS_SINK (->AnalysisSink)
-                                 #'*form-stack*         (atom [])}
-                          (nil? *created-fids*) (assoc #'*created-fids* (atom []))))
+  ;; dynamic extent: every form begin/end and fact recorded on this thread during
+  ;; the analysis uses this thread's own stack. *created-fids* is deliberately NOT
+  ;; bound here: begin-form! nil-guards it, so an ordinary analysis leaves it nil
+  ;; and pays nothing; when a caller (load-ns!) has established it, this inherits
+  ;; that binding so the caller sees every fid this analysis allocates, for rollback.
+  (push-thread-bindings {Compiler/ANALYSIS_SINK (->AnalysisSink)
+                         #'*form-stack*         (atom [])})
   (try (thunk) (finally (pop-thread-bindings))))
 
 (declare record-ns-mtime!)
@@ -327,18 +360,36 @@
   untouched namespaces - e.g. ones edited but not yet reloaded - are left intact,
   so a pending staleness flag elsewhere is not silently cleared."
   [thunk]
-  (let [before (:ns->forms @model)
-        result (with-sink thunk)]
-    (doseq [ns-sym (keys (:ns->forms @model))
-            :when (not= (get before ns-sym) (get-in @model [:ns->forms ns-sym]))]
-      (record-ns-mtime! ns-sym))
-    result))
+  ;; Own a tombstone-candidate set unless a driver (load-ns!) already established
+  ;; one, in which case inherit it so that driver does the single post-op sweep.
+  (let [own?   (nil? *emptied-tombstones*)
+        before (:ns->forms @model)]
+    (binding [*emptied-tombstones* (or *emptied-tombstones* (atom #{}))]
+      (let [result (with-sink thunk)]
+        (doseq [ns-sym (keys (:ns->forms @model))
+                :when (not= (get before ns-sym) (get-in @model [:ns->forms ns-sym]))]
+          (record-ns-mtime! ns-sym))
+        (when own? (swap! model sweep-tombstones @*emptied-tombstones*))
+        result))))
+
+(defn- retract-ns*
+  "Remove every fact produced by ns-sym's forms from the model, preserving all
+  other namespaces' references to its vars (design §8, single-ns replace). Records
+  emptied tombstone candidates but does NOT sweep - the caller does, after any
+  re-analysis (load-ns!), or immediately (retract-ns!)."
+  [ns-sym]
+  (swap! model (fn [m] (reduce retract-form m (get-in m [:ns->forms ns-sym]))))
+  nil)
 
 (defn retract-ns!
   "Remove every fact produced by ns-sym's forms from the model, preserving all
-  other namespaces' references to its vars (design §8, single-ns replace)."
+  other namespaces' references to its vars (design §8, single-ns replace). GCs any
+  tombstone whose last reference this retract removed (e.g. retracting the one
+  namespace that still referenced a deleted-but-referenced var)."
   [ns-sym]
-  (swap! model (fn [m] (reduce retract-form m (get-in m [:ns->forms ns-sym]))))
+  (binding [*emptied-tombstones* (atom #{})]
+    (retract-ns* ns-sym)
+    (swap! model sweep-tombstones @*emptied-tombstones*))
   nil)
 
 (defn- ns->source-path [ns-sym]
@@ -388,23 +439,38 @@
   rollback a failed reload leaves ns-sym's facts retracted but never replaced, so
   every var in the namespace (even ones that still compile) drops out of the index.
 
-  The rollback reverts ONLY ns-sym, via swap!: it retracts exactly the forms this
-  reload created (tracked in *created-fids*, wherever endForm filed them) and
-  reinstates ns-sym's prior forms from a pre-retract snapshot. It never reset!s the
-  whole model, so facts other threads committed by concurrent analyses between the
-  snapshot and the failure are preserved (design §7.3)."
+  The rollback reverts ONLY ns-sym, via swap!: it retracts this reload's created
+  forms that belong to ns-sym and reinstates ns-sym's prior forms from a pre-retract
+  snapshot. It never reset!s the whole model, so facts other threads committed by
+  concurrent analyses between the snapshot and the failure are preserved (design
+  §7.3). It also leaves alone any *other* namespace this reload happened to load
+  fresh (an edit adding `(require some-not-yet-loaded-ns)`): that namespace compiled
+  successfully and its facts reflect the runtime, so retracting them would strand a
+  loaded namespace with no model entry. Created fids are filtered by owning ns
+  (endForm files every form under its namespace, even the one that threw).
+
+  Limitation: assumes one namespace per source file (the Clojure norm). A file that
+  defines a second `(ns other ...)` is only partially tracked - retract and rollback
+  key on ns-sym, so `other`'s forms from the same file are neither replaced nor
+  rolled back cleanly. Reload such a file with a cold reanalysis instead."
   [ns-sym]
   (let [snapshot @model
         old-fids (get-in snapshot [:ns->forms ns-sym])]
-    (binding [*created-fids* (atom [])]
+    ;; One candidate set spans the retract and the re-analysis (run-analysis
+    ;; inherits it), so the single success-path sweep sees every var emptied by
+    ;; either phase - and the failure path discards it, never GC-ing on rollback.
+    (binding [*created-fids*       (atom [])
+              *emptied-tombstones* (atom #{})]
       (try
-        (retract-ns! ns-sym)
+        (retract-ns* ns-sym)
         (run-analysis #(require ns-sym :reload))
+        (swap! model sweep-tombstones @*emptied-tombstones*)
         (record-ns-mtime! ns-sym)
         (catch Throwable t
           (swap! model
                  (fn [m]
-                   (let [m (reduce retract-form m @*created-fids*)]
+                   (let [mine (filter #(= ns-sym (get-in m [:forms % :ns])) @*created-fids*)
+                         m    (reduce retract-form m mine)]
                      (reduce (fn [m fid] (reinstate-form m snapshot fid)) m old-fids))))
           (throw t))))))
 
@@ -443,20 +509,23 @@
   (let [rdr (doto (LineNumberingPushbackReader. (StringReader. form-str))
               (.setLineNumber (int line))
               (.setColumnNumber (int column)))]
-    (with-sink
-      (fn []
-        (push-thread-bindings {Compiler/SOURCE_PATH file
-                               Compiler/SOURCE      file
-                               (var *ns*)           (the-ns ns-sym)})
-        (try
-          (swap! model retract-forms-at file line column)
-          (begin-form! file line column)
+    (binding [*emptied-tombstones* (atom #{})]
+      (with-sink
+        (fn []
+          (push-thread-bindings {Compiler/SOURCE_PATH file
+                                 Compiler/SOURCE      file
+                                 (var *ns*)           (the-ns ns-sym)})
           (try
-            (let [form (read {:eof ::eof} rdr)]
-              (when-not (= form ::eof)
-                (clojure.core/eval form)))
-            (finally (end-form!)))
-          (finally (pop-thread-bindings)))))))
+            (swap! model retract-forms-at file line column)
+            (begin-form! file line column)
+            (try
+              (let [form (read {:eof ::eof} rdr)]
+                (when-not (= form ::eof)
+                  (clojure.core/eval form)))
+              (finally (end-form!)))
+            ;; only on success; GC tombstones this form's retraction emptied
+            (swap! model sweep-tombstones @*emptied-tombstones*)
+            (finally (pop-thread-bindings))))))))
 
 ;; --- queries ---------------------------------------------------------------
 
@@ -467,9 +536,12 @@
   (get-in @model [:usages (var-key v)]))
 
 (defn definition
-  "Definition site recorded for var v: a span, or nil."
+  "Definition site recorded for var v: a span, or nil. A tombstoned var (its def
+  deleted from source but still referenced) is treated as undefined - returns nil,
+  not the span the def used to occupy."
   [^Var v]
-  (:span (get-in @model [:defs (var-key v)])))
+  (let [e (get-in @model [:defs (var-key v)])]
+    (when-not (:removed e) (:span e))))
 
 (defn find-keyword-usages
   "Occurrence sites recorded for keyword kw. Auto-resolved keywords are indexed

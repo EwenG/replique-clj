@@ -316,10 +316,13 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 
 			// ch is the first char of an actual datum (whitespace and no-op macros
 			// - ; comments, #_ discards - have already been skipped/continued past).
-			// For a top-level read under analysis, report it as the form's true
-			// start, correcting beginForm's pre-scan guess. No-op iterations report
-			// too and then continue; the datum finally returned reports last and wins.
-			if(!isRecursive && (r instanceof LineNumberingPushbackReader) && positionsRequested())
+			// For the load loop's top-level read under analysis, report it as the
+			// form's true start, correcting the position beginForm opened it at. The
+			// Compiler.readingTopLevelForm() gate confines this to that read: without
+			// it, eval-form!'s own read or any nested read from a LineNumbering reader
+			// during eval would fire here and clobber the open form's position.
+			if(!isRecursive && (r instanceof LineNumberingPushbackReader)
+			   && positionsRequested() && Compiler.readingTopLevelForm())
 				{
 				IAnalysisSink sink = Compiler.analysisSink();
 				if(sink != null)

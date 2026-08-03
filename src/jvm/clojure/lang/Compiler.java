@@ -350,6 +350,19 @@ static IAnalysisSink analysisSink(){
 	return (IAnalysisSink) ANALYSIS_SINK.deref();
 }
 
+// True only while load()'s top-level loop is reading a form. formStart's position
+// correction (LispReader.read) applies ONLY to that read - the top-level datum of
+// the form beginForm just opened. It must NOT fire for a nested read performed by
+// user code during eval (e.g. reading an EDN resource via a LineNumberingReader),
+// nor for eval-form!'s own single-form read, both of which are also non-recursive
+// reads from a LineNumberingPushbackReader while the sink is bound but would
+// wrongly reassign the open form's - or the caller-supplied - position.
+static final ThreadLocal<Boolean> READING_TOP_LEVEL_FORM = ThreadLocal.withInitial(() -> Boolean.FALSE);
+
+static boolean readingTopLevelForm(){
+	return READING_TOP_LEVEL_FORM.get();
+}
+
 // True when sym carries a reader-attached position, i.e. it was written in
 // source rather than introduced by macroexpansion. Lets analysis skip
 // synthetic symbols (gensyms, macro plumbing) - the "free synthetic-form
@@ -8343,27 +8356,6 @@ static void consumeWhitespaces(LineNumberingPushbackReader pushbackReader) {
 	LispReader.unread(pushbackReader, ch);
 }
 
-// Like consumeWhitespaces, but also skips ; line-comments, leaving the reader
-// near the start of the next form (or EOF). Only a best-effort guess for
-// beginForm: it does not skip #_ discards or non-selected reader-conditional
-// branches, so the reader reports the form's exact start via IAnalysisSink.
-// formStart during read (see LispReader.read). Called only when an analysis sink
-// is installed, so the ordinary compile path is unaffected.
-static void consumeWhitespacesAndComments(LineNumberingPushbackReader pushbackReader) {
-	int ch = LispReader.read1(pushbackReader);
-	while(true) {
-		if(LispReader.isWhitespace(ch))
-			ch = LispReader.read1(pushbackReader);
-		else if(ch == ';') {
-			do { ch = LispReader.read1(pushbackReader); }
-			while(ch != -1 && ch != '\n' && ch != '\r');
-		}
-		else
-			break;
-	}
-	LispReader.unread(pushbackReader, ch);
-}
-
 private static final Object OPTS_COND_ALLOWED = RT.mapUniqueKeys(LispReader.OPT_READ_COND, LispReader.COND_ALLOW);
 private static Object readerOpts(String sourceName) {
     if(sourceName != null && sourceName.endsWith(".cljc"))
@@ -8411,19 +8403,37 @@ public static Object load(Reader rdr, String sourcePath, String sourceName) {
 			IAnalysisSink sink = analysisSink();
 			if(sink != null)
 				{
-				// Position beginForm near the form with a best-effort pre-scan;
-				// the reader then reports the exact start via formStart once it
-				// commits to the datum, past any #_ discard or non-selected
-				// reader-conditional branch this pre-scan cannot skip. Gated on
-				// sink so the off path (AOT, require, REPL) stays byte-for-byte
-				// stock - read() skips leading whitespace/comments itself there.
-				consumeWhitespacesAndComments(pushbackReader);
+				// Open the form at the reader's current position (whatever leading
+				// whitespace/comment/discard precedes the datum); the reader then
+				// reports the exact start via formStart once it commits to the datum,
+				// which is the position that survives on the form. No pre-scan is
+				// needed - the guess never outlives the read. Gated on sink so the
+				// off path (AOT, require, REPL) stays byte-for-byte stock.
 				sink.beginForm(sourcePath, pushbackReader.getLineNumber(), pushbackReader.getColumnNumber());
 				}
 			Object r;
 			try
 				{
-				r = LispReader.read(pushbackReader, false, EOF, false, readerOpts);
+				// Mark this read as the load loop's top-level read, so formStart
+				// corrects THIS form's position and no nested/eval-time read does.
+				// Save/restore rather than set-false in the finally: a data reader
+				// or #= read-eval can trigger a nested Compiler.load DURING this
+				// read, and it must not leave the flag false for the rest of our
+				// read (which would drop this form's formStart correction).
+				boolean prevTop = false;
+				if(sink != null)
+					{
+					prevTop = READING_TOP_LEVEL_FORM.get();
+					READING_TOP_LEVEL_FORM.set(Boolean.TRUE);
+					}
+				try
+					{
+					r = LispReader.read(pushbackReader, false, EOF, false, readerOpts);
+					}
+				finally
+					{
+					if(sink != null) READING_TOP_LEVEL_FORM.set(prevTop);
+					}
 				if(r == EOF)
 					break;
 				consumeWhitespaces(pushbackReader);
