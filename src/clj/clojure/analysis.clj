@@ -41,7 +41,7 @@
 ;;                                          usage disappears - see retract-instr)
 ;;   :locals          {binding {:ns :name ...span :uses #{span}}}
 ;;   :keyword-usages  {kw    #{span}}
-;;   :class-usages    {class #{span}}
+;;   :class-usages    {class-name-string #{span}}  (keyed by name, not Class - see class-key)
 ;;   :macro-deps      {ns-sym {macro-qsym #{fid}}}   compile-time edges (§9)
 ;; provenance:
 ;;   :forms           {fid {:ns :source :line :column :defines #{qsym} :facts [instr]}}
@@ -96,6 +96,17 @@
   [^Var v]
   (when-let [ns (.ns v)]
     (symbol (str (ns-name ns)) (str (.sym v)))))
+
+(defn- class-key
+  "Canonical model key for a class: its fully-qualified name string (Class.getName -
+  e.g. \"java.lang.String\", \"my.ns.Foo\", \"[Ljava.lang.Object;\"). Keying by name,
+  not the Class object, keeps a class redefined at the REPL - a reloaded deftype /
+  defrecord mints a NEW Class under a fresh DynamicClassLoader - from pinning its old
+  Class, and that loader, live as a stale map key until every referencing form is
+  itself re-analysed. Occurrences of the old and new class thus unify under one key,
+  exactly as var-key unifies a redefined var (design §5)."
+  [^Class c]
+  (.getName c))
 
 (defn- current-fid [] (when-let [s *form-stack*] (peek @s)))
 
@@ -316,7 +327,7 @@
   (classUsage [_ c from-ns source line column el ec]
     (when-let [fid (current-fid)]
       (swap! model (fn [m]
-                     (record-usage m :class-usages c
+                     (record-usage m :class-usages (class-key c)
                                    (assoc (span source line column el ec) :from-ns from-ns)
                                    fid))))
     nil)
@@ -562,9 +573,11 @@
   (get-in @model [:keyword-usages kw]))
 
 (defn find-class-usages
-  "Occurrence sites recorded for class c (a java.lang.Class)."
+  "Occurrence sites recorded for class c - a java.lang.Class, or its fully-qualified
+  name as a string/symbol. Usages are keyed by class name, so a reloaded class's
+  occurrences unify with the original's and no stale Class/loader is pinned."
   [c]
-  (get-in @model [:class-usages c]))
+  (get-in @model [:class-usages (if (class? c) (.getName ^Class c) (str c))]))
 
 (defn macro-deps
   "Compile-time macro dependency edges. No arg: {ns-sym #{macro-qsym}}. With a
