@@ -2,7 +2,74 @@
 
 # Compiler-integrated analysis & macro-aware reload — design
 
-Status: **design, not yet implemented.** This document is the plan we build against.
+Status: **in progress.** This document is the plan we build against.
+
+Implementation progress (see §10 for the full sequence):
+- **Layer 0 — done.** `clojure.lang.IAnalysisSink` + gated `Compiler.ANALYSIS_SINK`; var-def
+  and var-usage taps; `clojure.analysis` model + query API (`run-analysis`, `find-usages`,
+  `definition`). Cross-namespace find-usages works; zero-cost when off.
+- **Layer 1 — done.** Gated reader capture attaches `:line/:column/:end-line/:end-column` to
+  symbols (`LispReader.positionsRequested()` / `attachSourcePosition`); taps read the symbol's
+  own span via `Compiler.symbolPosition`; the sink interface and model carry end positions.
+  Multiple references in one form now resolve to distinct, editor-ready ranges.
+- **Layer 2 — done.** All capture points, in five waves, each tested:
+  - **A. Locals** — `registerLocal` + `analyzeSymbol` local branch; `localDef`/`localUsage`;
+    `unused-locals` query. Synthetic (macro-introduced) locals filtered via `isSourceSymbol`.
+  - **B. Keywords** — reader-side `keywordUsage` (keywords can't hold metadata); auto-resolved
+    `::x`/`::alias/x` indexed fully-qualified; `find-keyword-usages`.
+  - **C. Interop** — `classUsage` from `HostExpr.maybeClass` + the two `analyzeSymbol` class
+    branches; `(Foo. ...)` position carried through the constructor desugaring in `macroexpand1`
+    (`carryClassPosition`). Covers `new`, type hints, static/instance members. `find-class-usages`.
+  - **D. Macro edges** — `macroexpand1` tap emits `macroExpansion`, always feeding the
+    `:macro-deps` compile-time dependency graph that drives §9 stale reload, and feeding
+    `:usages` (macro calls bypass `analyzeSymbol`) only for source-written calls. `:inline`
+    fns still TODO.
+  - **Capture rule (all realms)** — a usage is recorded only where the name is textually
+    present in source (`isSourceSymbol`); references a macro *emits* are captured once at the
+    macro body (read-time `sinkSyntaxQuoteRef`), never re-recorded at expansion sites. See
+    "The capture rule" under Layer 1.
+  - **E. Requires/imports** — query-side, read from live namespace state (`ns-aliases`/
+    `ns-refers`/`ns-imports`) combined with the usage model: `unused-aliases`, `unused-refers`,
+    `unused-imports`. Bare `(require 'x)` with no `:as`/`:refer` leaves no per-ns trace, so it is
+    not covered (documented limitation).
+
+  Not yet done at that point: collection spans, `:inline`-fn compile-time edges.
+- **§7 (provenance + retraction) — done, form-based.** Per-top-level-form provenance via
+  `beginForm`/`endForm` wrapping read+eval in `Compiler.load` (so read-time keyword facts and
+  eval-time facts share one form); each fact filed under its form's `[:index target span]`
+  retraction list; `entity->form` drives retract-on-redefine; `ns->forms` batches namespace
+  ops. Drivers: `run-analysis`, `load-ns!` (retract + reload), `retract-ns!`, and `eval-form!`
+  (single-form, seeds a `LineNumberingPushbackReader` via the new `setColumnNumber`). Proven:
+  locals no longer accumulate across reloads; a single-ns reload preserves other namespaces'
+  usages of its vars; single-form re-eval replaces a def's prior facts without duplication.
+  This also fixed the `:locals` lifecycle issue noted above.
+
+- **§9 (stale-reload + prune) — done.** Staleness is **mtime-based**: `snapshot-mtimes!` /
+  `load-ns!` record each namespace's source-file modification time in `:ns-mtime`;
+  `changed-namespaces` flags a namespace whose current file mtime differs from the baseline
+  (edited since last loaded). `stale-namespaces` then takes the **conservative** transitive
+  closure over the **macro** dependency graph (runtime call dependents are excluded — the
+  precision tools.namespace lacks; but any edit to a macro-defining file marks its
+  macro-dependents stale, without distinguishing which form in the file changed).
+  `stale-reload!` reloads the stale set in macro-dependency (topological) order via `load-ns!`,
+  optionally pruning; `prune-ns!` ns-unmaps vars whose defining form vanished, warning (not
+  blocking) on remaining usages. Proven end-to-end: editing a macro reloads its dependents so
+  they re-expand the new macro (25→10→0), reloading the macro's ns *alone* does not update the
+  dependent (the case a naive reload misses), and a removed var is pruned.
+
+  Notes on the mtime choice: it reports a change whenever the file's timestamp moves — so a
+  touch or save-without-edit can trigger a reload — and its resolution is milliseconds, so an
+  edit within the same millisecond as the last load would be missed (not a concern in practice,
+  since edits follow loads by far more than a ms). `not=` is used, so a backwards-moving mtime
+  still counts as changed. (An earlier per-macro-source-hash *precise* variant was built and
+  then reverted to this simpler mtime + conservative-closure scheme by request.)
+- **Collection spans — done.** Vector/map/set literals (which carried no reader position at all)
+  now get `:line/:column/:end-line/:end-column`, and lists gain end positions — all gated by
+  analysis, so normal reads are unchanged (verified: no metadata when the sink is unbound).
+  This completes Layer 1's position model for structural/editor use and binding-form diagnostics.
+
+  Still not done (deliberately skipped): `:inline`-fn compile-time edges — an `:inline` fn change
+  won't mark its callers stale. `:inline` is rare enough that this is left as a known gap.
 
 ## 1. Goal
 
@@ -87,11 +154,39 @@ so normal reads are unaffected in behaviour and speed. Scope:
 - **Literals** (numbers, strings, chars, `nil`, `true/false`, regex) — skip until a specific
   lint needs them. They have no reference identity, so find-usages is meaningless for them.
 
-**Free synthetic-form filtering.** Because positions are attached *in the reader*, only
-user-written nodes carry them; symbols introduced by macroexpansion (gensyms, plumbing) do
-not. So "record a usage only if the node carries a read position" automatically attributes
-usages to real source and ignores macro-generated code — which is exactly the problem that
-makes expansion-based analysis hard. Build this rule in from the start.
+**The capture rule: a usage is recorded exactly where the referenced name is textually
+present in source.** Because positions are attached *in the reader*, only user-written nodes
+carry them; symbols introduced by macroexpansion (gensyms, template plumbing, resolved
+syntax-quote symbols) do not. So the rule is "record a usage only if the reference node
+carries a read position" (`isSourceSymbol`), applied uniformly to vars, classes and macro
+calls. Keywords need no gate: they are captured in the reader, so only literally-written ones
+are ever seen. This gives one consistent semantics across realms:
+
+- A var/class/keyword written in ordinary code → recorded at that spot.
+- A reference the macro *emits* into its expansion (`` `(helper ...) ``) → recorded once, at
+  the macro **body** where it is written — see the syntax-quote capture below — and **not**
+  re-recorded at each call site (the expanded symbol has no read position, so the gate skips
+  it). `find-usages` therefore never points at a call site where the name isn't textually
+  present.
+- The macro **var itself** at a direct call `(my-macro x)` *is* textually present → recorded.
+  A macro emitting another macro call is not, so only the dependency edge is kept there (§9).
+
+**Read-time capture of references inside syntax-quote.** A reference written inside a
+`` `(...) `` template (typically a `defmacro` body) is *quoted*, so analysis never sees it as
+a reference. `LispReader.syntaxQuote` therefore calls `Compiler.sinkSyntaxQuoteRef` when a
+templated symbol resolves to an existing var or class, emitting the usage at the originally-
+written position. Lookups are best-effort and never throw: a not-yet-defined (forward-
+referenced) target is silently skipped (§12 TODO: deferred resolution closes this gap and
+yields an unresolved-symbol lint).
+
+*Interaction with Layer 1:* syntax-quote re-attaches a written symbol's remaining metadata to
+the emitted symbol, and only skips this when the sole metadata is `:line`/`:column`. Layer 1
+adds `:end-line`/`:end-column`, which would defeat that skip and stamp the macro-body position
+onto every expanded symbol (making it look source-written and re-introducing the call-site
+phantom). So syntax-quote also strips the end-position keys, and when analysis is on attaches
+position-free metadata; with analysis off the behaviour is byte-identical to upstream. *Cost:*
+this drops `:line`/`:column` from expanded code, so macro-body diagnostics lose line precision
+under analysis — a known limitation, see §11.
 
 De-risk by prototyping this layer first; without it, every feature degrades to form-level
 precision and the value proposition changes.
@@ -102,12 +197,13 @@ Few and centralized:
 
 | Event | Where |
 | --- | --- |
-| var **usage** | `analyzeSymbol` var branch (`Compiler.java:7910`, the `registerVar(v); return new VarExpr(v)` path) |
+| var **usage** | `analyzeSymbol` var branch (`Compiler.java:7910`, the `registerVar(v); return new VarExpr(v)` path), gated on `isSourceSymbol` |
+| var / class **usage in a syntax-quote body** | `LispReader.syntaxQuote` → `Compiler.sinkSyntaxQuoteRef`: templated references (macro bodies) captured at read time, positioned at the written symbol |
 | local **usage** | `analyzeSymbol` local branch (`Compiler.java:7869`, `LocalBindingExpr`) |
 | local **definition** (+ scope extent) | `registerLocal` (`Compiler.java:7313`); `let`/`loop`/`fn` parsers for scope entry/exit |
 | var **definition** | `DefExpr.Parser.parse` (`Compiler.java:524`, already calls `registerVar`) |
 | Java interop (class / field / method) | `StaticFieldExpr` / `QualifiedMethodExpr` branches in `analyzeSymbol`; host-method parsers |
-| macro **usage** + compile-time edge | `macroexpand1` (`Compiler.java:7566`): record "macro M used here" and "this file depends on M@version" |
+| macro **usage** + compile-time edge | `macroexpand1` (`Compiler.java:7566`): always record the compile-time edge "this file depends on M"; record the "macro M used here" usage only for a source-written call (the macro name is textually present) |
 | keyword usage | in the **reader**, at `::` resolution (`matchSymbol`) — see §6 |
 | require / refer / alias / import | do **not** parse `ns` forms; let them run, then read `Namespace` alias/mapping/refer state (authoritative; handles `ns`, bare `require`, `use`, dynamic requires uniformly) |
 
@@ -160,6 +256,16 @@ it only decides where the *other* index lives.
 **Not everything has a var.** The target-keyed store covers **vars** only. **Keywords** →
 global `keyword → usages` map. **Locals** → per-ns/per-form. **Unresolved symbols** → per-ns
 bucket. So "on the var" is right for the var case specifically, not a uniform mechanism.
+
+> **Superseded — var key is the name, not the object.** The implementation keys `:usages` /
+> `:defs` / `:entity->form` (and the `:macro-deps` macro key) by the var's **fully-qualified
+> name symbol** (`my.ns/foo`), not by `Var` object identity — the sink converts each resolved
+> `Var` via `var-key` at ingestion. Identity keying stranded a deleted var's references under a
+> dead key when a later `def` minted a new `Var`, and pinned the dead `Var` (and its root) in
+> memory. A name key is stable across unmap+redef, matches Clojure's late binding (callers
+> re-resolve the name), and lets a deleted-but-referenced var live on as a **tombstone**
+> (`:defs` entry with `:removed true`) so its dangling references stay findable until the last
+> one is retracted, at which point the tombstone is GC'd (§9.3, `sweep-tombstones`).
 
 ## 6. What is referenceable
 
@@ -218,16 +324,49 @@ from. Provenance does double duty:
   mints many vars (`defprotocol`, `defrecord`/`deftype`, `defmulti`) is handled correctly —
   name-set diffing gets these wrong.
 
-### 7.3 Generation
+### 7.3 The retraction unit is the top-level form
 
-A **per-namespace counter**, bumped each time N is recompiled and stamped onto every fact N
-produces. Retraction becomes one sweep — "drop every fact stamped `N@gen < current`" — atomic,
-no diffing, no half-retracted state.
+The unit of provenance and retraction is the **top-level form**, not the namespace. Each
+top-level form analysed gets a **form id** (`fid`, a monotonic counter assigned at the form
+boundary), and every fact it produces is filed under that fid in `forms[fid].facts` — an exact
+list of `[:index target span]` retraction instructions. Retracting a form is then O(its own
+facts): replay the list, `disj`/`dissoc` each entry, drop empty sets. No global sweep, no
+per-fact generation stamp needed — the form's own fact-list *is* the generation record.
+
+A **namespace** operation is just a batch over its forms: `ns->forms[N]` holds the fids whose
+source is N, so reloading N is "retract every fid in `ns->forms[N]`, then load fresh." Form
+granularity subsumes namespace granularity — one mechanism, and ns-load / stale-load are batches
+of form-loads (see §8).
+
+**The active-form stack is per-thread, not part of the shared model.** "Which form am I inside"
+(the stack that `begin-form!`/`end-form!` push and pop, and that every fact reads via
+`current-fid`) is held in a thread-local (`*form-stack*`), bound to a fresh atom by `with-sink`
+for the duration of each analysis. This matches the sink binding, which is already thread-local:
+only the recorded facts — and `:next-fid`, the global unique-id source — live in the shared
+`model` atom. So two analyses running on different threads cannot stamp facts with each other's
+form ids (they'd only ever contend on the model atom's atomic `swap!`, which is safe), and off-
+thread callbacks with no binding just yield a nil fid — facts recorded without provenance, never
+misattributed. Fid allocation stays global (an atomic bump of `:next-fid`) so ids are unique
+across threads.
+
+**Recognising "the same form" across re-evals.** Retraction must match a re-eval to the prior
+version of the same logical form. Position is fragile (edits shift it), so the key is **what the
+form defines**: an `entity->form` index maps each defined var to the fid that currently defines
+it. When a new form's `varDef` fires for a var already in `entity->form`, the prior fid is
+retracted first (retract-on-redefine), then the new def installs. This is position-independent —
+re-evaluating `(defn foo …)` finds and replaces foo's prior form wherever it moved to — and it
+handles multi-var forms (`defprotocol`) because the first def retracts the whole prior form,
+clearing all its entity links, so the remaining defs re-file cleanly under the new fid. Forms
+that define nothing (bare expressions) have no entity key; a driver may pass an explicit form id
+or fall back to position, and otherwise their facts are replaced only on a full ns retract.
+
+Retract-on-redefine is also exactly what fixes locals accumulation (the ephemeral-`LocalBinding`
+issue): a re-eval'd `defn` drops its prior binding entries before recording the new ones.
 
 ### 7.4 The invariant that keeps global queries honest
 
 **"unused var V" is a global fold: no namespace anywhere holds a usage of V.** As long as each
-reload keeps that ns's usage slice *current and complete* (via 7.2 + 7.3), the fold stays
+form-load keeps that form's slice *current and complete* (via 7.2 + 7.3), the fold stays
 correct **without ever rebuilding the whole model**. Same for unused-require and unused-import.
 This is the one property to protect.
 
@@ -236,19 +375,38 @@ N's only call to `other/foo` and `other/foo` becomes unused). That is correct an
 it means the query API must be **"ask the model,"** never "return diagnostics for the file I
 just compiled."
 
+**Sub-invariant: everything recorded is retractable.** A fact is written to the query index
+*only* when a form is open (`current-fid` non-nil), because that is the only time there is a
+form to file its undo-record under. If the sink fires with no form open — a bare `eval` under
+`run-analysis`, outside any `beginForm`/`endForm` window — the recording is a **no-op**, not a
+half-write. Otherwise the index entry would exist with no undo-record and no retraction could
+ever remove it (a permanent ghost), and a `def` would additionally scribble a bogus `[:forms
+nil]` entry. Nothing real is lost: `load` / `require` / `eval-form!` always open a form; only
+an unsupported bare-eval lands here, and it was never retractable anyway.
+
 ## 8. Drivers (what triggers analysis)
 
-The sink and capture points are identical across all three; only the **scope** and the
-**model-update semantics** differ.
+The sink and capture points are identical across all drivers; only the **scope** and the
+**model-update semantics** differ. Every driver ultimately runs the same per-form boundary
+(`beginForm`/`endForm` around each top-level `eval`), so they compose out of one primitive:
+**form-load** = "analyse one top-level form; retract its prior version's facts; install the new
+ones."
 
+- **Single-form eval → form analysis (finest scope).** The editor selects a form and evaluates
+  it, passing its `*ns*`, `*file*`, and start line/column. The driver seeds a
+  `LineNumberingPushbackReader` to that position (`setLineNumber`/`setColumnNumber`), binds the
+  sink, reads and evals the one form. Retract-on-redefine (§7.3) replaces the prior version.
+  This is the equivalent of a single-namespace load, one form down. It does **not** cascade to
+  dependents (same philosophy as single-file reload — see §9.1).
 - **Cold load → full-project analysis.** Clean slate; the model is built from empty as every ns
-  loads. The only run where cross-namespace completeness is trivially guaranteed — the
-  correctness baseline / rebuild button.
-- **Single-namespace load → single-ns analysis.** Atomically replace N's slice (7.2/7.3):
-  retract N's outgoing facts, insert the new ones, **preserve every other namespace's usages of
-  N's vars.**
+  loads, each form a form-load. The only run where cross-namespace completeness is trivially
+  guaranteed — the correctness baseline / rebuild button.
+- **Single-namespace load → single-ns analysis.** Batch of form-loads over the file: retract
+  every fid in `ns->forms[N]` (dropping defs removed from source and stale non-def forms), then
+  load N fresh. **Preserves every other namespace's usages of N's vars**, because those live
+  under *their* forms, not N's.
 - **Stale-files load (new) → stale-files analysis.** Compute the macro-aware stale set (§9),
-  reload it in topological order, each file doing the single-ns atomic replace.
+  reload it in topological order, each file a single-ns load.
 
 ## 9. Reload workflows
 
@@ -274,18 +432,19 @@ topological order, and **optionally** prunes vars no longer in source.
 
 Staleness inputs, recorded per namespace after each successful compile:
 
-1. content hash of its source,
-2. `require`/`import` edges (runtime deps),
-3. the set of **compile-time dependencies it expanded** — macros **and `:inline` fns** (and
-   direct-linked callees if direct-linking is on; an analysis session will typically run with
-   direct-linking **off** for redefinable vars, which drops that case, but `:inline` fns are
-   always in play and would otherwise be a silent staleness hole) — each tagged with a
-   **version** of that dependency's definition (hash of its source form, or a counter bumped on
-   redefinition).
+1. source-file **modification time** (`:ns-mtime`),
+2. the **macro dependency edges** it expanded (`:macro-deps`, from the `macroexpand1` tap).
 
-A file is stale if its own source hash changed **or** any compile-time dependency it expanded
-changed version (the case tools.namespace misses). Propagate staleness through **both** graphs
-(require edges and compile-time-dependency edges) and reload the stale set topologically.
+A namespace is a **seed** if its file mtime changed since last load (edited since last loaded).
+The stale set is the seed plus the transitive closure of its macro-dependents over the macro
+graph — the *conservative* macro-aware closure: any edit to a macro-defining file marks that
+file's macro-dependents stale, without distinguishing which form in the file changed. Runtime
+(function-call) dependents are excluded — a plain var re-resolves at runtime and needs no
+recompile. Reload the stale set in macro-dependency (topological) order.
+
+(A precise variant — per-macro source-form versions, so only dependents of the specific changed
+macro reload — was built and reverted to this simpler scheme by request. `:inline`-fn edges are
+a deliberately-skipped staleness hole; `:inline` is rare.)
 
 **Macro re-expansion is automatic here.** Recompiling a file inherently re-runs
 macroexpansion, so "re-evaluate macro calls only when recompiling stale files" needs nothing
@@ -299,14 +458,40 @@ the explicit operation that removes vars whose defining form vanished from the s
 - Uses **def provenance** (§7.2): "form at position P defined vars {…}" — a form removed from
   source ⇒ prune exactly the vars that form defined (handles the multi-var `defprotocol` /
   `defrecord` / `defmulti` cases that name-set diffing gets wrong).
-- The prune itself is `ns-unmap` (plus dropping the var's side-map entry). Because definitions
-  *are* the runtime (§5), there is no separate index to reconcile — mutate the runtime and the
-  model follows.
+- The prune itself is `ns-unmap`, **runtime-only**. The model side is already reconciled by
+  `load-ns!`'s retract before `prune-ns!` runs: a deleted def still referenced by other forms
+  becomes a **tombstone** in `:defs` (`:removed true`, its `:usages` preserved so the now-dangling
+  references stay findable), and once its last reference is gone the tombstone is dropped by
+  `sweep-tombstones` at the operation boundary (deferred to the stable end state, not GC'd eagerly
+  during retract — mid-reload a still-referenced var's usage set is transiently emptied and then
+  re-filled). The sweep is **scoped**: each driver (`load-ns!` / `eval-form!` / `retract-ns!`)
+  collects, in a thread-local `*emptied-tombstones*`, only the var keys *its own* retraction
+  emptied, and sweeps just those — so it never scans the whole `:defs` map, and one thread cannot
+  GC a tombstone another thread's concurrent reload has transiently emptied (a residual race
+  needs two reloads racing on the very same deleted var; a cold reanalysis reconciles it). A
+  deleted def with no references is dropped outright. Because vars are
+  keyed by **name symbol**, not Var-object identity (§5), redefinition needs no reconciliation and
+  no dead Var is pinned; `prune-ns!` only removes the interned var that `require :reload` leaves
+  behind.
 - **Gate with the usage graph, warn don't block.** The model knows every remaining usage, so
   prune can report precisely — "removing `foo`, still referenced at A:12, B:30." Default to
   **warn-and-prune**, not block: vars get referenced reflectively (`#'foo`, `resolve`,
   `requiring-resolve`) in ways no static graph sees, so refusing on any inbound edge is both
   noisy and still-unsafe.
+- **Var-identity guard.** Since the model keys vars by name, not object, prune takes a
+  `{qsym → Var}` snapshot (`ns-def-var-snapshot`) of N's defs *before* the reload and only unmaps
+  a candidate when the **same Var object** is still interned afterwards. A def deleted from source
+  but re-created under a fresh identity during the reload (an explicit `intern`, or
+  `ns-unmap`+re-`intern`) is a different object, so it is preserved rather than destroyed.
+- **Precondition: prune only right after a full (re)analysis of N.** Prune deletes vars that are
+  interned in N but absent from `:defs` (as a healthy, non-tombstone entry), reading that absence
+  as "deleted from source."
+  That equivalence holds only when `:defs` was *just* fully repopulated — which `stale-reload!`
+  guarantees by calling `load-ns!` immediately before `prune-ns!`. Absent that, a var that never
+  entered `:defs` for a reason *other* than deletion — created by a runtime `intern` rather than
+  a `def` form, or in a namespace never analysed under the sink — would be wrongly unmapped
+  (silent data loss). So `prune-ns!` **refuses** (throws) on a namespace with no forms in
+  `:ns->forms`, turning standalone misuse into a loud error rather than a quiet deletion.
 
 **Out of scope for v1 (note so they aren't surprises):**
 - `defmethod` is **not a var** — removing one mutates a multimethod, needing method-level
@@ -337,3 +522,32 @@ the explicit operation that removes vars whose defining form vanished from the s
 - **keyword jump-to-def** is convention-based at best (no true def site).
 - `defmethod` removal, direct-linking caller staleness (if enabled), and reflective var usage
   are all partial — documented above where they bite.
+- **Syntax-quote refs resolve at read time**, so a var referenced inside a macro body *before*
+  it is defined in the same file (a bare forward reference, no `declare`) doesn't resolve and
+  is skipped. Cross-namespace refs and `declare`d forwards are unaffected.
+- **Macro-body line numbers under an analysis load.** To stop syntax-quoted forms from looking
+  source-written (which would record a call-site phantom usage), analysis strips
+  `:line`/`:column` from a syntax-quoted form's emitted metadata — but only for a form that also
+  carries *other* metadata (a type hint or user `^{...}` meta); position-only forms already lose
+  it in stock Clojure. So when analysis is on, a runtime error or compiler message in code
+  generated by such a form reports the enclosing form's line instead of the precise macro-body
+  line, disagreeing with a plain `require` of the same source. Program behaviour is unchanged
+  (only positions are stripped, never semantic metadata like `:tag`), and a plain reload is
+  unaffected. A precise fix means decoupling the compiler's line marker from `isSourceSymbol`'s
+  `:line`-based "source-written" test (§4, Layer 1) — deferred as not worth the ripple for a
+  diagnostics-only, narrowly-triggered gap.
+
+## 12. TODO — deferred resolution (fixes the forward-ref gap + gives an undefined-symbol lint)
+
+Replace read-time resolution in `sinkSyntaxQuoteRef` with **deferred resolution**:
+
+- Syntax-quote already computes the fully-qualified *name* even for a not-yet-defined target,
+  so at read time record a **pending** ref `{:sym qualified-sym :from-ns :span}` filed under the
+  current form's fid (retraction works unchanged) instead of resolving to a `Var`/`Class`.
+- After the namespace finishes loading (`load-ns!` / `run-analysis` completion), run one resolve
+  pass: each pending ref that now resolves moves into `:usages` keyed by identity.
+- **Leftovers are the payoff:** a pending ref that still won't resolve is an
+  **unresolved-symbol / undefined-reference diagnostic** — a clj-kondo-style lint the same
+  mechanism gives for free. Build this when we do diagnostics; the forward-ref fix falls out.
+- Timing caveat: `eval-form!` of a single form can only resolve against vars that already exist,
+  so a forward ref to a later, unevaluated form correctly stays pending.

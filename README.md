@@ -12,15 +12,17 @@ The jar is published as `replique-clj/clojure:1.12.5-r1`, deliberately keeping t
 - **This fork does not promise to stay byte-identical to upstream.** Divergence in `src` is on the
   table where it earns its keep. Judge a change on its merits — a benchmark, a bug, the vendored
   test suite passing — not on whether it perturbs the diff against the tag.
-- **Behaviour is stock Clojure 1.12.5** — the reader, the numerics, source metadata (`:line` /
-  `:column` on lists and `^meta` seqs) — with the compiler diverging as listed below.
+- **Behaviour is stock Clojure 1.12.5 with analysis off** (the default — see the third divergence
+  below) — the reader, the numerics, source metadata (`:line` / `:column` on lists and `^meta`
+  seqs) — with the compiler diverging as listed below.
 - **The rest of the difference is the build** and the packaging (`groupId` / `version`). See
   [Build](#build) and [The build vs. upstream's](#the-build-vs-upstreams).
 
 ## Divergence from upstream
 
-`git diff clojure-1.12.5 -- src test` lists it; `test` is untouched. Today it is two changes, both
-in the compiler and both measured:
+`git diff clojure-1.12.5 -- src test` lists it; `test` is untouched. Three divergences in `src`:
+two small, measured compiler changes, and one larger — a gated, off-by-default analysis subsystem
+(the bulk of the diff by line count).
 
 - **`Compiler.writeClassFile` defers the compiler's own class-file writes to virtual threads**, and
   joins them at each namespace boundary. Class-file I/O is ~13% of AOT wall time (~2800 files for
@@ -66,7 +68,29 @@ in the compiler and both measured:
   `clojure.lang.Reflector/getMethods` directly — a far smaller surface than the Java 21 floor
   above. If you upstream this, expect that narrowing to be the contentious part.
 
-Neither change alters what the compiler emits, and the vendored test suite passes unmodified.
+- **A compiler-integrated analysis & macro-aware reload subsystem** — the largest divergence by
+  line count, and the one the two changes above don't mention: `clojure.analysis` (new),
+  `clojure.lang.IAnalysisSink` (new), and gated taps in `Compiler.java` and `LispReader.java`. The
+  compiler emits typed semantic events (var / local / class / keyword usages, var defs,
+  macro-expansion edges) into a sink installed by binding `Compiler/ANALYSIS_SINK`; a Clojure-side
+  model folds them into find-usages / jump-to-definition / unused-`require`-import-local queries and
+  a **macro-aware stale reload** that recompiles the files a macro edit actually invalidates, in
+  dependency order. It exists to let an in-process REPL tool inherit the *real* compiler's
+  resolution instead of re-approximating it statically.
+
+  **Off by default, gated on that one dynamic var.** When `ANALYSIS_SINK` is unbound — normal
+  compilation, AOT, the REPL — every capture point is skipped and behaviour is byte-for-byte stock,
+  which is what preserves the drop-in `org.clojure/clojure` property. The one measurable off-cost
+  is a dynamic-var deref per datum in the reader (well under 1% of AOT; reading is ~5% of it), not
+  the "null check only" the design doc claims for the *compiler* taps. Enabling analysis *runs* the
+  code it analyses (top-level and macroexpansion side effects fire), so it is a dev tool, not a
+  sandboxed linter. Full design, drivers, and known limitations (notably: macro-body line numbers
+  shift under an active analysis load) are in
+  [`doc/analysis-and-reload.md`](doc/analysis-and-reload.md), where the feature is still marked
+  *in progress*.
+
+With analysis off — the default, and how the vendored test suite runs — none of these change what
+the compiler emits, and that suite passes unmodified.
 
 ### Speed without AOT
 
@@ -191,12 +215,12 @@ to clojure/clojure by accident). The vendored files sit at their upstream paths,
 directly.
 
 ```
-git diff clojure-1.12.5 -- src test    # what this fork changes in the source (today: nothing)
-git diff clojure-1.12.5                 # the whole fork: the build, the packaging, this README
+git diff clojure-1.12.5 -- src test    # what this fork changes in the source (the three divergences above)
+git diff clojure-1.12.5                 # the whole fork: the source, the build, the packaging, this README
 ```
 
-Keeping that first diff honest and small is the point — not because the source may never change,
-but so that when it does, the change is legible against upstream.
+Keeping that first diff legible is the point — gated on `ANALYSIS_SINK` so the off-path stays stock,
+and small outside the analysis subsystem — so that a change against upstream reads clearly.
 
 ### Keeping those diffs clean: line endings
 
