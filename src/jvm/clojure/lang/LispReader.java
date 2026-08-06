@@ -321,6 +321,12 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 			// Compiler.readingTopLevelForm() gate confines this to that read: without
 			// it, eval-form!'s own read or any nested read from a LineNumbering reader
 			// during eval would fire here and clobber the open form's position.
+			// Known corner (accepted): a #=(...) read-eval whose evaluation itself
+			// reads from a LineNumberingPushbackReader runs while this flag is still
+			// true, so it too reports here and can shift the enclosing form's start.
+			// Requires *read-eval* on, a #= form, and a line-numbering nested read
+			// during an analysis load - rare enough to not warrant reader-identity
+			// tracking on this hot path; a cold reanalysis reconciles the position.
 			if(!isRecursive && (r instanceof LineNumberingPushbackReader)
 			   && positionsRequested() && Compiler.readingTopLevelForm())
 				{

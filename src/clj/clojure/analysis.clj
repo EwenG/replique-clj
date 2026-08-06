@@ -89,10 +89,13 @@
   "Canonical model key for a var: its fully-qualified name symbol (my.ns/foo).
   Stable across ns-unmap+redef churn (a redefinition mints a new Var object under
   the same name), so a deleted var's references stay findable and no dead Var is
-  pinned in the model. `v` is always a live, resolved var here (the sink is only
-  handed vars the compiler resolved), so its namespace is non-nil."
+  pinned in the model. The sink only ever hands it resolved (interned) vars, but
+  the public query API (find-usages / definition) may be passed an arbitrary var,
+  including an uninterned one whose namespace is nil - return nil for those so a
+  lookup simply misses (as it did pre-refactor) rather than throwing."
   [^Var v]
-  (symbol (str (ns-name (.ns v))) (str (.sym v))))
+  (when-let [ns (.ns v)]
+    (symbol (str (ns-name ns)) (str (.sym v)))))
 
 (defn- current-fid [] (when-let [s *form-stack*] (peek @s)))
 
@@ -226,6 +229,11 @@
   ;; reader-conditional branch that beginForm's pre-scan could not skip. Correct
   ;; the open form's position so retract-forms-at / eval-form! key on the form
   ;; itself, not the junk before it.
+  ;; The reader fires formStart once per skipped leading no-op (each ; line, each
+  ;; #_), then once for the datum - "last wins" gives the right position, so the
+  ;; earlier calls are redundant swaps. Accepted: this is the analysis path, not a
+  ;; hot loop, and the waste is bounded by a form's leading-comment count; avoiding
+  ;; it would mean restructuring the reader's read() loop for no correctness gain.
   (when-let [fid (current-fid)]
     (swap! model update-in [:forms fid] #(assoc % :line line :column column)))
   nil)
@@ -258,15 +266,19 @@
   (formStart [_ line column] (form-start! line column))
   (endForm [_] (end-form!))
   (varUsage [_ target from-ns source line column el ec]
+    ;; when-let on the key, not let: var-key is nil only for a nil-ns var, which the
+    ;; compiler should never resolve to here - but if one slips through, skip it
+    ;; rather than write a nil key that would later NPE (namespace nil) in queries.
     (when-let [fid (current-fid)]
-      (swap! model (fn [m]
-                     (record-usage m :usages (var-key target)
-                                   (assoc (span source line column el ec) :from-ns from-ns)
-                                   fid))))
+      (when-let [k (var-key target)]
+        (swap! model (fn [m]
+                       (record-usage m :usages k
+                                     (assoc (span source line column el ec) :from-ns from-ns)
+                                     fid)))))
     nil)
   (varDef [_ v source line column el ec]
     (when-let [fid (current-fid)]
-      (let [k (var-key v)]
+      (when-let [k (var-key v)]
         (swap! model (fn [m]
                        (let [old (get-in m [:entity->form k])
                              m   (if (and old (not= old fid)) (retract-form m old) m)]
@@ -310,21 +322,21 @@
     nil)
   (macroExpansion [_ macro from-ns source line column el ec record-usage?]
     (when-let [fid (current-fid)]
-     (swap! model (fn [m]
-                   (let [ns-sym (ns-name from-ns)
-                         mk     (var-key macro)
-                         ;; Always record the compile-time edge (stale reload needs
-                         ;; it even for expansion-introduced calls); record the
-                         ;; macro *usage* only for a source-written call.
-                         m      (-> m
-                                    (update-in [:macro-deps ns-sym mk] (fnil conj #{}) fid)
-                                    (add-fact fid [:macro-dep ns-sym mk fid]))]
-                     (if record-usage?
-                       (record-usage m :usages mk
-                                     (assoc (span source line column el ec) :from-ns from-ns :macro true)
-                                     fid)
-                       m))))
-    nil)))
+     (when-let [mk (var-key macro)]      ; skip a nil-ns macro var (see varUsage)
+      (let [ns-sym (ns-name from-ns)]
+       (swap! model (fn [m]
+                     ;; Always record the compile-time edge (stale reload needs it
+                     ;; even for expansion-introduced calls); record the macro
+                     ;; *usage* only for a source-written call.
+                     (let [m (-> m
+                                 (update-in [:macro-deps ns-sym mk] (fnil conj #{}) fid)
+                                 (add-fact fid [:macro-dep ns-sym mk fid]))]
+                       (if record-usage?
+                         (record-usage m :usages mk
+                                       (assoc (span source line column el ec) :from-ns from-ns :macro true)
+                                       fid)
+                         m)))))
+    nil))))
 
 ;; --- drivers ---------------------------------------------------------------
 
@@ -707,14 +719,30 @@
                :when (and (= nsname (namespace k)) (not (:removed entry)))]
            k))))
 
+(defn ns-def-var-snapshot
+  "Capture {qsym -> the currently-interned Var object} for ns-sym's healthy
+  recorded defs. This is prune-ns!'s `prior`; take it *before* load-ns! so that,
+  once vars are keyed by name (not identity), prune can still tell a lingering
+  deleted-def var (the SAME Var object is still interned after :reload) from one
+  the reloaded source deleted and re-created under a fresh identity via intern /
+  unmap-then-reintern (which must be preserved, not unmapped)."
+  [m ns-sym]
+  (let [interned (ns-interns ns-sym)]
+    (into {} (for [k (ns-def-vars m ns-sym)]
+               [k (get interned (symbol (name k)))]))))
+
 (defn prune-ns!
   "Unmap the *runtime* vars whose defining `def` form vanished from source.
-  `prior-defs` is the set of def name-symbols the model recorded for ns-sym
-  *before* the reload that just ran (capture it with `ns-def-vars` immediately
-  before `load-ns!`); a var is pruned when it was in `prior-defs`, no longer has a
-  healthy def in the freshly reloaded model, and is still interned. Warns - but
-  still unmaps - if a pruned var has recorded usages (design §9.3: reflective uses
-  can't be seen, so warn-and-prune, don't block). Returns the pruned symbols.
+  `prior` is the {qsym -> Var} snapshot the model recorded for ns-sym *before* the
+  reload that just ran (capture it with `ns-def-var-snapshot` immediately before
+  `load-ns!`); a var is pruned when it was in `prior`, no longer has a healthy def
+  in the freshly reloaded model, and the SAME Var object is still interned. The
+  identity check matters because vars are keyed by name, not object: a def deleted
+  from source but re-created under a fresh Var (an explicit intern, or
+  unmap-then-reintern in the new source) is a different object than the snapshot's,
+  so it is left alone rather than destroyed. Warns - but still unmaps - if a pruned
+  var has recorded usages (design §9.3: reflective uses can't be seen, so
+  warn-and-prune, don't block). Returns the pruned symbols.
 
   Model-side, nothing to do here: load-ns!'s retract already handled the vanished
   def - a deleted def still referenced by other forms became a tombstone in :defs
@@ -724,7 +752,7 @@
   live namespace: `require :reload` re-defs existing vars but never *removes* a var
   whose def was deleted, so the interned var would linger and shadow the source.
 
-  Gating on `prior-defs` (not `ns-interns` minus :defs) is deliberate: vars that
+  Gating on `prior` (not `ns-interns` minus :defs) is deliberate: vars that
   were never recorded as a `def` are never candidates, so intern-created vars
   are left alone. In particular a `defprotocol`'s method vars (created by
   `intern`, never a DefExpr - see core_deftype.clj) are never in :defs and so
@@ -737,7 +765,7 @@
   `stale-reload!` does), so :defs has just been fully repopulated. Refuses to run
   on a namespace the model has never analysed (no forms in :ns->forms), turning
   misuse into a loud error instead of silent data loss."
-  [ns-sym prior-defs]
+  [ns-sym prior]
   (when-not (seq (get-in @model [:ns->forms ns-sym]))
     (throw (ex-info (str "prune-ns! refused: " ns-sym " has no analysed forms in the model. "
                          "Run (load-ns! '" ns-sym ") first - prune is only valid right after "
@@ -745,9 +773,11 @@
                     {:ns ns-sym})))
   (let [live     (ns-def-vars @model ns-sym)   ; healthy def qsyms after reload
         interned (ns-interns ns-sym)           ; {simple-sym var}
-        gone (filter (fn [k] (and (contains? interned (symbol (name k)))
-                                  (not (contains? live k))))
-                     prior-defs)]
+        gone (for [[k old-var] prior
+                   :when (and old-var
+                              (identical? (get interned (symbol (name k))) old-var)
+                              (not (contains? live k)))]
+               k)]
     (doseq [k gone]
       (when-let [us (seq (get-in @model [:usages k]))]
         (binding [*out* *err*]
@@ -800,9 +830,10 @@
   [& {:keys [prune]}]
   (let [reload! (fn [order]
                   (doseq [ns-sym order]
-                    ;; Snapshot the ns's def-vars BEFORE load-ns! retracts them,
-                    ;; so prune can tell which def forms vanished (see prune-ns!).
-                    (let [prior (when prune (ns-def-vars @model ns-sym))]
+                    ;; Snapshot the ns's def-vars (with their Var identities) BEFORE
+                    ;; load-ns! retracts them, so prune can tell which def forms
+                    ;; vanished - and preserve any re-created afresh (see prune-ns!).
+                    (let [prior (when prune (ns-def-var-snapshot @model ns-sym))]
                       (load-ns! ns-sym)
                       (when prune (prune-ns! ns-sym prior)))))
         stale  (stale-namespaces)
