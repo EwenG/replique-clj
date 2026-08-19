@@ -38,11 +38,11 @@ Implementation progress (see §10 for the full sequence):
   `beginForm`/`endForm` wrapping read+eval in `Compiler.load` (so read-time keyword facts and
   eval-time facts share one form); each fact filed under its form's `[:index target span]`
   retraction list; `entity->form` drives retract-on-redefine; `ns->forms` batches namespace
-  ops. Drivers: `run-analysis`, `load-ns!` (retract + reload), `retract-ns!`, and `eval-form!`
-  (single-form, seeds a `LineNumberingPushbackReader` via the new `setColumnNumber`). Proven:
-  locals no longer accumulate across reloads; a single-ns reload preserves other namespaces'
-  usages of its vars; single-form re-eval replaces a def's prior facts without duplication.
-  This also fixed the `:locals` lifecycle issue noted above.
+  ops. Drivers: `run-analysis`, `load-ns!` (retract + reload), and `retract-ns!` — all
+  populated **from disk**, so the model stays in sync with the file and never reflects an
+  un-saved REPL eval. Proven: locals no longer accumulate across reloads; a single-ns reload
+  preserves other namespaces' usages of its vars. This also fixed the `:locals` lifecycle
+  issue noted above.
 
 - **§9 (stale-reload + prune) — done.** Staleness is **mtime-based**: `snapshot-mtimes!` /
   `load-ns!` record each namespace's source-file modification time in `:ns-mtime`;
@@ -381,8 +381,8 @@ form to file its undo-record under. If the sink fires with no form open — a ba
 `run-analysis`, outside any `beginForm`/`endForm` window — the recording is a **no-op**, not a
 half-write. Otherwise the index entry would exist with no undo-record and no retraction could
 ever remove it (a permanent ghost), and a `def` would additionally scribble a bogus `[:forms
-nil]` entry. Nothing real is lost: `load` / `require` / `eval-form!` always open a form; only
-an unsupported bare-eval lands here, and it was never retractable anyway.
+nil]` entry. Nothing real is lost: `load` / `require` always open a form; only an unsupported
+bare-eval lands here, and it was never retractable anyway.
 
 ## 8. Drivers (what triggers analysis)
 
@@ -392,12 +392,13 @@ The sink and capture points are identical across all drivers; only the **scope**
 **form-load** = "analyse one top-level form; retract its prior version's facts; install the new
 ones."
 
-- **Single-form eval → form analysis (finest scope).** The editor selects a form and evaluates
-  it, passing its `*ns*`, `*file*`, and start line/column. The driver seeds a
-  `LineNumberingPushbackReader` to that position (`setLineNumber`/`setColumnNumber`), binds the
-  sink, reads and evals the one form. Retract-on-redefine (§7.3) replaces the prior version.
-  This is the equivalent of a single-namespace load, one form down. It does **not** cascade to
-  dependents (same philosophy as single-file reload — see §9.1).
+Every driver reads **from disk**. There is deliberately no single-form / REPL-eval driver: the
+model is meant to stay in sync with what is written on disk, so an un-saved REPL eval (a scratch
+`def`, a form evaluated from the editor before saving) never enters it. The finest exposed
+granularity is therefore the **namespace** (`load-ns!`); the per-form primitive above is an
+internal building block, not an operation on its own. Analysis of an edited form lands when its
+file is saved and reloaded.
+
 - **Cold load → full-project analysis.** Clean slate; the model is built from empty as every ns
   loads, each form a form-load. The only run where cross-namespace completeness is trivially
   guaranteed — the correctness baseline / rebuild button.
@@ -464,7 +465,7 @@ the explicit operation that removes vars whose defining form vanished from the s
   references stay findable), and once its last reference is gone the tombstone is dropped by
   `sweep-tombstones` at the operation boundary (deferred to the stable end state, not GC'd eagerly
   during retract — mid-reload a still-referenced var's usage set is transiently emptied and then
-  re-filled). The sweep is **scoped**: each driver (`load-ns!` / `eval-form!` / `retract-ns!`)
+  re-filled). The sweep is **scoped**: each driver (`load-ns!` / `retract-ns!`)
   collects, in a thread-local `*emptied-tombstones*`, only the var keys *its own* retraction
   emptied, and sweeps just those — so it never scans the whole `:defs` map, and one thread cannot
   GC a tombstone another thread's concurrent reload has transiently emptied (a residual race
@@ -549,5 +550,3 @@ Replace read-time resolution in `sinkSyntaxQuoteRef` with **deferred resolution*
 - **Leftovers are the payoff:** a pending ref that still won't resolve is an
   **unresolved-symbol / undefined-reference diagnostic** — a clj-kondo-style lint the same
   mechanism gives for free. Build this when we do diagnostics; the forward-ref fix falls out.
-- Timing caveat: `eval-form!` of a single form can only resolve against vars that already exist,
-  so a forward ref to a later, unevaluated form correctly stays pending.

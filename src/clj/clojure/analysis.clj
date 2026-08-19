@@ -15,15 +15,16 @@
   Provenance is per top-level form: every fact is filed under the form that
   produced it, so re-analysing one form (or one namespace) retracts exactly its
   prior facts and installs the new ones, without disturbing the rest of the
-  model (design §7). Drivers: run-analysis / load-ns! (cold or single-ns) and
-  eval-form! (single-form). Query with find-usages, definition, unused-*, etc.
+  model (design §7). Analysis is always populated from disk — run-analysis (cold)
+  and load-ns! (single-namespace reload) both read the file, so the model stays in
+  sync with what is written on disk and never reflects an un-saved REPL eval. Query
+  with find-usages, definition, unused-*, etc.
 
   See doc/analysis-and-reload.md for the full design."
       :author "replique-clj"}
     clojure.analysis
   (:require [clojure.java.io :as io])
-  (:import [clojure.lang IAnalysisSink Compiler Var LineNumberingPushbackReader]
-           [java.io StringReader]))
+  (:import [clojure.lang IAnalysisSink Compiler Var]))
 
 ;; Vars are keyed by their fully-qualified name symbol (my.ns/foo), not by Var
 ;; object identity: a var deleted and later redefined mints a NEW Var object, so
@@ -170,7 +171,7 @@
   operation, collected in *emptied-tombstones*) whose last reference is now truly
   gone: drop each :defs entry that is still :removed and still has no usages.
 
-  Runs at a reload boundary (after load-ns! / eval-form! / retract-ns! finishes),
+  Runs at a reload boundary (after load-ns! / retract-ns! finishes),
   NOT inside retract-instr: a reload first retracts the namespace's old forms and
   only then re-analyses, so a var the reloaded namespace still references has its
   usage set transiently emptied mid-reload and re-filled moments later. GC-ing
@@ -238,8 +239,8 @@
   ;; The reader reports the top-level form's true start once it commits to the
   ;; datum - past any leading whitespace, ; comment, #_ discard or non-selected
   ;; reader-conditional branch that beginForm's pre-scan could not skip. Correct
-  ;; the open form's position so retract-forms-at / eval-form! key on the form
-  ;; itself, not the junk before it.
+  ;; the open form's position so the recorded form span points at the form itself,
+  ;; not the junk before it.
   ;; The reader fires formStart once per skipped leading no-op (each ; line, each
   ;; #_), then once for the datum - "last wins" gives the right position, so the
   ;; earlier calls are redundant swaps. Accepted: this is the analysis path, not a
@@ -268,9 +269,9 @@
 ;; Without a form there is nowhere to file the fact's undo-record, so it could
 ;; never be retracted (a ghost in the index) - and for defs it would even write a
 ;; bogus [:forms nil] entry. So every sink method is a no-op when no form is open.
-;; This never drops anything real: load / require / eval-form! always open a form;
-;; only a bare eval outside a form window (an unsupported use of run-analysis)
-;; would land here, and that was never retractable anyway.
+;; This never drops anything real: load / require always open a form; only a bare
+;; eval outside a form window (an unsupported use of run-analysis) would land here,
+;; and that was never retractable anyway.
 (deftype AnalysisSink []
   IAnalysisSink
   (beginForm [_ source line column] (begin-form! source line column))
@@ -496,59 +497,6 @@
                          m    (reduce retract-form m mine)]
                      (reduce (fn [m fid] (reinstate-form m snapshot fid)) m old-fids))))
           (throw t))))))
-
-(defn- retract-forms-at
-  "Retract any previously-analysed top-level form recorded at exactly this source
-  position. Re-evaluating an edited form thus replaces its facts instead of
-  leaving the old version's behind. The varDef retract-on-redefine tap only
-  covers forms that (re)define a var - a non-def form (defmethod, a registry
-  swap!, a bare call) has no var identity to key on, so without this its old
-  usages/keyword/class facts would accumulate as phantoms. Matching is by
-  (source, line, column); a form whose start position shifted is not caught here
-  (its var defs are still handled by entity->form; for non-defs, prefer load-ns!
-  when positions move)."
-  [m source line column]
-  (reduce retract-form m
-          (vec (for [[fid fe] (:forms m)
-                     :when (and (= source (:source fe))
-                                (= line (:line fe))
-                                (= column (:column fe)))]
-                 fid))))
-
-(defn eval-form!
-  "Single-form analysis (design §8, finest scope). Reads one top-level form from
-  form-str positioned at file/line/column, evaluates it in ns-sym under the sink,
-  and updates the model for just that form. Any prior form recorded at the same
-  file/line/column is retracted first, so re-evaluating an edited form replaces
-  its facts - both for defs (also covered by retract-on-redefine) and for non-def
-  forms (which have no var to key retraction on). Returns the eval result.
-
-  Caveat: the retraction unit is the whole form. Top-level (do ...) is NOT split
-  here (unlike Compiler.load), so re-evaluating one def previously loaded inside a
-  multi-def form (e.g. (do (def a) (def b))) retracts that form's siblings from
-  the model - they stay interned at runtime but drop out of the index until
-  re-analysed."
-  [ns-sym file line column form-str]
-  (let [rdr (doto (LineNumberingPushbackReader. (StringReader. form-str))
-              (.setLineNumber (int line))
-              (.setColumnNumber (int column)))]
-    (binding [*emptied-tombstones* (atom #{})]
-      (with-sink
-        (fn []
-          (push-thread-bindings {Compiler/SOURCE_PATH file
-                                 Compiler/SOURCE      file
-                                 (var *ns*)           (the-ns ns-sym)})
-          (try
-            (swap! model retract-forms-at file line column)
-            (begin-form! file line column)
-            (try
-              (let [form (read {:eof ::eof} rdr)]
-                (when-not (= form ::eof)
-                  (clojure.core/eval form)))
-              (finally (end-form!)))
-            ;; only on success; GC tombstones this form's retraction emptied
-            (swap! model sweep-tombstones @*emptied-tombstones*)
-            (finally (pop-thread-bindings))))))))
 
 ;; --- queries ---------------------------------------------------------------
 

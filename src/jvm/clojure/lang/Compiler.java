@@ -354,9 +354,8 @@ static IAnalysisSink analysisSink(){
 // correction (LispReader.read) applies ONLY to that read - the top-level datum of
 // the form beginForm just opened. It must NOT fire for a nested read performed by
 // user code during eval (e.g. reading an EDN resource via a LineNumberingReader),
-// nor for eval-form!'s own single-form read, both of which are also non-recursive
-// reads from a LineNumberingPushbackReader while the sink is bound but would
-// wrongly reassign the open form's - or the caller-supplied - position.
+// which is also a non-recursive read from a LineNumberingPushbackReader while the
+// sink is bound but would wrongly reassign the open form's position.
 static final ThreadLocal<Boolean> READING_TOP_LEVEL_FORM = ThreadLocal.withInitial(() -> Boolean.FALSE);
 
 static boolean readingTopLevelForm(){

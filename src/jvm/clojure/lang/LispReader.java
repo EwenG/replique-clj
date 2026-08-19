@@ -319,8 +319,8 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 			// For the load loop's top-level read under analysis, report it as the
 			// form's true start, correcting the position beginForm opened it at. The
 			// Compiler.readingTopLevelForm() gate confines this to that read: without
-			// it, eval-form!'s own read or any nested read from a LineNumbering reader
-			// during eval would fire here and clobber the open form's position.
+			// it, any nested read from a LineNumbering reader during eval would fire
+			// here and clobber the open form's position.
 			// Known corner (accepted): a #=(...) read-eval whose evaluation itself
 			// reads from a LineNumberingPushbackReader runs while this flag is still
 			// true, so it too reports here and can shift the enclosing form's start.
