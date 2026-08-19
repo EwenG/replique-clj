@@ -439,15 +439,24 @@ static void sinkSyntaxQuoteRef(Object orig, Symbol resolved){
 	if(resolved.ns != null)
 		{
 		Namespace ns = Namespace.find(Symbol.intern(resolved.ns));
-		if(ns != null)
+		Var v = ns != null ? ns.findInternedVar(Symbol.intern(resolved.name)) : null;
+		if(v != null)
 			{
-			Var v = ns.findInternedVar(Symbol.intern(resolved.name));
-			if(v != null)
-				{
-				int[] pos = symbolPosition(origSym);
-				analysisSink().varUsage(v, currentNS(), (String) SOURCE_PATH.deref(),
-				                        pos[0], pos[1], pos[2], pos[3]);
-				}
+			int[] pos = symbolPosition(origSym);
+			analysisSink().varUsage(v, currentNS(), (String) SOURCE_PATH.deref(),
+			                        pos[0], pos[1], pos[2], pos[3]);
+			}
+		else
+			{
+			// Not a var: resolved.ns may itself be a class, i.e. this is a
+			// Classname/staticMember reference (e.g. java.lang.System/nanoTime,
+			// which syntax-quote resolved to ns="java.lang.System"). Mirror the
+			// normal static-member path in analyzeSymbol, which records a class
+			// usage over the whole Classname/member token (origSym), not just the
+			// class part - so find-class-usages sees it inside a macro body too.
+			Class c = RT.classForNameNonLoading(resolved.ns);
+			if(c != null)
+				sinkClassUsage(c, origSym);
 			}
 		}
 	else
