@@ -4,8 +4,11 @@ Clojure 1.12.5, vendored from the upstream `clojure-1.12.5` tag, with a self-con
 The jar is published as `replique-clj/clojure:1.12.5-r1`, deliberately keeping the artifactId
 `clojure`, so it can be dropped onto a classpath in place of `org.clojure/clojure`.
 
-**Requires Java 21+**, unlike upstream 1.12.5, which runs on Java 8. See
-[Divergence from upstream](#divergence-from-upstream).
+**Requires Java 21+**, unlike upstream 1.12.5, which runs on Java 8 — a deliberate modern-JVM
+baseline (`maven.compiler.release=21`), not something the `src` diff forces: nothing in it needs
+21 today. The fork targets current JVMs, and 1.12 is upstream's last release on a Java 8 floor. The
+bytecode the *Clojure* compiler emits is unaffected — that stays pinned to `V1_8`, i.e. Java 8
+class files; it is `clojure.lang.*` itself that is built for 21.
 
 ## What this is (and isn't)
 
@@ -20,31 +23,9 @@ The jar is published as `replique-clj/clojure:1.12.5-r1`, deliberately keeping t
 
 ## Divergence from upstream
 
-`git diff clojure-1.12.5 -- src test` lists it; `test` is untouched. Three divergences in `src`:
-two small, measured compiler changes, and one larger — a gated, off-by-default analysis subsystem
+`git diff clojure-1.12.5 -- src test` lists it; `test` is untouched. Two divergences in `src`:
+one small, measured compiler change, and one larger — a gated, off-by-default analysis subsystem
 (the bulk of the diff by line count).
-
-- **`Compiler.writeClassFile` defers the compiler's own class-file writes to virtual threads**, and
-  joins them at each namespace boundary. Class-file I/O is ~13% of AOT wall time (~2800 files for
-  the standard library); deferring it takes the full standard-library AOT build from ~3.55s to
-  ~3.34s (**~6%**) on an M1. The public `writeClassFile` stays synchronous — `clojure.core/proxy`
-  writes a proxy class and immediately resolves it *by name* off the classpath, so deferring that
-  particular write races the read and produces a truncated class file. Only the two compiler-
-  internal call sites defer.
-
-  This is what costs the Java 21 baseline: the executor is a static field of `Compiler`, so on an
-  older JVM the class would not initialise at all. It does not change the bytecode the Clojure
-  compiler *emits* — that is pinned to `V1_8` and stays Java 8 class files; it is `clojure.lang.*`
-  itself that now needs 21.
-
-  **The Java 21 floor is deliberate, and it is not bought by the speedup.** Virtual threads are not
-  load-bearing here: a 4-thread platform pool measures the same within noise, because file I/O pins
-  the carrier thread and the virtual threads buy no extra concurrency over carriers. The ~6% comes
-  from *deferring* the writes, not from what they run on, and a platform pool would deliver it on
-  Java 8. Virtual threads are the chosen shape anyway — this fork targets modern JVMs and upstream
-  1.12 is already the last release on a Java 8 baseline. If you ever need the Java 8 floor back,
-  swap `Executors.newVirtualThreadPerTaskExecutor()` for a small fixed platform pool and drop
-  `maven.compiler.release` — nothing else in the design depends on it.
 
 - **`Reflector.getMethods` caches `Class.getMethods()` in a `ClassValue`.** `Class.getMethods()`
   copies the whole public-method array *and every `Method` object in it* on every call, and the
@@ -53,7 +34,7 @@ two small, measured compiler changes, and one larger — a gated, off-by-default
   namespace: 6296ms → 6033ms). It also speeds up runtime reflective calls, so unhinted code
   benefits at run time and not just at compile time.
 
-  `ClassValue` is JDK 7+, so unlike the change above this one costs no baseline. It keys on the
+  `ClassValue` is JDK 7+, so this change needs no particular baseline of its own. It keys on the
   `Class`, so a class redefined at the REPL is a distinct key rather than a stale hit, and entries
   are collected with the class instead of pinning its loader — which matters for a REPL that
   reloads namespaces all day.
@@ -65,8 +46,8 @@ two small, measured compiler changes, and one larger — a gated, off-by-default
   instances cannot leave `clojure.lang`. Nothing the compiler emits calls `getMethods` (reflective
   call sites go to `Reflector.invokeInstanceMethod` / `invokeNoArgInstanceMember`), so this does
   not affect already-AOT-compiled code; it breaks only third-party code calling
-  `clojure.lang.Reflector/getMethods` directly — a far smaller surface than the Java 21 floor
-  above. If you upstream this, expect that narrowing to be the contentious part.
+  `clojure.lang.Reflector/getMethods` directly. If you upstream this, expect that narrowing to be
+  the contentious part.
 
 - **A compiler-integrated analysis & macro-aware reload subsystem** — the largest divergence by
   line count, and the one the two changes above don't mention: `clojure.analysis` (new),
@@ -94,9 +75,9 @@ the compiler emits, and that suite passes unmodified.
 
 ### Speed without AOT
 
-Neither divergence above helps a REPL: `writeClassFile` is never called when `*compile-files*` is
-false, and the Reflector cache is only ~4%. Compiling a namespace from source is dominated by
-analysis and macroexpansion, and the two things that actually move it are **not** code changes:
+The Reflector cache above barely helps a REPL: it is only ~4%. Compiling a namespace from source is
+dominated by analysis and macroexpansion, and the two things that actually move it are **not** code
+changes:
 
 ```
 -Dclojure.spec.skip-macros=true     # -15% cold, -18% on a warm recompile loop

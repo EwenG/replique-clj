@@ -24,12 +24,11 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-    <!-- Java 21, not upstream's 8: Compiler.writeClassFile hands class-file writes to virtual
-         threads (Executors.newVirtualThreadPerTaskExecutor, JDK 21+), and the executor is a static
-         field of Compiler, so on an older JVM the class would fail to initialise at all rather than
-         only when AOT-compiling. This raises the runtime floor for the whole jar. Note it does not
-         change the bytecode the *Clojure* compiler emits: that is pinned to V1_8 in Compiler.java
-         and stays Java 8 class files. -->
+    <!-- Java 21, not upstream's 8: a deliberate modern-JVM baseline for the jar, not something the
+         source currently requires (nothing in src/jvm needs a JDK 21 API today). The fork targets
+         current JVMs, and 1.12 is upstream's last release on a Java 8 floor. This raises the runtime
+         floor for clojure.lang.* only; it does not change the bytecode the *Clojure* compiler emits:
+         that is pinned to V1_8 in Compiler.java and stays Java 8 class files. -->
     <maven.compiler.release>21</maven.compiler.release>
 
     <!-- Direct linking is how Clojure builds its own core: it compiles core's calls as static
