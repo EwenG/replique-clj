@@ -37,25 +37,37 @@ Implementation progress (see §10 for the full sequence):
 - **§7 (provenance + retraction) — done, form-based.** Per-top-level-form provenance via
   `beginForm`/`endForm` wrapping read+eval in `Compiler.load` (so read-time keyword facts and
   eval-time facts share one form); each fact filed under its form's `[:index target span]`
-  retraction list; `entity->form` drives retract-on-redefine; `ns->forms` batches namespace
-  ops. Drivers: `run-analysis`, `load-ns!` (retract + reload), and `retract-ns!` — all
+  retraction list; `entity->form` drives retract-on-redefine; `source->forms` batches file
+  ops. Drivers: `run-analysis`, `load-file!` (retract + reload), and `retract-file!` — all
   populated **from disk**, so the model stays in sync with the file and never reflects an
-  un-saved REPL eval. Proven: locals no longer accumulate across reloads; a single-ns reload
-  preserves other namespaces' usages of its vars. This also fixed the `:locals` lifecycle
+  un-saved REPL eval. Proven: locals no longer accumulate across reloads; a single-file reload
+  preserves other files' usages of its vars. This also fixed the `:locals` lifecycle
   issue noted above.
 
-- **§9 (stale-reload + prune) — done.** Staleness is **mtime-based**: `snapshot-mtimes!` /
-  `load-ns!` record each namespace's source-file modification time in `:ns-mtime`;
-  `changed-namespaces` flags a namespace whose current file mtime differs from the baseline
-  (edited since last loaded). `stale-namespaces` then takes the **conservative** transitive
-  closure over the **macro** dependency graph (runtime call dependents are excluded — the
-  precision tools.namespace lacks; but any edit to a macro-defining file marks its
-  macro-dependents stale, without distinguishing which form in the file changed).
-  `stale-reload!` reloads the stale set in macro-dependency (topological) order via `load-ns!`,
-  optionally pruning; `prune-ns!` ns-unmaps vars whose defining form vanished, warning (not
-  blocking) on remaining usages. Proven end-to-end: editing a macro reloads its dependents so
-  they re-expand the new macro (25→10→0), reloading the macro's ns *alone* does not update the
-  dependent (the case a naive reload misses), and a removed var is pruned.
+- **File-centric, resource-keyed — done.** The reload/staleness unit is the **file**, keyed by
+  the classpath-relative source path the compiler records (`"app/util.clj"`), not the namespace.
+  A file is what an editor edits, and — the payoff — **one file may define several namespaces**;
+  the file reload re-analyses all of them at once, which a require-by-namespace can't (it can't
+  even *name* a file's second `(ns …)`). `load-file!` reloads by the file's **resource**
+  (`load`), so it runs the whole file and records the same key `require` does for transitive
+  deps (which the editor does not drive) — keeping the model consistent however a file entered
+  it. Each form still keeps its `:ns` as metadata, so the per-namespace lints (unused-*) still
+  work; `file-namespaces` lists the namespaces a file defines. `find-usages`/`definition` take a
+  Var **or** its fully-qualified symbol (an editor has the name at a cursor, not a Var).
+
+- **§9 (stale-reload + prune) — done, file-based.** Staleness is **mtime-based**:
+  `snapshot-mtimes!` / `load-file!` record each file's source modification time in `:file-mtime`
+  (the source path *is* the resource path — no namespace→path munging); `changed-files` flags a
+  file whose current mtime differs from the baseline (edited since last loaded). `stale-files`
+  then takes the **conservative** transitive closure over the **macro** dependency graph in file
+  space (runtime call dependents are excluded — the precision tools.namespace lacks; but any
+  edit to a macro-defining file marks its macro-dependent files stale, without distinguishing
+  which form changed). `stale-reload!` reloads the stale set in macro-dependency (topological)
+  order via `load-file!`, optionally pruning; `prune-file!` ns-unmaps vars whose defining form
+  vanished (across every namespace the file defines), warning (not blocking) on remaining usages.
+  Proven end-to-end: editing a macro reloads its dependent *files* so they re-expand the new
+  macro, reloading the macro's file *alone* does not update the dependent (the case a naive
+  reload misses), and a removed var is pruned.
 
   Notes on the mtime choice: it reports a change whenever the file's timestamp moves — so a
   touch or save-without-edit can trigger a reload — and its resolution is milliseconds, so an
@@ -333,10 +345,11 @@ list of `[:index target span]` retraction instructions. Retracting a form is the
 facts): replay the list, `disj`/`dissoc` each entry, drop empty sets. No global sweep, no
 per-fact generation stamp needed — the form's own fact-list *is* the generation record.
 
-A **namespace** operation is just a batch over its forms: `ns->forms[N]` holds the fids whose
-source is N, so reloading N is "retract every fid in `ns->forms[N]`, then load fresh." Form
-granularity subsumes namespace granularity — one mechanism, and ns-load / stale-load are batches
-of form-loads (see §8).
+A **file** operation is just a batch over its forms: `source->forms[F]` holds the fids whose
+source is file F, so reloading F is "retract every fid in `source->forms[F]`, then load fresh."
+Form granularity subsumes file granularity — one mechanism, and file-load / stale-load are
+batches of form-loads (see §8). (The index keys on the file, not the namespace, because a file
+is the editor's unit and may hold several namespaces; each form keeps its `:ns` as metadata.)
 
 **The active-form stack is per-thread, not part of the shared model.** "Which form am I inside"
 (the stack that `begin-form!`/`end-form!` push and pop, and that every fact reads via
@@ -395,53 +408,62 @@ ones."
 Every driver reads **from disk**. There is deliberately no single-form / REPL-eval driver: the
 model is meant to stay in sync with what is written on disk, so an un-saved REPL eval (a scratch
 `def`, a form evaluated from the editor before saving) never enters it. The finest exposed
-granularity is therefore the **namespace** (`load-ns!`); the per-form primitive above is an
+granularity is therefore the **file** (`load-file!`); the per-form primitive above is an
 internal building block, not an operation on its own. Analysis of an edited form lands when its
 file is saved and reloaded.
 
-- **Cold load → full-project analysis.** Clean slate; the model is built from empty as every ns
-  loads, each form a form-load. The only run where cross-namespace completeness is trivially
-  guaranteed — the correctness baseline / rebuild button.
-- **Single-namespace load → single-ns analysis.** Batch of form-loads over the file: retract
-  every fid in `ns->forms[N]` (dropping defs removed from source and stale non-def forms), then
-  load N fresh. **Preserves every other namespace's usages of N's vars**, because those live
-  under *their* forms, not N's.
-- **Stale-files load (new) → stale-files analysis.** Compute the macro-aware stale set (§9),
-  reload it in topological order, each file a single-ns load.
+The unit is the file, keyed by its classpath-relative source path, and a file is reloaded by its
+**resource** (`load "/app/util"`), never require-by-namespace. That is what lets a file defining
+several namespaces reload as one unit (require can't name a file's second `(ns …)`), and it
+records the same source key `require` uses for transitive deps — so however a file first entered
+the model (cold `require`, or an editor `load-file!`), its key is the same and retraction matches.
+
+- **Cold load → full-project analysis.** Clean slate; the model is built from empty as every file
+  loads (via `require` of the entry namespaces, which pulls transitive deps in dependency order),
+  each form a form-load. The only run where cross-file completeness is trivially guaranteed — the
+  correctness baseline / rebuild button.
+- **Single-file load → single-file analysis.** Batch of form-loads over the file: retract every
+  fid in `source->forms[F]` (dropping defs removed from source and stale non-def forms), then
+  `load` F's resource fresh — re-analysing every namespace the file defines. **Preserves every
+  other file's usages of F's vars**, because those live under *their* forms, not F's.
+- **Stale-files load → stale-files analysis.** Compute the macro-aware stale set (§9), reload it
+  in topological order, each file a single-file load.
 
 ## 9. Reload workflows
 
 Two coexisting workflows. The distinction is purely *what gets recompiled* — the model is kept
 current on **both**.
 
-### 9.1 Plain single-file reload — unchanged
+### 9.1 Plain single-file reload — `load-file!`
 
-`require :reload`, exactly Clojure's behaviour: recompile that one file, redefine its vars in
-place, **no** cascade to callers, **no** re-expansion of macro calls in other namespaces. The
-scalpel stays a scalpel.
+Recompile that one file (by its resource, so all its namespaces), redefine its vars in place,
+**no** cascade to callers, **no** re-expansion of macro calls in other files. The scalpel stays a
+scalpel — the file analog of Clojure's `require :reload` scope.
 
 Subtlety that makes the two workflows coexist cleanly: reloading a macro's defining file still
-(a) atomically replaces that ns's model slice, and (b) **bumps the macro's version** — so the
-model now records "callers X, Y expanded an *older* version of this macro." It does **not**
-recompile X and Y. The version bump is a passive consequence of *any* reload; **acting** on it
-(the cascade) is exclusive to stale-reload.
+(a) atomically replaces that file's model slice, and (b) leaves the model recording "files X, Y
+expanded an *older* version of this macro" (their macro-dep edges are unchanged, so a later
+staleness check will see them depend on the just-edited file). It does **not** recompile X and Y.
+Acting on that dependency (the cascade) is exclusive to stale-reload.
 
-### 9.2 Stale-reload — new
+### 9.2 Stale-reload
 
-Recompiles the touched files **plus** the caller namespaces that are actually stale, in
+Recompiles the touched files **plus** the caller **files** that are actually stale, in
 topological order, and **optionally** prunes vars no longer in source.
 
-Staleness inputs, recorded per namespace after each successful compile:
+Staleness inputs, recorded per file after each successful compile:
 
-1. source-file **modification time** (`:ns-mtime`),
-2. the **macro dependency edges** it expanded (`:macro-deps`, from the `macroexpand1` tap).
+1. source-file **modification time** (`:file-mtime`, keyed by the resource path — no ns→path munging),
+2. the **macro dependency edges** its forms expanded (`:macro-deps`, from the `macroexpand1` tap;
+   each edge carries the expanding form's fid, hence its file).
 
-A namespace is a **seed** if its file mtime changed since last load (edited since last loaded).
-The stale set is the seed plus the transitive closure of its macro-dependents over the macro
-graph — the *conservative* macro-aware closure: any edit to a macro-defining file marks that
-file's macro-dependents stale, without distinguishing which form in the file changed. Runtime
-(function-call) dependents are excluded — a plain var re-resolves at runtime and needs no
-recompile. Reload the stale set in macro-dependency (topological) order.
+A file is a **seed** if its mtime changed since last load (edited since last loaded). The stale
+set is the seed plus the transitive closure of its macro-dependent *files* over the macro graph
+(projected into file space via each form's `:source` and each macro's owning-namespace file) —
+the *conservative* macro-aware closure: any edit to a macro-defining file marks that file's
+macro-dependent files stale, without distinguishing which form changed. Runtime (function-call)
+dependents are excluded — a plain var re-resolves at runtime and needs no recompile. Reload the
+stale set in macro-dependency (topological) order.
 
 (A precise variant — per-macro source-form versions, so only dependents of the specific changed
 macro reload — was built and reverted to this simpler scheme by request. `:inline`-fn edges are
@@ -459,46 +481,48 @@ the explicit operation that removes vars whose defining form vanished from the s
 - Uses **def provenance** (§7.2): "form at position P defined vars {…}" — a form removed from
   source ⇒ prune exactly the vars that form defined (handles the multi-var `defprotocol` /
   `defrecord` / `defmulti` cases that name-set diffing gets wrong).
-- The prune itself is `ns-unmap`, **runtime-only**. The model side is already reconciled by
-  `load-ns!`'s retract before `prune-ns!` runs: a deleted def still referenced by other forms
+- The prune itself is `ns-unmap`, **runtime-only** (each pruned var unmapped in its own home
+  namespace — a file's vars may span several). The model side is already reconciled by
+  `load-file!`'s retract before `prune-file!` runs: a deleted def still referenced by other forms
   becomes a **tombstone** in `:defs` (`:removed true`, its `:usages` preserved so the now-dangling
   references stay findable), and once its last reference is gone the tombstone is dropped by
   `sweep-tombstones` at the operation boundary (deferred to the stable end state, not GC'd eagerly
   during retract — mid-reload a still-referenced var's usage set is transiently emptied and then
-  re-filled). The sweep is **scoped**: each driver (`load-ns!` / `retract-ns!`)
+  re-filled). The sweep is **scoped**: each driver (`load-file!` / `retract-file!`)
   collects, in a thread-local `*emptied-tombstones*`, only the var keys *its own* retraction
   emptied, and sweeps just those — so it never scans the whole `:defs` map, and one thread cannot
   GC a tombstone another thread's concurrent reload has transiently emptied (a residual race
   needs two reloads racing on the very same deleted var; a cold reanalysis reconciles it). A
   deleted def with no references is dropped outright. Because vars are
   keyed by **name symbol**, not Var-object identity (§5), redefinition needs no reconciliation and
-  no dead Var is pinned; `prune-ns!` only removes the interned var that `require :reload` leaves
-  behind.
+  no dead Var is pinned; `prune-file!` only removes the interned var that a `load`/`require :reload`
+  leaves behind.
 - **Gate with the usage graph, warn don't block.** The model knows every remaining usage, so
   prune can report precisely — "removing `foo`, still referenced at A:12, B:30." Default to
   **warn-and-prune**, not block: vars get referenced reflectively (`#'foo`, `resolve`,
   `requiring-resolve`) in ways no static graph sees, so refusing on any inbound edge is both
   noisy and still-unsafe.
 - **Var-identity guard.** Since the model keys vars by name, not object, prune takes a
-  `{qsym → Var}` snapshot (`ns-def-var-snapshot`) of N's defs *before* the reload and only unmaps
-  a candidate when the **same Var object** is still interned afterwards. A def deleted from source
-  but re-created under a fresh identity during the reload (an explicit `intern`, or
-  `ns-unmap`+re-`intern`) is a different object, so it is preserved rather than destroyed.
-- **Precondition: prune only right after a full (re)analysis of N.** Prune deletes vars that are
-  interned in N but absent from `:defs` (as a healthy, non-tombstone entry), reading that absence
-  as "deleted from source."
-  That equivalence holds only when `:defs` was *just* fully repopulated — which `stale-reload!`
-  guarantees by calling `load-ns!` immediately before `prune-ns!`. Absent that, a var that never
-  entered `:defs` for a reason *other* than deletion — created by a runtime `intern` rather than
-  a `def` form, or in a namespace never analysed under the sink — would be wrongly unmapped
-  (silent data loss). So `prune-ns!` **refuses** (throws) on a namespace with no forms in
-  `:ns->forms`, turning standalone misuse into a loud error rather than a quiet deletion.
+  `{qsym → Var}` snapshot (`file-def-var-snapshot`) of file F's defs *before* the reload and only
+  unmaps a candidate when the **same Var object** is still interned afterwards. A def deleted from
+  source but re-created under a fresh identity during the reload (an explicit `intern`, or
+  `ns-unmap`+re-`intern`) is a different object, so it is preserved rather than destroyed. The
+  "still deleted" test is "no healthy `:defs` entry for it **anywhere**" — so a def *moved* to
+  another file that has since been reloaded (both files are stale, both reload) is not pruned.
+- **Precondition: prune only right after a full (re)analysis of F.** Prune deletes vars that were
+  in F's pre-reload defs but that the model now records no healthy `:defs` entry for, reading that
+  absence as "deleted from source." That equivalence holds only when `:defs` was *just* fully
+  repopulated — which `stale-reload!` guarantees by calling `load-file!` immediately before
+  `prune-file!`. Absent that, a var that never entered `:defs` for a reason *other* than deletion
+  — created by a runtime `intern` rather than a `def` form, or in a file never analysed under the
+  sink — would be wrongly unmapped (silent data loss). So `prune-file!` **refuses** (throws) on a
+  file with no forms in `:source->forms`, turning standalone misuse into a loud error.
 
 **Out of scope for v1 (note so they aren't surprises):**
 - `defmethod` is **not a var** — removing one mutates a multimethod, needing method-level
   provenance ("form P added dispatch value V to multi M"), a parallel mechanism.
-- **Refers aren't owned by N** — `refer`/`use` put other namespaces' mappings in N's map. Prune
-  only vars where `var.ns == N`; leave refers to the require graph.
+- **Refers aren't owned by a file** — `refer`/`use` put other namespaces' mappings in a namespace's
+  map. Prune only vars where `var.ns` is a namespace the file defines; leave refers to the require graph.
 - `declare` / forward decls define a var with no root — provenance handles them; don't mistake
   "no root value" for "not defined."
 
@@ -545,7 +569,7 @@ Replace read-time resolution in `sinkSyntaxQuoteRef` with **deferred resolution*
 - Syntax-quote already computes the fully-qualified *name* even for a not-yet-defined target,
   so at read time record a **pending** ref `{:sym qualified-sym :from-ns :span}` filed under the
   current form's fid (retraction works unchanged) instead of resolving to a `Var`/`Class`.
-- After the namespace finishes loading (`load-ns!` / `run-analysis` completion), run one resolve
+- After the file finishes loading (`load-file!` / `run-analysis` completion), run one resolve
   pass: each pending ref that now resolves moves into `:usages` keyed by identity.
 - **Leftovers are the payoff:** a pending ref that still won't resolve is an
   **unresolved-symbol / undefined-reference diagnostic** — a clj-kondo-style lint the same

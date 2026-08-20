@@ -10,15 +10,33 @@
 
   Captures var/local/keyword/class usages and definitions, macro compile-time
   dependency edges, and (from live namespace state) unused require/import/refer
-  - across namespaces, with precise source spans.
+  - across files, with precise source spans.
 
   Provenance is per top-level form: every fact is filed under the form that
-  produced it, so re-analysing one form (or one namespace) retracts exactly its
-  prior facts and installs the new ones, without disturbing the rest of the
-  model (design §7). Analysis is always populated from disk — run-analysis (cold)
-  and load-ns! (single-namespace reload) both read the file, so the model stays in
-  sync with what is written on disk and never reflects an un-saved REPL eval. Query
-  with find-usages, definition, unused-*, etc.
+  produced it, so re-analysing one form (or one file) retracts exactly its prior
+  facts and installs the new ones, without disturbing the rest of the model
+  (design §7).
+
+  The reload/staleness unit is the FILE, keyed by the classpath-relative source
+  path the compiler records (e.g. \"app/util.clj\"). This is deliberate:
+    - a file is what an editor actually edits and saves;
+    - one file can define several namespaces (a second `(ns ...)`, or `in-ns`);
+      a file reload re-analyses all of them together, which a require-by-namespace
+      cannot (it can't even name a file's second namespace);
+    - `require`, which loads transitive deps and which the editor does NOT drive,
+      already records this same classpath-relative key - so keying by it keeps the
+      model consistent no matter how a file first entered it.
+  Each form also keeps its owning namespace (:ns) as metadata, for the lints that
+  read live namespace state (unused-aliases/refers/imports).
+
+  Analysis is always populated FROM DISK - run-analysis (cold) and load-file!
+  (single-file reload) both read the file - so the model stays in sync with what is
+  written on disk and never reflects an un-saved REPL eval.
+
+  Drivers: run-analysis (cold), load-file! (single file, atomic), stale-reload!
+  (macro-aware cascade, §9), retract-file!. Query with find-usages, definition,
+  unused-*, file-namespaces, etc. - find-usages/definition take a Var or its
+  fully-qualified name symbol.
 
   See doc/analysis-and-reload.md for the full design."
       :author "replique-clj"}
@@ -43,16 +61,20 @@
 ;;   :locals          {binding {:ns :name ...span :uses #{span}}}
 ;;   :keyword-usages  {kw    #{span}}
 ;;   :class-usages    {class-name-string #{span}}  (keyed by name, not Class - see class-key)
-;;   :macro-deps      {ns-sym {macro-qsym #{fid}}}   compile-time edges (§9)
+;;   :macro-deps      {ns-sym {macro-qsym #{fid}}}   compile-time edges (§9); each fid
+;;                                          carries the expanding form's file (:source)
 ;; provenance:
 ;;   :forms           {fid {:ns :source :line :column :defines #{qsym} :facts [instr]}}
 ;;   :entity->form    {qsym fid}    the form that currently defines each var
-;;   :ns->forms       {ns-sym #{fid}}
+;;   :source->forms   {source #{fid}}   the file each form belongs to (the reload unit)
 ;;   :next-fid        long          global unique-id source for forms (shared)
+;; staleness (§9):
+;;   :file-mtime      {source long}   per-file on-disk mtime baseline; a live file
+;;                                    whose mtime differs is "changed"
 (def ^:private empty-model
   {:usages {} :defs {} :locals {} :keyword-usages {} :class-usages {} :macro-deps {}
-   :forms {} :entity->form {} :ns->forms {} :next-fid 0
-   :ns-mtime {}})  ; ns-sym -> source file last-modified time, for staleness (§9)
+   :forms {} :entity->form {} :source->forms {} :next-fid 0
+   :file-mtime {}})
 
 (defonce ^:private model (atom empty-model))
 
@@ -65,11 +87,11 @@
 ;; nil and facts are simply recorded without provenance.
 (def ^:private ^:dynamic *form-stack* nil)
 
-;; When bound to an atom, begin-form! logs every fid it allocates here. load-ns!
+;; When bound to an atom, begin-form! logs every fid it allocates here. load-file!
 ;; uses this to roll back a failed reload precisely - retracting exactly the forms
 ;; that reload created (wherever endForm filed them) - instead of resetting the
 ;; whole shared model, which would clobber facts other threads committed meanwhile.
-;; nil outside load-ns!, so ordinary analyses pay nothing for it.
+;; nil outside load-file!, so ordinary analyses pay nothing for it.
 (def ^:private ^:dynamic *created-fids* nil)
 
 ;; When bound to an atom (holding a set), retract-instr logs here every var whose
@@ -161,8 +183,8 @@
           m (update m :forms dissoc fid)
           m (update m :entity->form
                     (fn [e] (reduce (fn [e v] (if (= (get e v) fid) (dissoc e v) e)) e (:defines fe))))]
-      (if-let [owner (:ns fe)]
-        (-> m (update-in [:ns->forms owner] disj fid) (drop-empty :ns->forms owner))
+      (if-let [src (:source fe)]
+        (-> m (update-in [:source->forms src] disj fid) (drop-empty :source->forms src))
         m))
     m))
 
@@ -171,16 +193,16 @@
   operation, collected in *emptied-tombstones*) whose last reference is now truly
   gone: drop each :defs entry that is still :removed and still has no usages.
 
-  Runs at a reload boundary (after load-ns! / retract-ns! finishes),
-  NOT inside retract-instr: a reload first retracts the namespace's old forms and
-  only then re-analyses, so a var the reloaded namespace still references has its
-  usage set transiently emptied mid-reload and re-filled moments later. GC-ing
-  eagerly on that empty window would delete a cross-namespace tombstone that in
-  fact survives the reload (the reference comes right back) - and, on a plain
-  successful reload of the referencing namespace, strand the re-added usage under
-  no :defs entry. Deferring to the stable end state, and re-checking emptiness
-  here, avoids both. Sweeping only this operation's own candidates (not the whole
-  :defs map) keeps it O(touched) and confines it to tombstones this thread emptied."
+  Runs at a reload boundary (after load-file! / retract-file! finishes), NOT inside
+  retract-instr: a reload first retracts the file's old forms and only then
+  re-analyses, so a var the reloaded file still references has its usage set
+  transiently emptied mid-reload and re-filled moments later. GC-ing eagerly on that
+  empty window would delete a cross-file tombstone that in fact survives the reload
+  (the reference comes right back) - and, on a plain successful reload of the
+  referencing file, strand the re-added usage under no :defs entry. Deferring to the
+  stable end state, and re-checking emptiness here, avoids both. Sweeping only this
+  operation's own candidates (not the whole :defs map) keeps it O(touched) and
+  confines it to tombstones this thread emptied."
   [m candidates]
   (reduce (fn [m k]
             (if (and (get-in m [:defs k :removed]) (empty? (get-in m [:usages k])))
@@ -188,7 +210,7 @@
               m))
           m candidates))
 
-;; The precise inverse of retract-instr/retract-form, used only by load-ns! to
+;; The precise inverse of retract-instr/retract-form, used only by load-file! to
 ;; roll back a failed reload: it re-adds one previously-retracted form (and its
 ;; facts) into the live model, without disturbing any other form. `snap` is the
 ;; pre-reload model the form is restored from; the two lossy instrs (:defs carries
@@ -213,8 +235,8 @@
     (let [m (assoc-in m [:forms fid] fe)
           m (reduce (partial reinstate-instr snap) m (:facts fe))
           m (reduce (fn [m v] (assoc-in m [:entity->form v] fid)) m (:defines fe))]
-      (if-let [owner (:ns fe)]
-        (update-in m [:ns->forms owner] (fnil conj #{}) fid)
+      (if-let [src (:source fe)]
+        (update-in m [:source->forms src] (fnil conj #{}) fid)
         m))
     m))
 
@@ -259,10 +281,11 @@
                (let [fe (get-in m [:forms fid])]
                  (if (and (empty? (:facts fe)) (empty? (:defines fe)))
                    (update m :forms dissoc fid)          ; drop empty forms (e.g. outer do, EOF)
-                   (let [owner (some-> *ns* ns-name)]
-                     (-> m
-                         (assoc-in [:forms fid :ns] owner)
-                         (update-in [:ns->forms owner] (fnil conj #{}) fid)))))))))
+                   ;; File the form under its file (the reload unit); keep the owning
+                   ;; namespace as metadata for the lints that read live ns state.
+                   (-> m
+                       (assoc-in [:forms fid :ns] (some-> *ns* ns-name))
+                       (update-in [:source->forms (:source fe)] (fnil conj #{}) fid))))))))
   nil)
 
 ;; Invariant: a fact is recorded ONLY when a form is open (current-fid non-nil).
@@ -339,7 +362,8 @@
        (swap! model (fn [m]
                      ;; Always record the compile-time edge (stale reload needs it
                      ;; even for expansion-introduced calls); record the macro
-                     ;; *usage* only for a source-written call.
+                     ;; *usage* only for a source-written call. The fid carries the
+                     ;; expanding form's file, which the §9 cascade reads.
                      (let [m (-> m
                                  (update-in [:macro-deps ns-sym mk] (fnil conj #{}) fid)
                                  (add-fact fid [:macro-dep ns-sym mk fid]))]
@@ -362,62 +386,61 @@
   ;; dynamic extent: every form begin/end and fact recorded on this thread during
   ;; the analysis uses this thread's own stack. *created-fids* is deliberately NOT
   ;; bound here: begin-form! nil-guards it, so an ordinary analysis leaves it nil
-  ;; and pays nothing; when a caller (load-ns!) has established it, this inherits
+  ;; and pays nothing; when a caller (load-file!) has established it, this inherits
   ;; that binding so the caller sees every fid this analysis allocates, for rollback.
   (push-thread-bindings {Compiler/ANALYSIS_SINK (->AnalysisSink)
                          #'*form-stack*         (atom [])})
   (try (thunk) (finally (pop-thread-bindings))))
 
-(declare record-ns-mtime!)
+(declare record-file-mtime!)
 
 (defn run-analysis
   "Invoke thunk with the analysis sink installed on this thread, so any
   compilation it triggers (load / require / eval) populates the model,
   form by form. Returns the thunk's value.
 
-  Also records the source mtime of every namespace this run (re)compiled, so the
-  run establishes its own staleness baseline. Without it a cold analysis leaves
-  every namespace with a nil baseline, and the next `changed-namespaces` would
-  report them all as changed (nil baseline != current mtime), making the first
-  `stale-reload!` re-evaluate the whole codebase. Only namespaces actually
-  touched this run are snapshotted (their :ns->forms changed); baselines for
-  untouched namespaces - e.g. ones edited but not yet reloaded - are left intact,
-  so a pending staleness flag elsewhere is not silently cleared."
+  Also records the source mtime of every FILE this run (re)compiled, so the run
+  establishes its own staleness baseline. Without it a cold analysis leaves every
+  file with a nil baseline, and the next `changed-files` would report them all as
+  changed (nil baseline != current mtime), making the first `stale-reload!`
+  re-evaluate the whole codebase. Only files actually touched this run are
+  snapshotted (their :source->forms changed); baselines for untouched files - e.g.
+  ones edited but not yet reloaded - are left intact, so a pending staleness flag
+  elsewhere is not silently cleared."
   [thunk]
-  ;; Own a tombstone-candidate set unless a driver (load-ns!) already established
+  ;; Own a tombstone-candidate set unless a driver (load-file!) already established
   ;; one, in which case inherit it so that driver does the single post-op sweep.
   (let [own?   (nil? *emptied-tombstones*)
-        before (:ns->forms @model)]
+        before (:source->forms @model)]
     (binding [*emptied-tombstones* (or *emptied-tombstones* (atom #{}))]
       (let [result (with-sink thunk)]
-        (doseq [ns-sym (keys (:ns->forms @model))
-                :when (not= (get before ns-sym) (get-in @model [:ns->forms ns-sym]))]
-          (record-ns-mtime! ns-sym))
+        (doseq [source (keys (:source->forms @model))
+                :when (not= (get before source) (get-in @model [:source->forms source]))]
+          (record-file-mtime! source))
         (when own? (swap! model sweep-tombstones @*emptied-tombstones*))
         result))))
 
-(defn- retract-ns*
-  "Remove every fact produced by ns-sym's forms from the model, preserving all
-  other namespaces' references to its vars (design §8, single-ns replace). Records
+(defn- retract-source*
+  "Remove every fact produced by `source`'s forms from the model, preserving all
+  other files' references to its vars (design §8, single-file replace). Records
   emptied tombstone candidates but does NOT sweep - the caller does, after any
-  re-analysis (load-ns!), or immediately (retract-ns!)."
-  [ns-sym]
-  (swap! model (fn [m] (reduce retract-form m (get-in m [:ns->forms ns-sym]))))
+  re-analysis (load-file!), or immediately (retract-file!)."
+  [source]
+  (swap! model (fn [m] (reduce retract-form m (get-in m [:source->forms source]))))
   nil)
 
-(defn retract-ns!
-  "Remove every fact produced by ns-sym's forms from the model, preserving all
-  other namespaces' references to its vars (design §8, single-ns replace). GCs any
-  tombstone whose last reference this retract removed (e.g. retracting the one
-  namespace that still referenced a deleted-but-referenced var)."
-  [ns-sym]
+(defn retract-file!
+  "Remove every fact produced by `source`'s forms from the model, preserving all
+  other files' references to its vars (e.g. before dropping a deleted file). GCs any
+  tombstone whose last reference this retract removed. `source` is the
+  classpath-relative source path (e.g. \"app/util.clj\")."
+  [source]
   (binding [*emptied-tombstones* (atom #{})]
-    (retract-ns* ns-sym)
+    (retract-source* source)
     (swap! model sweep-tombstones @*emptied-tombstones*))
   nil)
 
-(defn- ns->source-path [ns-sym]
-  (str (.. (name ns-sym) (replace \- \_) (replace \. \/)) ".clj"))
+;; --- §9: per-file source mtime (the staleness baseline) --------------------
 
 (defn- resource->file
   "The File a file: resource URL points at. Prefer URL.toURI (which decodes %20
@@ -432,86 +455,111 @@
     (catch java.net.URISyntaxException _
       (java.io.File. (.getPath u)))))
 
-(defn- ns-source-mtime [ns-sym]
-  (when-let [u (io/resource (ns->source-path ns-sym))]
+(defn- file-mtime
+  "The on-disk last-modified time of the file behind classpath resource `source`,
+  or nil if it can't be resolved to a file (never loaded from a file, moved,
+  deleted, or now behind a jar - a jar-entry URL has protocol \"jar\", not
+  \"file\"). No namespace->path munging: the source path IS the resource path."
+  [source]
+  (when-let [u (io/resource source)]
     (when (= "file" (.getProtocol u))
       (.lastModified (resource->file u)))))
 
-(defn- record-ns-mtime! [ns-sym]
-  (swap! model assoc-in [:ns-mtime ns-sym] (ns-source-mtime ns-sym))
+(defn- record-file-mtime! [source]
+  (swap! model assoc-in [:file-mtime source] (file-mtime source))
   nil)
 
 (defn snapshot-mtimes!
-  "Record the current source-file modification time of every analysed namespace,
-  so later staleness checks have a reference point. `run-analysis` already
-  baselines the namespaces it compiles, so this is not needed after a plain cold
-  analysis; use it to force-rebaseline the entire model (e.g. to deliberately
-  clear all pending staleness flags at once)."
+  "Record the current on-disk mtime of every analysed file, so later staleness
+  checks have a reference point. `run-analysis` already baselines the files it
+  compiles, so this is not needed after a plain cold analysis; use it to
+  force-rebaseline the entire model (e.g. to deliberately clear all pending
+  staleness flags at once)."
   []
-  (doseq [ns-sym (keys (:ns->forms @model))] (record-ns-mtime! ns-sym))
+  (doseq [source (keys (:source->forms @model))] (record-file-mtime! source))
   nil)
 
-(defn load-ns!
-  "Single-namespace analysis (design §8): retract ns-sym's prior forms, then
-  reload the namespace under the sink so the model is replaced cleanly. Removes
-  defs deleted from source and stale non-def forms that retract-on-redefine
-  alone would miss. Refreshes the stored source mtime.
+(defn- strip-ext [^String source]
+  (cond (.endsWith source ".cljc") (subs source 0 (- (count source) 5))
+        (.endsWith source ".clj")  (subs source 0 (- (count source) 4))
+        :else source))
 
-  Atomic: retract + reload + mtime update either all take effect or, if the
-  reload throws (typically an edited source with a compile/syntax error), none
-  do - ns-sym is reverted to its prior state and the error re-thrown. Without the
-  rollback a failed reload leaves ns-sym's facts retracted but never replaced, so
-  every var in the namespace (even ones that still compile) drops out of the index.
+(defn- load-source!
+  ;; Reload a file by its classpath resource: (load \"/app/util\") for source
+  ;; \"app/util.clj\". `load` (unlike require) ALWAYS re-runs, and runs the whole
+  ;; file - every (ns ...)/in-ns in it - so all of a file's namespaces re-analyse
+  ;; together, and it records the same classpath-relative :source key `require` did.
+  [source]
+  (load (str "/" (strip-ext source))))
 
-  The rollback reverts ONLY ns-sym, via swap!: it retracts this reload's created
-  forms that belong to ns-sym and reinstates ns-sym's prior forms from a pre-retract
-  snapshot. It never reset!s the whole model, so facts other threads committed by
-  concurrent analyses between the snapshot and the failure are preserved (design
-  §7.3). It also leaves alone any *other* namespace this reload happened to load
-  fresh (an edit adding `(require some-not-yet-loaded-ns)`): that namespace compiled
-  successfully and its facts reflect the runtime, so retracting them would strand a
-  loaded namespace with no model entry. Created fids are filtered by owning ns
-  (endForm files every form under its namespace, even the one that threw).
+(defn load-file!
+  "Single-file analysis: retract `source`'s prior forms, then reload the file under
+  the sink so the model is replaced cleanly - no accumulation. Removes defs deleted
+  from source and stale non-def forms that retract-on-redefine alone would miss.
+  Refreshes the stored source mtime. `source` is the classpath-relative source path
+  the compiler records (e.g. \"app/util.clj\").
 
-  Limitation: assumes one namespace per source file (the Clojure norm). A file that
-  defines a second `(ns other ...)` is only partially tracked - retract and rollback
-  key on ns-sym, so `other`'s forms from the same file are neither replaced nor
-  rolled back cleanly. Reload such a file with a cold reanalysis instead."
-  [ns-sym]
+  Reloads via the file's resource (`load`), NOT require-by-namespace, so it handles
+  a file that defines several namespaces (a require can't even name a file's second
+  namespace) and keeps :source consistent with the cold analysis.
+
+  Atomic: retract + reload + mtime update either all take effect or, if the reload
+  throws (typically an edited source with a compile/syntax error), none do - the
+  file is reverted to its prior state and the error re-thrown. The rollback reverts
+  ONLY this file, via swap! (never reset!): it retracts this reload's created forms
+  belonging to `source` and reinstates the file's prior forms from a pre-retract
+  snapshot, so facts other threads committed meanwhile, and any OTHER file this
+  reload happened to load fresh (an edit adding a new require), are preserved. The
+  mtime is left unrefreshed on failure, so the file stays flagged stale and retries."
+  [source]
   (let [snapshot @model
-        old-fids (get-in snapshot [:ns->forms ns-sym])]
+        old-fids (get-in snapshot [:source->forms source])]
     ;; One candidate set spans the retract and the re-analysis (run-analysis
     ;; inherits it), so the single success-path sweep sees every var emptied by
     ;; either phase - and the failure path discards it, never GC-ing on rollback.
     (binding [*created-fids*       (atom [])
               *emptied-tombstones* (atom #{})]
       (try
-        (retract-ns* ns-sym)
-        (run-analysis #(require ns-sym :reload))
+        (retract-source* source)
+        (run-analysis #(load-source! source))
         (swap! model sweep-tombstones @*emptied-tombstones*)
-        (record-ns-mtime! ns-sym)
+        (record-file-mtime! source)
         (catch Throwable t
           (swap! model
                  (fn [m]
-                   (let [mine (filter #(= ns-sym (get-in m [:forms % :ns])) @*created-fids*)
+                   (let [mine (filter #(= source (:source (get-in m [:forms %]))) @*created-fids*)
                          m    (reduce retract-form m mine)]
                      (reduce (fn [m fid] (reinstate-form m snapshot fid)) m old-fids))))
           (throw t))))))
 
 ;; --- queries ---------------------------------------------------------------
 
+(defn- ->var-key
+  "Normalise a find-usages / definition argument to a var-key: accept a Var or a
+  fully-qualified name symbol (my.ns/foo), the latter being what an editor has at a
+  cursor without a live Var object."
+  [var-or-sym]
+  (cond
+    (instance? Var var-or-sym) (var-key var-or-sym)
+    (qualified-symbol? var-or-sym) var-or-sym
+    :else (throw (IllegalArgumentException.
+                  (str "find-usages/definition expect a Var or fully-qualified symbol, got: "
+                       (pr-str var-or-sym))))))
+
 (defn find-usages
-  "Usage sites recorded for var v: a set of spans
+  "Usage sites recorded for a var - pass the Var, or its fully-qualified name symbol
+  (my.ns/foo). Returns a set of spans
   {:from-ns :source :line :column :end-line :end-column [:macro]}."
-  [^Var v]
-  (get-in @model [:usages (var-key v)]))
+  [var-or-sym]
+  (get-in @model [:usages (->var-key var-or-sym)]))
 
 (defn definition
-  "Definition site recorded for var v: a span, or nil. A tombstoned var (its def
-  deleted from source but still referenced) is treated as undefined - returns nil,
-  not the span the def used to occupy."
-  [^Var v]
-  (let [e (get-in @model [:defs (var-key v)])]
+  "Definition site recorded for a var - pass the Var or its fully-qualified name
+  symbol. Returns a span, or nil. A tombstoned var (its def deleted from source but
+  still referenced) is treated as undefined - returns nil, not the span the def used
+  to occupy."
+  [var-or-sym]
+  (let [e (get-in @model [:defs (->var-key var-or-sym)])]
     (when-not (:removed e) (:span e))))
 
 (defn find-keyword-usages
@@ -543,6 +591,34 @@
          :when (empty? (:uses info))
          :when (or (nil? ns-sym) (= ns-sym (ns-name (:ns info))))]
      (dissoc info :uses))))
+
+(defn file-forms
+  "The fids currently attributed to file `source` (for inspection/tests)."
+  [source]
+  (get-in @model [:source->forms source] #{}))
+
+(defn file-namespaces
+  "The namespaces (ns-name symbols) file `source` defines, per the model - one file
+  can define several. Use this to drive the per-namespace lints for a file."
+  [source]
+  (set (for [fid (file-forms source)
+             :let [n (get-in @model [:forms fid :ns])]
+             :when n]
+         n)))
+
+(defn ns-forms
+  "The fids currently attributed to ns-sym (scans :forms by :ns metadata). Present
+  for inspection; the reload unit is the file (see file-forms)."
+  [ns-sym]
+  (set (for [[fid fe] (:forms @model) :when (= ns-sym (:ns fe))] fid)))
+
+(defn source->file
+  "The on-disk java.io.File for a classpath-relative source path, or nil if it
+  can't be resolved to a file (behind a jar, moved). For an editor to open the file
+  a span's :source names."
+  [source]
+  (when-let [u (io/resource source)]
+    (when (= "file" (.getProtocol u)) (resource->file u))))
 
 ;; --- requires / imports (read from live namespace state, design §4) --------
 
@@ -601,65 +677,82 @@
                    :when (and (not (contains? defaults c)) (not (used? c)))]
                [sym c]))))
 
-(defn ns-forms
-  "The fids currently attributed to ns-sym (for inspection/tests)."
-  [ns-sym]
-  (get-in @model [:ns->forms ns-sym] #{}))
-
 ;; --- stale reload + prune (design §9) --------------------------------------
 
-(defn changed-namespaces
-  "Analysed namespaces whose source-file modification time differs from the
-  recorded baseline (edited since last analysis/reload). Namespaces whose source
-  can no longer be resolved to a file (mtime nil - moved, deleted, or now behind
-  a jar) are skipped: reloading them would only fail, so they are not flagged."
+(defn changed-files
+  "Analysed files (classpath-relative source paths) whose on-disk mtime differs from
+  the recorded baseline - edited since last analysis/reload. A file that no longer
+  resolves to a file (mtime nil - moved, deleted, or now behind a jar) is skipped:
+  reloading it would only fail, so it is not flagged."
   []
   (let [m @model]
-    (set (for [ns-sym (keys (:ns->forms m))
-               :let [now (ns-source-mtime ns-sym)]
-               :when (and (some? now)
-                          (not= now (get-in m [:ns-mtime ns-sym])))]
-           ns-sym))))
+    (set (for [source (keys (:source->forms m))
+               :let [now (file-mtime source)]
+               :when (and (some? now) (not= now (get-in m [:file-mtime source])))]
+           source))))
 
 (defn- macro-owner
   "The macro-defining namespace symbol for a macro key (a qualified symbol)."
   [macro-key] (symbol (namespace macro-key)))
 
-(defn- reverse-macro-graph
-  "macro-defining-ns -> #{namespaces that expand a macro from it}."
+(defn- file-macro-graph
+  "Forward compile-time dependency graph over FILES: {source #{dep-source}} where a
+  form in `source` expands a macro whose defining namespace lives in `dep-source`.
+  Derived from :macro-deps (each edge's fid carries the expanding form's file) and
+  the ns->sources projection of :forms (a macro-defining ns maps to the file(s) it
+  lives in). Self-edges are dropped - a file that expands its own macros needs no
+  cross-file reload of itself."
   [m]
-  (reduce (fn [acc [n mm]]
-            (reduce (fn [acc mv] (update acc (macro-owner mv) (fnil conj #{}) n))
-                    acc (keys mm)))
-          {} (:macro-deps m)))
+  (let [forms    (:forms m)
+        ns->srcs (reduce-kv (fn [acc _ fe]
+                              (if-let [n (:ns fe)]
+                                (update acc n (fnil conj #{}) (:source fe))
+                                acc))
+                            {} forms)]
+    (reduce-kv
+     (fn [g _ mm]
+       (reduce-kv
+        (fn [g mk fids]
+          (let [owner-srcs (get ns->srcs (macro-owner mk))]
+            (reduce (fn [g fid]
+                      (let [s (:source (get forms fid))]
+                        (reduce (fn [g os] (if (= os s) g (update g s (fnil conj #{}) os)))
+                                g owner-srcs)))
+                    g fids)))
+        g mm))
+     {} (:macro-deps m))))
 
-(defn stale-namespaces
-  "The set of namespaces to reload: every namespace whose source was edited since
-  last loaded (the seed), plus every namespace that transitively compile-time-
-  depends on the seed through the macro graph (design §9). Runtime-only
+(defn- reverse-file-graph
+  "Invert a forward file graph {source #{dep-source}} to {dep-source #{dependent
+  source}} - the direction the stale cascade walks (edit a file -> its dependents)."
+  [fwd]
+  (reduce-kv (fn [rev src deps]
+               (reduce (fn [rev d] (update rev d (fnil conj #{}) src)) rev deps))
+             {} fwd))
+
+(defn stale-files
+  "The set of files to reload: every file whose source was edited since last loaded
+  (the seed - no arg = changed-files), plus every file that transitively compile-
+  time-depends on the seed through the file macro graph (design §9). Runtime-only
   (function-call) dependents are excluded - a plain var re-resolves at runtime and
-  needs no recompile; only macro dependents do. This is a conservative macro-aware
-  closure: any edit to a macro-defining file marks its macro-dependents stale
-  (it does not distinguish which specific form in the file changed)."
-  ([] (stale-namespaces (changed-namespaces)))
+  needs no recompile; only macro dependents do. Conservative: any edit to a
+  macro-defining file marks ALL its macro-dependent files stale (it does not
+  distinguish which form in the file changed)."
+  ([] (stale-files (changed-files)))
   ([seed]
-   (let [rev (reverse-macro-graph @model)]
+   (let [rev (reverse-file-graph (file-macro-graph @model))]
      (loop [dirty (set seed), queue (vec seed)]
        (if-let [x (peek queue)]
          (let [fresh (remove dirty (get rev x))]
            (recur (into dirty fresh) (into (pop queue) fresh)))
          dirty)))))
 
-(defn- macro-dep-nses
-  "Namespaces defining macros that ns-sym expands (its compile-time deps)."
-  [m ns-sym]
-  (set (map macro-owner (keys (get-in m [:macro-deps ns-sym])))))
-
 (defn- topo-order
-  "Order nses so each namespace's macro-dependency namespaces come first.
-  Cycles are broken arbitrarily (remaining nodes appended)."
-  [nses dep-fn]
-  (let [nodes (set nses)]
+  "Order files so each file's macro-dependency files come first. Cycles are broken
+  arbitrarily (remaining nodes appended). Deps outside `nodes` are ignored - they
+  are not being reloaded, so they are already current."
+  [files dep-fn]
+  (let [nodes (set files)]
     (loop [order [], placed #{}, remaining nodes]
       (if (empty? remaining)
         order
@@ -669,88 +762,86 @@
             (into order remaining)
             (recur (into order ready) (into placed ready) (reduce disj remaining ready))))))))
 
-(defn ns-def-vars
+(defn- healthy-def? [m k]
+  (let [e (get-in m [:defs k])] (and e (not (:removed e)))))
+
+(defn file-def-vars
   "The fully-qualified name symbols the model currently records a healthy `def`
-  form for in ns-sym (tombstones - :removed defs - excluded). This is exactly the
-  population prune-ns! is allowed to consider: only vars the compiler saw defined
-  by a top-level def can be judged 'deleted from source' by their disappearance."
-  [m ns-sym]
-  (let [nsname (str (ns-name (the-ns ns-sym)))]
-    (set (for [[k entry] (:defs m)
-               :when (and (= nsname (namespace k)) (not (:removed entry)))]
-           k))))
+  form for IN file `source` (tombstones - :removed defs - excluded), keyed off each
+  def's span :source. Exactly the population prune-file! may consider: only vars the
+  compiler saw defined by a top-level def can be judged 'deleted' by disappearance."
+  [m source]
+  (set (for [[k e] (:defs m)
+             :when (and (not (:removed e)) (= source (:source (:span e))))]
+         k)))
 
-(defn ns-def-var-snapshot
-  "Capture {qsym -> the currently-interned Var object} for ns-sym's healthy
-  recorded defs. This is prune-ns!'s `prior`; take it *before* load-ns! so that,
-  once vars are keyed by name (not identity), prune can still tell a lingering
-  deleted-def var (the SAME Var object is still interned after :reload) from one
-  the reloaded source deleted and re-created under a fresh identity via intern /
-  unmap-then-reintern (which must be preserved, not unmapped)."
-  [m ns-sym]
-  (let [interned (ns-interns ns-sym)]
-    (into {} (for [k (ns-def-vars m ns-sym)]
-               [k (get interned (symbol (name k)))]))))
+(defn file-def-var-snapshot
+  "Capture {qsym -> the currently-interned Var object} for the healthy defs in file
+  `source`. This is prune-file!'s `prior`; take it *before* the reload so that,
+  since vars are keyed by name (not identity), prune can still tell a lingering
+  deleted-def var (the SAME Var object survives a reload) from one the reloaded
+  source deleted and re-created under a fresh identity (which must be preserved)."
+  [m source]
+  (into {} (for [k (file-def-vars m source)
+                 :let [home (find-ns (symbol (namespace k)))
+                       v    (when home (get (ns-interns home) (symbol (name k))))]]
+             [k v])))
 
-(defn prune-ns!
-  "Unmap the *runtime* vars whose defining `def` form vanished from source.
-  `prior` is the {qsym -> Var} snapshot the model recorded for ns-sym *before* the
-  reload that just ran (capture it with `ns-def-var-snapshot` immediately before
-  `load-ns!`); a var is pruned when it was in `prior`, no longer has a healthy def
-  in the freshly reloaded model, and the SAME Var object is still interned. The
-  identity check matters because vars are keyed by name, not object: a def deleted
-  from source but re-created under a fresh Var (an explicit intern, or
-  unmap-then-reintern in the new source) is a different object than the snapshot's,
-  so it is left alone rather than destroyed. Warns - but still unmaps - if a pruned
-  var has recorded usages (design §9.3: reflective uses can't be seen, so
-  warn-and-prune, don't block). Returns the pruned symbols.
+(defn prune-file!
+  "Unmap the *runtime* vars whose defining `def` form vanished from file `source`.
+  `prior` is the {qsym -> Var} snapshot the model recorded for `source` *before* the
+  reload that just ran (capture it with `file-def-var-snapshot` immediately before
+  `load-file!`); a var is pruned when it was in `prior`, the model now records NO
+  healthy def for it anywhere (deleted outright - not merely moved to another file
+  that has since been reloaded), and the SAME Var object is still interned in its
+  home namespace. The identity check matters because vars are keyed by name, not
+  object: a def deleted from source but re-created under a fresh Var (an explicit
+  intern, or unmap-then-reintern) is a different object, so it is left alone rather
+  than destroyed. Warns - but still unmaps - if a pruned var has recorded usages
+  (design §9.3: reflective uses can't be seen, so warn-and-prune, don't block).
+  Returns the pruned qsyms.
 
-  Model-side, nothing to do here: load-ns!'s retract already handled the vanished
+  Model-side, nothing to do here: load-file!'s retract already handled the vanished
   def - a deleted def still referenced by other forms became a tombstone in :defs
-  (:removed true, its usages preserved so the now-dangling references stay
-  findable), one with no references left was dropped outright, and either way
-  :entity->form was cleared by retract-form. This function only reconciles the
-  live namespace: `require :reload` re-defs existing vars but never *removes* a var
-  whose def was deleted, so the interned var would linger and shadow the source.
+  (:removed true, its usages preserved), one with no references left was dropped
+  outright, and either way :entity->form was cleared. This only reconciles the live
+  namespace: `require :reload` / `load` re-def existing vars but never *remove* a
+  var whose def was deleted, so the interned var would linger and shadow the source.
 
-  Gating on `prior` (not `ns-interns` minus :defs) is deliberate: vars that
-  were never recorded as a `def` are never candidates, so intern-created vars
-  are left alone. In particular a `defprotocol`'s method vars (created by
-  `intern`, never a DefExpr - see core_deftype.clj) are never in :defs and so
-  are never pruned; the cost is that a genuinely *deleted* protocol method (or a
-  deleted `defonce`, which :reload also does not re-def) leaks a stale interned
-  var until a cold reanalysis. That is the safe direction: never unmap a live
-  protocol method and break its dispatch.
+  Gating on `prior` (not `ns-interns` minus :defs) is deliberate: vars never recorded
+  as a `def` are never candidates, so intern-created vars are left alone. In
+  particular a `defprotocol`'s method vars (created by `intern`, never a DefExpr) are
+  never pruned; the cost is that a genuinely *deleted* protocol method (or a deleted
+  `defonce`, which reload also does not re-def) leaks a stale interned var until a
+  cold reanalysis. That is the safe direction: never unmap a live protocol method.
 
-  PRECONDITION: only valid immediately after `load-ns!` of ns-sym (which
-  `stale-reload!` does), so :defs has just been fully repopulated. Refuses to run
-  on a namespace the model has never analysed (no forms in :ns->forms), turning
-  misuse into a loud error instead of silent data loss."
-  [ns-sym prior]
-  (when-not (seq (get-in @model [:ns->forms ns-sym]))
-    (throw (ex-info (str "prune-ns! refused: " ns-sym " has no analysed forms in the model. "
-                         "Run (load-ns! '" ns-sym ") first - prune is only valid right after "
+  PRECONDITION: only valid immediately after `load-file!` of `source` (which
+  `stale-reload!` does), so :defs has just been fully repopulated. Refuses to run on
+  a file the model has never analysed (no forms in :source->forms), turning misuse
+  into a loud error instead of silent data loss."
+  [source prior]
+  (when-not (seq (get-in @model [:source->forms source]))
+    (throw (ex-info (str "prune-file! refused: " source " has no analysed forms in the model. "
+                         "Run (load-file! \"" source "\") first - prune is only valid right after "
                          "a full analysis, else it would unmap vars it simply never recorded.")
-                    {:ns ns-sym})))
-  (let [live     (ns-def-vars @model ns-sym)   ; healthy def qsyms after reload
-        interned (ns-interns ns-sym)           ; {simple-sym var}
+                    {:source source})))
+  (let [m    @model
         gone (for [[k old-var] prior
-                   :when (and old-var
-                              (identical? (get interned (symbol (name k))) old-var)
-                              (not (contains? live k)))]
+                   :let [home (find-ns (symbol (namespace k)))
+                         cur  (when home (get (ns-interns home) (symbol (name k))))]
+                   :when (and old-var (identical? cur old-var) (not (healthy-def? m k)))]
                k)]
     (doseq [k gone]
-      (when-let [us (seq (get-in @model [:usages k]))]
+      (when-let [us (seq (get-in m [:usages k]))]
         (binding [*out* *err*]
           (println "WARN: pruning" (str k) "still referenced at"
                    (vec (for [s us] [(some-> (:from-ns s) ns-name) (:line s) (:column s)])))))
-      (ns-unmap ns-sym (symbol (name k))))
-    (mapv #(symbol (name %)) gone)))
+      (ns-unmap (symbol (namespace k)) (symbol (name k))))
+    (vec gone)))
 
 (defn- topo-respected?
-  "True when `order` already loads every namespace after all its macro-deps
-  (per dep-fn). Deps outside `order` are ignored - they were not reloaded, so
-  they are already current."
+  "True when `order` already loads every file after all its macro-deps (per dep-fn).
+  Deps outside `order` are ignored - they were not reloaded, so they are current."
   [order dep-fn]
   (let [idx (zipmap order (range))]
     (every? (fn [x] (every? (fn [y] (or (nil? (idx y)) (< (idx y) (idx x))))
@@ -758,53 +849,52 @@
             order)))
 
 (defn stale-reload!
-  "Macro-aware stale reload (design §9.2). Computes the stale set (changed
-  namespaces + their transitive macro-dependents), reloads each via load-ns! in
-  macro-dependency order (macro definers before their users, which then re-expand
-  the new macros), and optionally prunes vanished vars (:prune true). Returns the
-  final reload order.
+  "Macro-aware stale reload (design §9.2). Computes the stale set (changed files +
+  their transitive macro-dependent files), reloads each via load-file! in macro-
+  dependency (topological) order - macro-defining files before the files that
+  re-expand them - and optionally prunes vanished vars (:prune true). Returns the
+  final reload order (a vector of source paths).
 
-  Fail-fast, like require: if a namespace fails to compile, load-ns! re-throws and
-  the reload stops there (namespaces later in the order, and the second pass, do
-  not run). This is intentional - it surfaces the error immediately rather than
-  pressing on. No staleness is lost: load-ns! advances a namespace's mtime baseline
-  only on a successful load, so the failed namespace and any not yet reached stay
-  stale (see changed-namespaces) and are retried on the next stale-reload! call.
+  Fail-fast, like require: if a file fails to compile, load-file! re-throws and the
+  reload stops there (files later in the order, and the second pass, do not run).
+  This is intentional - it surfaces the error immediately. No staleness is lost:
+  load-file! advances a file's mtime baseline only on a successful load, so the
+  failed file and any not yet reached stay stale (see changed-files) and are retried
+  on the next stale-reload! call.
 
-  Two-pass, to handle a macro dependency introduced by the very edit being
-  reloaded (design §9.2). The first-pass order comes from the pre-reload macro
-  graph, which cannot yet know an edge that only this edit adds (e.g. ns A newly
-  requires and expands ns B's macro): A could be ordered before B and expand B's
-  stale macro. Pass 1 reloads in that best-guess order, which recompiles every
-  edited file and so completes the macro graph. We then recompute the order from
-  the now-complete graph; if pass 1 already respected it (the common case - no
-  new cross-ns macro edge) we are done at no extra cost, otherwise a namespace
-  expanded a stale macro and we reload once more in the corrected order. Two
-  passes always suffice: after pass 1 the on-disk source is fixed and every
-  edited file has been analysed, so the recomputed graph - and its order - is
-  stable.
+  Two-pass, to handle a macro dependency introduced by the very edit being reloaded.
+  The first-pass order comes from the pre-reload macro graph, which cannot yet know
+  an edge only this edit adds (e.g. file A newly requires and expands a macro from
+  file B): A could be ordered before B and expand B's stale macro. Pass 1 reloads in
+  that best-guess order, which recompiles every edited file and so completes the
+  graph. We then recompute the order; if pass 1 already respected it (the common
+  case) we are done at no extra cost, otherwise a file expanded a stale macro and we
+  reload once more in the corrected order. Two passes always suffice: after pass 1
+  the on-disk source is fixed and every edited file analysed, so the recomputed
+  graph - and its order - is stable.
 
   Limitation: this repairs *stale* expansion (the macro exists but is the old
-  version). An edit that calls a macro which did not exist in the dependency's
-  old version can still make pass 1 error if misordered; ordering by the new
-  requires would be needed for that, which this does not do."
+  version). An edit that calls a macro which did not exist in the dependency's old
+  version can still make pass 1 error if misordered; ordering by the new requires
+  would be needed for that, which this does not do."
   [& {:keys [prune]}]
-  (let [reload! (fn [order]
-                  (doseq [ns-sym order]
-                    ;; Snapshot the ns's def-vars (with their Var identities) BEFORE
-                    ;; load-ns! retracts them, so prune can tell which def forms
-                    ;; vanished - and preserve any re-created afresh (see prune-ns!).
-                    (let [prior (when prune (ns-def-var-snapshot @model ns-sym))]
-                      (load-ns! ns-sym)
-                      (when prune (prune-ns! ns-sym prior)))))
-        stale  (stale-namespaces)
-        order1 (topo-order stale #(macro-dep-nses @model %))]
+  (let [dep-fn  (fn [g] (fn [s] (get g s #{})))
+        reload! (fn [order]
+                  (doseq [source order]
+                    ;; Snapshot the file's def-vars (with their Var identities) BEFORE
+                    ;; load-file! retracts them, so prune can tell which def forms
+                    ;; vanished - and preserve any re-created afresh (see prune-file!).
+                    (let [prior (when prune (file-def-var-snapshot @model source))]
+                      (load-file! source)
+                      (when prune (prune-file! source prior)))))
+        stale   (stale-files)
+        order1  (topo-order stale (dep-fn (file-macro-graph @model)))]
     (reload! order1)
     ;; Pass 1 completed the macro graph; re-derive the order from it.
-    (let [dep-fn  #(macro-dep-nses @model %)]
-      (if (topo-respected? order1 dep-fn)
+    (let [df (dep-fn (file-macro-graph @model))]
+      (if (topo-respected? order1 df)
         order1
-        (let [order2 (topo-order stale dep-fn)]
+        (let [order2 (topo-order stale df)]
           (reload! order2)
           order2)))))
 
