@@ -492,6 +492,25 @@
   [source]
   (load (str "/" (strip-ext source))))
 
+(defn- check-resource-source!
+  "Reject a `source` that is not a loadable classpath-relative resource path - the
+  key the compiler records (e.g. \"app/util.clj\"). An editor deals in ABSOLUTE
+  paths and must translate to the resource path (strip the classpath root) before
+  calling load-file!; catching that here turns it into a clear error instead of a
+  cryptic FileNotFoundException from `load`, or a silent no-op when the key matches
+  nothing in the model. A nil `io/resource` (deleted / moved / behind a jar) is
+  rejected the same way, since load would fail anyway."
+  [source]
+  (when (or (not (string? source))
+            (.startsWith ^String source "/")
+            (nil? (io/resource source)))
+    (throw (ex-info (str "load-file! expects a classpath-relative source path, the key the "
+                         "compiler records (e.g. \"app/util.clj\") - not " (pr-str source)
+                         ". An editor must translate an absolute file path to its resource "
+                         "path (strip the classpath root) before calling load-file!.")
+                    {:source source})))
+  source)
+
 (defn load-file!
   "Single-file analysis: retract `source`'s prior forms, then reload the file under
   the sink so the model is replaced cleanly - no accumulation. Removes defs deleted
@@ -512,6 +531,7 @@
   reload happened to load fresh (an edit adding a new require), are preserved. The
   mtime is left unrefreshed on failure, so the file stays flagged stale and retries."
   [source]
+  (check-resource-source! source)
   (let [snapshot @model
         old-fids (get-in snapshot [:source->forms source])]
     ;; One candidate set spans the retract and the re-analysis (run-analysis
@@ -715,9 +735,13 @@
         (fn [g mk fids]
           (let [owner-srcs (get ns->srcs (macro-owner mk))]
             (reduce (fn [g fid]
-                      (let [s (:source (get forms fid))]
+                      ;; :macro-deps fids track live forms (retract-instr's :macro-dep
+                      ;; op keeps them in sync), so s is normally non-nil; guard anyway
+                      ;; so any future drift injects no nil-source edge.
+                      (if-let [s (:source (get forms fid))]
                         (reduce (fn [g os] (if (= os s) g (update g s (fnil conj #{}) os)))
-                                g owner-srcs)))
+                                g owner-srcs)
+                        g))
                     g fids)))
         g mm))
      {} (:macro-deps m))))
