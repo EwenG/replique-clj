@@ -139,9 +139,10 @@ static boolean isWhitespace(int ch){
 	return Character.isWhitespace(ch) || ch == ',';
 }
 
-// True when the compiler wants source positions recorded (analysis is on).
+// True when the compiler wants source positions recorded - because analysis is on,
+// or because a front end asked for them directly (Compiler.RECORD_POSITIONS).
 static boolean positionsRequested(){
-	return Compiler.ANALYSIS_SINK.deref() != null;
+	return Compiler.recordPositions();
 }
 
 static private Object attachSourcePosition(IObj o, int line, int column, int endLine, int endColumn){
@@ -328,7 +329,7 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 			// during an analysis load - rare enough to not warrant reader-identity
 			// tracking on this hot path; a cold reanalysis reconciles the position.
 			if(!isRecursive && (r instanceof LineNumberingPushbackReader)
-			   && positionsRequested() && Compiler.readingTopLevelForm())
+			   && Compiler.readingTopLevelForm())
 				{
 				IAnalysisSink sink = Compiler.analysisSink();
 				if(sink != null)

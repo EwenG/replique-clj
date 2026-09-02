@@ -350,6 +350,14 @@ static IAnalysisSink analysisSink(){
 	return (IAnalysisSink) ANALYSIS_SINK.deref();
 }
 
+static final public Var RECORD_POSITIONS = Var.create(null).setDynamic();
+
+// True when positions should be recorded: either explicitly requested, or implied
+// by an installed sink (which needs them for every event it reports).
+static boolean recordPositions(){
+	return ANALYSIS_SINK.deref() != null || RT.booleanCast(RECORD_POSITIONS.deref());
+}
+
 // True only while load()'s top-level loop is reading a form. formStart's position
 // correction (LispReader.read) applies ONLY to that read - the top-level datum of
 // the form beginForm just opened. It must NOT fire for a nested read performed by
