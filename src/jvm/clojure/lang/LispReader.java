@@ -242,9 +242,6 @@ static private Keyword platformKey(){
 	return k == null ? PLATFORM_KEY : (Keyword) k;
 }
 
-// installPlatformFeature runs on every (recursive) read, so the default platform's
-// singleton set stays cached and allocates nothing it did not allocate before.
-// Keywords are interned, so binding the var to :clj also takes the cached path.
 static private Object platformFeatures(Keyword key){
 	return key == PLATFORM_KEY ? PLATFORM_FEATURES : PersistentHashSet.create(key);
 }
