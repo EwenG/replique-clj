@@ -25,18 +25,10 @@
   as data with source spans attached, and it is the caller's job to advance
   *current-ns* as it processes each (ns ...) form."}
   clojure.cljs.reader
+  (:require [clojure.cljs.env :as env])
   (:import [clojure.lang Compiler LispReader LispReader$Resolver
             LineNumberingPushbackReader Namespace NamespaceWorld Symbol Var]
            [java.io Reader StringReader]))
-
-;; --- the ClojureScript symbol table ---------------------------------------
-
-(defn new-world
-  "A namespace world for ClojureScript: namespaces start with no mappings at all.
-  The JVM's namespaces seed themselves with RT/DEFAULT_IMPORTS (java.lang and
-  friends), which a target with no host classes must not inherit."
-  ^NamespaceWorld []
-  (NamespaceWorld.))
 
 ;; --- #js ------------------------------------------------------------------
 
@@ -80,10 +72,10 @@
             (Symbol/intern (str (.getName (.ns v))) (str (.sym v)))))))))
 
 (defn resolver
-  "A LispReader$Resolver resolving in `world`, against the namespace named by the
-  atom `current-ns` (a symbol) at the moment each form is read."
-  ^LispReader$Resolver [^NamespaceWorld world current-ns]
-  (->WorldResolver world current-ns))
+  "A LispReader$Resolver resolving in `cenv`'s ClojureScript world, against
+  whichever namespace `cenv` names at the moment each form is read."
+  ^LispReader$Resolver [cenv]
+  (->WorldResolver (:world cenv) (:current-ns cenv)))
 
 ;; --- reading --------------------------------------------------------------
 
@@ -97,15 +89,15 @@
 
 (defn with-cljs-reader*
   "Invoke `thunk` with the vendored reader configured to read ClojureScript in
-  `world`, resolving against the namespace named by the atom `current-ns`.
+  `cenv`, resolving against whichever namespace `cenv` names.
 
   Four bindings, three of them the switches the fork added:
     *reader-resolver*   resolution goes to the ClojureScript world, not the JVM's
     PLATFORM_FEATURE    :cljs, replacing :clj, so #?(:clj a :cljs b) yields b
     RECORD_POSITIONS    spans on symbols/keywords/collections, with no sink
     *read-eval*         false - #= evaluates JVM code and has no place here"
-  [^NamespaceWorld world current-ns thunk]
-  (with-bindings* {reader-resolver-var    (resolver world current-ns)
+  [cenv thunk]
+  (with-bindings* {reader-resolver-var    (resolver cenv)
                    LispReader/PLATFORM_FEATURE :cljs
                    Compiler/RECORD_POSITIONS   true
                    #'*read-eval*          false
@@ -116,18 +108,18 @@
 
 (defn read-forms
   "Every top-level form of ClojureScript source `src` (a string or Reader), read in
-  `world` against the atom `current-ns`.
+  `cenv`.
 
-  `current-ns` is read before each form, so a caller processing forms as it goes
-  can reset! it on an (ns ...) and have the rest of the file resolve correctly.
-  Reading a whole file up front leaves every form resolved against the namespace
-  that was current when reading started - fine for a single-namespace file, wrong
-  for one that switches, which is why the atom is the caller's."
-  [^NamespaceWorld world current-ns src]
+  The current namespace is read before each form, so a caller processing forms as
+  it goes can env/set-current-ns! on an (ns ...) and have the rest of the file
+  resolve correctly. Reading a whole file up front leaves every form resolved
+  against the namespace that was current when reading started - fine for a
+  single-namespace file, wrong for one that switches."
+  [cenv src]
   (let [rdr  (LineNumberingPushbackReader.
               (if (string? src) (StringReader. ^String src) ^Reader src))
         opts {:read-cond :allow :eof EOF}]
-    (with-cljs-reader* world current-ns
+    (with-cljs-reader* cenv
       (fn []
         (loop [forms []]
           (let [form (read opts rdr)]
