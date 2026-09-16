@@ -13,9 +13,10 @@
   - across files, with precise source spans.
 
   Provenance is per top-level form: every fact is filed under the form that
-  produced it, so re-analysing one form (or one file) retracts exactly its prior
-  facts and installs the new ones, without disturbing the rest of the model
-  (design §7).
+  produced it, so re-analysing one file drops exactly its prior forms and installs
+  the new ones, without disturbing the rest of the model (design §7). The stored
+  model is just this form log; the by-entity query indexes are derived from it on
+  demand and cached (build-index / derived), so the sink does no index maintenance.
 
   The reload/staleness unit is the FILE, keyed by the classpath-relative source
   path the compiler records (e.g. \"app/util.clj\"). This is deliberate:
@@ -48,33 +49,39 @@
 ;; object identity: a var deleted and later redefined mints a NEW Var object, so
 ;; identity keys would strand a deleted var's references under a dead key and pin
 ;; the dead Var (and its root value) in memory. A name key is stable across that
-;; churn, keeps a deleted-but-referenced var findable as a tombstone (:defs entry
-;; with :removed true), and matches Clojure's late binding (callers re-resolve the
-;; name). The sink receives resolved Var objects and converts them via var-key.
-;; model keys:
+;; churn, keeps a deleted-but-referenced var findable (see below) and matches
+;; Clojure's late binding (callers re-resolve the name). The sink receives resolved
+;; Var objects and converts them via var-key.
+;;
+;; The model has two layers. The STORED layer is the compiler's write side - an
+;; append log of top-level forms, each carrying the facts it produced; it is all the
+;; sink ever mutates. The DERIVED layer is the query side - the by-entity indexes,
+;; rebuilt from the forms by build-index and cached (see derived). The sink does no
+;; index maintenance and no retract-on-redefine: a redefinition is just a later form,
+;; and build-index resolves "which form defines each var" by replaying forms in fid
+;; (definition) order, so the highest-fid def wins. A var referenced but not defined
+;; by any live form simply has no :defs entry - definition returns nil for it, which
+;; is what the old incremental tombstone yielded.
+;;
+;; stored (write model - mutated only by the sink / drivers):
+;;   :forms           {fid {:ns :source :line :column :facts [instr]}}
+;;                                          instr = [op a b], self-contained so the
+;;                                          derived indexes can be rebuilt from it alone
+;;   :source->forms   {source #{fid}}   the file each form belongs to (the reload unit)
+;;   :next-fid        long          global unique-id source for forms (shared)
+;;   :file-mtime      {source long}   per-file on-disk mtime baseline (§9); a live file
+;;                                    whose mtime differs is "changed"
+;; derived (built by build-index from :forms, cached keyed by :forms identity):
 ;;   :usages          {qsym  #{span}}       qsym = fully-qualified var name (my.ns/foo)
 ;;                                          span = {:source :line :column :end-line :end-column :from-ns}
-;;   :defs            {qsym  {:span span :removed bool}}
-;;                                          :removed = def deleted from source but still
-;;                                          referenced (a tombstone; dropped once its last
-;;                                          usage disappears - see retract-instr)
+;;   :defs            {qsym  {:span span}}   only vars a live form defines
 ;;   :locals          {binding {:ns :name ...span :uses #{span}}}
 ;;   :keyword-usages  {kw    #{span}}
 ;;   :class-usages    {class-name-string #{span}}  (keyed by name, not Class - see class-key)
 ;;   :macro-deps      {ns-sym {macro-qsym #{fid}}}   compile-time edges (§9); each fid
 ;;                                          carries the expanding form's file (:source)
-;; provenance:
-;;   :forms           {fid {:ns :source :line :column :defines #{qsym} :facts [instr]}}
-;;   :entity->form    {qsym fid}    the form that currently defines each var
-;;   :source->forms   {source #{fid}}   the file each form belongs to (the reload unit)
-;;   :next-fid        long          global unique-id source for forms (shared)
-;; staleness (§9):
-;;   :file-mtime      {source long}   per-file on-disk mtime baseline; a live file
-;;                                    whose mtime differs is "changed"
 (def ^:private empty-model
-  {:usages {} :defs {} :locals {} :keyword-usages {} :class-usages {} :macro-deps {}
-   :forms {} :entity->form {} :source->forms {} :next-fid 0
-   :file-mtime {}})
+  {:forms {} :source->forms {} :next-fid 0 :file-mtime {}})
 
 (defonce ^:private model (atom empty-model))
 
@@ -93,15 +100,6 @@
 ;; whole shared model, which would clobber facts other threads committed meanwhile.
 ;; nil outside load-file!, so ordinary analyses pay nothing for it.
 (def ^:private ^:dynamic *created-fids* nil)
-
-;; When bound to an atom (holding a set), retract-instr logs here every var whose
-;; usage set it just emptied - the candidates for tombstone GC. A driver sweeps
-;; ONLY these keys when its operation finishes (sweep-tombstones), instead of
-;; scanning the whole :defs map. Being per-operation and thread-local, thread A
-;; only ever sweeps tombstones A itself emptied, so it cannot GC a tombstone that
-;; thread B's concurrent reload has transiently emptied mid-retract (design §7.3).
-;; nil when no driver established it, so bare retract-form calls pay nothing.
-(def ^:private ^:dynamic *emptied-tombstones* nil)
 
 (defn- span [source line column end-line end-column]
   (cond-> {:source source :line line :column column}
@@ -133,108 +131,38 @@
 
 (defn- current-fid [] (when-let [s *form-stack*] (peek @s)))
 
-(defn- add-fact [m fid instr]
-  (if fid (update-in m [:forms fid :facts] conj instr) m))
+;; The sink's one mutation: append a self-contained fact instr [op a b] to the
+;; open form. No index maintenance - the by-entity indexes are derived on read
+;; (build-index). nil fid (no form open) is a no-op; see the sink for why.
+(defn- add-fact! [fid instr]
+  (when fid (swap! model update-in [:forms fid :facts] conj instr))
+  nil)
 
-(defn- record-usage [m idx target sp fid]
-  (-> m
-      (update-in [idx target] (fnil conj #{}) sp)
-      (add-fact fid [idx target sp])))
-
-;; --- retraction ------------------------------------------------------------
+;; --- retraction (structural only - drops forms; indexes re-derive) ---------
 
 (defn- drop-empty [m idx k]
   (if (empty? (get-in m [idx k])) (update m idx dissoc k) m))
 
-(defn- retract-instr [m [op a b c]]
-  (case op
-    ;; When this drop empties a's usage set, note a as a tombstone-GC candidate for
-    ;; the driver to sweep after re-analysis (see *emptied-tombstones* / sweep-
-    ;; tombstones). The conj is a side effect inside a swap! fn, but idempotent - a
-    ;; retried swap re-adds the same key to a set, and sweep re-checks emptiness
-    ;; before dropping, so an extra candidate from a discarded attempt is harmless.
-    :usages         (let [m (-> m (update-in [:usages a] disj b) (drop-empty :usages a))]
-                      (when (and *emptied-tombstones* (nil? (get-in m [:usages a])))
-                        (swap! *emptied-tombstones* conj a))
-                      m)
-    :keyword-usages (-> m (update-in [:keyword-usages a] disj b) (drop-empty :keyword-usages a))
-    :class-usages   (-> m (update-in [:class-usages a] disj b) (drop-empty :class-usages a))
-    ;; A def whose form is retracted (deleted from source) but that other forms
-    ;; still reference becomes a tombstone, not a deletion, so tooling can flag the
-    ;; now-dangling references; with no references left it is dropped outright. A
-    ;; normal reload re-runs varDef right after, clearing :removed either way. The
-    ;; tombstone is later GC'd by sweep-tombstones (NOT here, and NOT in the :usages
-    ;; branch) - see that fn for why the collection must wait for a reload boundary.
-    :defs           (if (seq (get-in m [:usages a]))
-                      (assoc-in m [:defs a :removed] true)
-                      (update m :defs dissoc a))
-    :locals         (update m :locals dissoc a)
-    :local-use      (cond-> m (get-in m [:locals a]) (update-in [:locals a :uses] disj b))
-    :macro-dep      (let [m (update-in m [:macro-deps a b] disj c)]
-                      (if (empty? (get-in m [:macro-deps a b]))
-                        (let [m (update-in m [:macro-deps a] dissoc b)]
-                          (if (empty? (get-in m [:macro-deps a])) (update m :macro-deps dissoc a) m))
-                        m))
-    m))
-
+;; Retracting a form is now purely structural: remove it from :forms and from its
+;; file's :source->forms. There is no index surgery and no tombstone bookkeeping -
+;; the query indexes are a pure function of the surviving forms (build-index), so a
+;; var whose last defining form is gone stops appearing in :defs automatically, and
+;; one still referenced elsewhere keeps its usages because those live on other forms.
 (defn- retract-form [m fid]
   (if-let [fe (get-in m [:forms fid])]
-    (let [m (reduce retract-instr m (:facts fe))
-          m (update m :forms dissoc fid)
-          m (update m :entity->form
-                    (fn [e] (reduce (fn [e v] (if (= (get e v) fid) (dissoc e v) e)) e (:defines fe))))]
+    (let [m (update m :forms dissoc fid)]
       (if-let [src (:source fe)]
         (-> m (update-in [:source->forms src] disj fid) (drop-empty :source->forms src))
         m))
     m))
 
-(defn- sweep-tombstones
-  "GC the tombstones among `candidates` (var keys whose usage set was emptied this
-  operation, collected in *emptied-tombstones*) whose last reference is now truly
-  gone: drop each :defs entry that is still :removed and still has no usages.
-
-  Runs at a reload boundary (after load-file! / retract-file! finishes), NOT inside
-  retract-instr: a reload first retracts the file's old forms and only then
-  re-analyses, so a var the reloaded file still references has its usage set
-  transiently emptied mid-reload and re-filled moments later. GC-ing eagerly on that
-  empty window would delete a cross-file tombstone that in fact survives the reload
-  (the reference comes right back) - and, on a plain successful reload of the
-  referencing file, strand the re-added usage under no :defs entry. Deferring to the
-  stable end state, and re-checking emptiness here, avoids both. Sweeping only this
-  operation's own candidates (not the whole :defs map) keeps it O(touched) and
-  confines it to tombstones this thread emptied."
-  [m candidates]
-  (reduce (fn [m k]
-            (if (and (get-in m [:defs k :removed]) (empty? (get-in m [:usages k])))
-              (update m :defs dissoc k)
-              m))
-          m candidates))
-
-;; The precise inverse of retract-instr/retract-form, used only by load-file! to
-;; roll back a failed reload: it re-adds one previously-retracted form (and its
-;; facts) into the live model, without disturbing any other form. `snap` is the
-;; pre-reload model the form is restored from; the two lossy instrs (:defs carries
-;; only the qsym, :locals only the binding) recover their index value from it. For
-;; :defs that value is the WHOLE entry {:span :removed}, so a def's tombstone state
-;; round-trips with its span - restoring only the span could leave a var falsely
-;; tombstoned (or falsely healthy) after rollback. Must mirror retract-instr
-;; op-for-op - if you add a fact op there, add it here.
-(defn- reinstate-instr [snap m [op a b c]]
-  (case op
-    :usages         (update-in m [:usages a] (fnil conj #{}) b)
-    :keyword-usages (update-in m [:keyword-usages a] (fnil conj #{}) b)
-    :class-usages   (update-in m [:class-usages a] (fnil conj #{}) b)
-    :defs           (assoc-in m [:defs a] (get-in snap [:defs a]))
-    :locals         (assoc-in m [:locals a] (get-in snap [:locals a]))
-    :local-use      (cond-> m (get-in m [:locals a]) (update-in [:locals a :uses] (fnil conj #{}) b))
-    :macro-dep      (update-in m [:macro-deps a b] (fnil conj #{}) c)
-    m))
-
+;; Re-add one previously-retracted form to the live model, used only by load-file!
+;; to roll back a failed reload without disturbing any other form. Restores just the
+;; stored layer (the form and its file membership) from the pre-reload snapshot; the
+;; indexes re-derive from it. `snap` is that snapshot.
 (defn- reinstate-form [m snap fid]
   (if-let [fe (get-in snap [:forms fid])]
-    (let [m (assoc-in m [:forms fid] fe)
-          m (reduce (partial reinstate-instr snap) m (:facts fe))
-          m (reduce (fn [m v] (assoc-in m [:entity->form v] fid)) m (:defines fe))]
+    (let [m (assoc-in m [:forms fid] fe)]
       (if-let [src (:source fe)]
         (update-in m [:source->forms src] (fnil conj #{}) fid)
         m))
@@ -251,7 +179,7 @@
                        (-> m
                            (update :next-fid inc)
                            (assoc-in [:forms fid] {:source source :line line :column column
-                                                   :defines #{} :facts []})))))
+                                                   :facts []})))))
         fid (dec (:next-fid m'))]
     (when *form-stack* (swap! *form-stack* conj fid))
     (when *created-fids* (swap! *created-fids* conj fid)))
@@ -279,7 +207,7 @@
       (swap! model
              (fn [m]
                (let [fe (get-in m [:forms fid])]
-                 (if (and (empty? (:facts fe)) (empty? (:defines fe)))
+                 (if (empty? (:facts fe))
                    (update m :forms dissoc fid)          ; drop empty forms (e.g. outer do, EOF)
                    ;; File the form under its file (the reload unit); keep the owning
                    ;; namespace as metadata for the lints that read live ns state.
@@ -289,12 +217,16 @@
   nil)
 
 ;; Invariant: a fact is recorded ONLY when a form is open (current-fid non-nil).
-;; Without a form there is nowhere to file the fact's undo-record, so it could
-;; never be retracted (a ghost in the index) - and for defs it would even write a
-;; bogus [:forms nil] entry. So every sink method is a no-op when no form is open.
-;; This never drops anything real: load / require always open a form; only a bare
-;; eval outside a form window (an unsupported use of run-analysis) would land here,
-;; and that was never retractable anyway.
+;; Without a form there is nowhere to file it (no fid to attribute it to, and it
+;; could never be dropped on reload - a ghost), so every sink method is a no-op when
+;; no form is open. This never drops anything real: load / require always open a
+;; form; only a bare eval outside a form window (an unsupported use of run-analysis)
+;; would land here, and that was never retractable anyway.
+;;
+;; Each method builds a SELF-CONTAINED fact instr [op a b] and appends it - no index
+;; is touched here. build-index replays these instrs (in fid order) into the query
+;; indexes on read. So the instr must carry everything the index needs: a def
+;; carries its span (not just the qsym), a local its full info (ns/name/span).
 (deftype AnalysisSink []
   IAnalysisSink
   (beginForm [_ source line column] (begin-form! source line column))
@@ -306,73 +238,41 @@
     ;; rather than write a nil key that would later NPE (namespace nil) in queries.
     (when-let [fid (current-fid)]
       (when-let [k (var-key target)]
-        (swap! model (fn [m]
-                       (record-usage m :usages k
-                                     (assoc (span source line column el ec) :from-ns from-ns)
-                                     fid)))))
+        (add-fact! fid [:usages k (assoc (span source line column el ec) :from-ns from-ns)])))
     nil)
   (varDef [_ v source line column el ec]
     (when-let [fid (current-fid)]
       (when-let [k (var-key v)]
-        (swap! model (fn [m]
-                       (let [old (get-in m [:entity->form k])
-                             m   (if (and old (not= old fid)) (retract-form m old) m)]
-                         (-> m
-                             ;; Fresh entry (no :removed): a (re)definition un-tombstones.
-                             (assoc-in [:defs k] {:span (span source line column el ec)})
-                             (assoc-in [:entity->form k] fid)
-                             (update-in [:forms fid :defines] (fnil conj #{}) k)
-                             (add-fact fid [:defs k])))))))
+        (add-fact! fid [:defs k (span source line column el ec)])))
     nil)
   (localDef [_ binding name ns source line column el ec]
     (when-let [fid (current-fid)]
-      (swap! model (fn [m]
-                     (-> m
-                         (update-in [:locals binding]
-                                    (fn [cur] (merge (span source line column el ec)
-                                                     {:ns ns :name name :uses (get cur :uses #{})})))
-                         (add-fact fid [:locals binding])))))
+      (add-fact! fid [:locals binding (merge (span source line column el ec) {:ns ns :name name})]))
     nil)
   (localUsage [_ binding ns source line column el ec]
     (when-let [fid (current-fid)]
-      (let [sp (assoc (span source line column el ec) :ns ns)]
-        (swap! model (fn [m]
-                       (-> m
-                           (update-in [:locals binding :uses] (fnil conj #{}) sp)
-                           (add-fact fid [:local-use binding sp]))))))
+      (add-fact! fid [:local-use binding (assoc (span source line column el ec) :ns ns)]))
     nil)
   (keywordUsage [_ kw from-ns source line column el ec]
     (when-let [fid (current-fid)]
-      (swap! model (fn [m]
-                     (record-usage m :keyword-usages kw
-                                   (assoc (span source line column el ec) :from-ns from-ns)
-                                   fid))))
+      (add-fact! fid [:keyword-usages kw (assoc (span source line column el ec) :from-ns from-ns)]))
     nil)
   (classUsage [_ c from-ns source line column el ec]
     (when-let [fid (current-fid)]
-      (swap! model (fn [m]
-                     (record-usage m :class-usages (class-key c)
-                                   (assoc (span source line column el ec) :from-ns from-ns)
-                                   fid))))
+      (add-fact! fid [:class-usages (class-key c) (assoc (span source line column el ec) :from-ns from-ns)]))
     nil)
   (macroExpansion [_ macro from-ns source line column el ec record-usage?]
     (when-let [fid (current-fid)]
      (when-let [mk (var-key macro)]      ; skip a nil-ns macro var (see varUsage)
       (let [ns-sym (ns-name from-ns)]
-       (swap! model (fn [m]
-                     ;; Always record the compile-time edge (stale reload needs it
-                     ;; even for expansion-introduced calls); record the macro
-                     ;; *usage* only for a source-written call. The fid carries the
-                     ;; expanding form's file, which the §9 cascade reads.
-                     (let [m (-> m
-                                 (update-in [:macro-deps ns-sym mk] (fnil conj #{}) fid)
-                                 (add-fact fid [:macro-dep ns-sym mk fid]))]
-                       (if record-usage?
-                         (record-usage m :usages mk
-                                       (assoc (span source line column el ec) :from-ns from-ns :macro true)
-                                       fid)
-                         m)))))
-    nil))))
+        ;; Always record the compile-time edge (stale reload needs it even for
+        ;; expansion-introduced calls); record the macro *usage* only for a
+        ;; source-written call. The edge's fid (the form's own, filled in by
+        ;; build-index) carries the expanding form's file, which the §9 cascade reads.
+        (add-fact! fid [:macro-dep ns-sym mk])
+        (when record-usage?
+          (add-fact! fid [:usages mk (assoc (span source line column el ec) :from-ns from-ns :macro true)])))))
+    nil))
 
 ;; --- drivers ---------------------------------------------------------------
 
@@ -408,36 +308,29 @@
   ones edited but not yet reloaded - are left intact, so a pending staleness flag
   elsewhere is not silently cleared."
   [thunk]
-  ;; Own a tombstone-candidate set unless a driver (load-file!) already established
-  ;; one, in which case inherit it so that driver does the single post-op sweep.
-  (let [own?   (nil? *emptied-tombstones*)
-        before (:source->forms @model)]
-    (binding [*emptied-tombstones* (or *emptied-tombstones* (atom #{}))]
-      (let [result (with-sink thunk)]
-        (doseq [source (keys (:source->forms @model))
-                :when (not= (get before source) (get-in @model [:source->forms source]))]
-          (record-file-mtime! source))
-        (when own? (swap! model sweep-tombstones @*emptied-tombstones*))
-        result))))
+  (let [before (:source->forms @model)
+        result (with-sink thunk)]
+    (doseq [source (keys (:source->forms @model))
+            :when (not= (get before source) (get-in @model [:source->forms source]))]
+      (record-file-mtime! source))
+    result))
 
 (defn- retract-source*
-  "Remove every fact produced by `source`'s forms from the model, preserving all
-  other files' references to its vars (design §8, single-file replace). Records
-  emptied tombstone candidates but does NOT sweep - the caller does, after any
-  re-analysis (load-file!), or immediately (retract-file!)."
+  "Remove every form produced by `source` from the model, preserving all other
+  files' references to its vars (design §8, single-file replace). Purely structural
+  now - the query indexes re-derive from the surviving forms, so there is nothing to
+  GC afterwards; a var still referenced elsewhere keeps its usages, and one no longer
+  defined simply drops out of :defs on the next build."
   [source]
   (swap! model (fn [m] (reduce retract-form m (get-in m [:source->forms source]))))
   nil)
 
 (defn retract-file!
-  "Remove every fact produced by `source`'s forms from the model, preserving all
-  other files' references to its vars (e.g. before dropping a deleted file). GCs any
-  tombstone whose last reference this retract removed. `source` is the
-  classpath-relative source path (e.g. \"app/util.clj\")."
+  "Remove every form produced by `source` from the model, preserving all other
+  files' references to its vars (e.g. before dropping a deleted file). `source` is
+  the classpath-relative source path (e.g. \"app/util.clj\")."
   [source]
-  (binding [*emptied-tombstones* (atom #{})]
-    (retract-source* source)
-    (swap! model sweep-tombstones @*emptied-tombstones*))
+  (retract-source* source)
   nil)
 
 ;; --- §9: per-file source mtime (the staleness baseline) --------------------
@@ -513,8 +406,8 @@
 
 (defn load-file!
   "Single-file analysis: retract `source`'s prior forms, then reload the file under
-  the sink so the model is replaced cleanly - no accumulation. Removes defs deleted
-  from source and stale non-def forms that retract-on-redefine alone would miss.
+  the sink so the model is replaced cleanly - no accumulation. Removes forms deleted
+  from source (their facts vanish with the form, and the derived indexes reflect it).
   Refreshes the stored source mtime. `source` is the classpath-relative source path
   the compiler records (e.g. \"app/util.clj\").
 
@@ -534,15 +427,10 @@
   (check-resource-source! source)
   (let [snapshot @model
         old-fids (get-in snapshot [:source->forms source])]
-    ;; One candidate set spans the retract and the re-analysis (run-analysis
-    ;; inherits it), so the single success-path sweep sees every var emptied by
-    ;; either phase - and the failure path discards it, never GC-ing on rollback.
-    (binding [*created-fids*       (atom [])
-              *emptied-tombstones* (atom #{})]
+    (binding [*created-fids* (atom [])]
       (try
         (retract-source* source)
         (run-analysis #(load-source! source))
-        (swap! model sweep-tombstones @*emptied-tombstones*)
         (record-file-mtime! source)
         (catch Throwable t
           (swap! model
@@ -551,6 +439,65 @@
                          m    (reduce retract-form m mine)]
                      (reduce (fn [m fid] (reinstate-form m snapshot fid)) m old-fids))))
           (throw t))))))
+
+;; --- derived query indexes (built from :forms, cached) ---------------------
+
+;; The by-entity indexes are a pure function of the stored form log, so they are
+;; not maintained as the sink runs - they are rebuilt on demand and cached, keyed by
+;; the IDENTITY of the :forms map. Any analysis / retraction produces a new :forms
+;; value (immutable, structurally shared), so `identical?` cheaply detects that the
+;; cache is stale; a quiescent model (no analysis in flight) is a straight cache hit.
+;; The cache holds {:forms <the forms it was built from> :index <the built indexes>}.
+(defonce ^:private index-cache (atom {:forms nil :index nil}))
+
+(defn- build-index
+  "Replay the per-form fact log into the by-entity query indexes. Forms are replayed
+  in ascending fid (definition) order, so a redefinition - a later form defining the
+  same var - naturally overwrites the earlier :defs entry: highest fid wins, which is
+  what the old eager retract-on-redefine achieved. A var referenced but defined by no
+  live form gets usages but no :defs entry, so `definition` returns nil for it (what
+  the old incremental tombstone yielded). Pure function of `forms`.
+
+  Returns {:usages :defs :keyword-usages :class-usages :locals :macro-deps}, each
+  shaped exactly as the eagerly-maintained index was, so the queries are unchanged."
+  [forms]
+  (reduce
+   (fn [idx fid]
+     (reduce
+      (fn [idx [op a b]]
+        (case op
+          :usages         (update-in idx [:usages a] (fnil conj #{}) b)
+          :keyword-usages (update-in idx [:keyword-usages a] (fnil conj #{}) b)
+          :class-usages   (update-in idx [:class-usages a] (fnil conj #{}) b)
+          :defs           (assoc-in idx [:defs a] {:span b})
+          ;; A local's def carries its full info; keep any :uses already gathered
+          ;; from local-use facts earlier in this form (def normally precedes use).
+          :locals         (update-in idx [:locals a]
+                                     (fn [cur] (merge b {:uses (get cur :uses #{})})))
+          :local-use      (cond-> idx
+                            (get-in idx [:locals a])
+                            (update-in [:locals a :uses] (fnil conj #{}) b))
+          ;; a = defining ns-sym, b = macro qsym; the edge is stamped with fid (the
+          ;; expanding form), so the §9 file cascade can find the expanding file.
+          :macro-dep      (update-in idx [:macro-deps a b] (fnil conj #{}) fid)
+          idx))
+      idx (:facts (get forms fid))))
+   {:usages {} :defs {} :keyword-usages {} :class-usages {} :locals {} :macro-deps {}}
+   (sort (keys forms))))
+
+(defn- derived
+  "The cached by-entity indexes for model value `m` (deref the model once and pass
+  it, so a query reads a single consistent snapshot). Rebuilds only when `m`'s :forms
+  differ from the cached ones. The build is a pure function of :forms, so two threads
+  racing to build the same :forms compute the same value - last writer wins, harmless."
+  [m]
+  (let [forms (:forms m)
+        c     @index-cache]
+    (if (identical? forms (:forms c))
+      (:index c)
+      (let [built (build-index forms)]
+        (reset! index-cache {:forms forms :index built})
+        built))))
 
 ;; --- queries ---------------------------------------------------------------
 
@@ -571,43 +518,41 @@
   (my.ns/foo). Returns a set of spans
   {:from-ns :source :line :column :end-line :end-column [:macro]}."
   [var-or-sym]
-  (get-in @model [:usages (->var-key var-or-sym)]))
+  (get (:usages (derived @model)) (->var-key var-or-sym)))
 
 (defn definition
   "Definition site recorded for a var - pass the Var or its fully-qualified name
-  symbol. Returns a span, or nil. A tombstoned var (its def deleted from source but
-  still referenced) is treated as undefined - returns nil, not the span the def used
-  to occupy."
+  symbol. Returns a span, or nil. A var referenced but defined by no live form (its
+  def deleted from source, or never analysed) is treated as undefined - returns nil."
   [var-or-sym]
-  (let [e (get-in @model [:defs (->var-key var-or-sym)])]
-    (when-not (:removed e) (:span e))))
+  (:span (get (:defs (derived @model)) (->var-key var-or-sym))))
 
 (defn find-keyword-usages
   "Occurrence sites recorded for keyword kw. Auto-resolved keywords are indexed
   fully-qualified, so pass e.g. (keyword \"my.ns\" \"x\")."
   [kw]
-  (get-in @model [:keyword-usages kw]))
+  (get (:keyword-usages (derived @model)) kw))
 
 (defn find-class-usages
   "Occurrence sites recorded for class c - a java.lang.Class, or its fully-qualified
   name as a string/symbol. Usages are keyed by class name, so a reloaded class's
   occurrences unify with the original's and no stale Class/loader is pinned."
   [c]
-  (get-in @model [:class-usages (if (class? c) (.getName ^Class c) (str c))]))
+  (get (:class-usages (derived @model)) (if (class? c) (.getName ^Class c) (str c))))
 
 (defn macro-deps
   "Compile-time macro dependency edges. No arg: {ns-sym #{macro-qsym}}. With a
   namespace symbol: the set of macro var names (qualified symbols) it expanded
   (design §9)."
-  ([] (reduce-kv (fn [acc ns mm] (assoc acc ns (set (keys mm)))) {} (:macro-deps @model)))
-  ([ns-sym] (set (keys (get-in @model [:macro-deps ns-sym])))))
+  ([] (reduce-kv (fn [acc ns mm] (assoc acc ns (set (keys mm)))) {} (:macro-deps (derived @model))))
+  ([ns-sym] (set (keys (get-in (derived @model) [:macro-deps ns-sym])))))
 
 (defn unused-locals
   "Source-written local bindings with no recorded reference. Optionally restrict
   to a namespace. Each result is the binding's def site plus :name and :ns."
   ([] (unused-locals nil))
   ([ns-sym]
-   (for [[_ info] (:locals @model)
+   (for [[_ info] (:locals (derived @model))
          :when (empty? (:uses info))
          :when (or (nil? ns-sym) (= ns-sym (ns-name (:ns info))))]
      (dissoc info :uses))))
@@ -656,7 +601,7 @@
   "Namespace-name symbols whose vars or namespaced keywords are referenced from
   ns-sym, per the model."
   [ns-sym]
-  (let [m @model
+  (let [m (derived @model)
         from? (fn [uses] (some #(= ns-sym (some-> (:from-ns %) ns-name)) uses))]
     (into #{}
           (concat
@@ -680,7 +625,7 @@
   "Non-core vars referred into ns-sym that are never used from it.
   Returns {referred-sym var}. clojure.core auto-refers are excluded."
   [ns-sym]
-  (let [uses (:usages @model)
+  (let [uses (:usages (derived @model))
         core (the-ns 'clojure.core)
         used? (fn [^Var v] (some #(= ns-sym (some-> (:from-ns %) ns-name)) (get uses (var-key v))))]
     (into {} (for [[sym ^Var v] (ns-refers ns-sym)
@@ -735,16 +680,16 @@
         (fn [g mk fids]
           (let [owner-srcs (get ns->srcs (macro-owner mk))]
             (reduce (fn [g fid]
-                      ;; :macro-deps fids track live forms (retract-instr's :macro-dep
-                      ;; op keeps them in sync), so s is normally non-nil; guard anyway
-                      ;; so any future drift injects no nil-source edge.
+                      ;; :macro-deps fids are the forms build-index replayed, so each
+                      ;; is a live form and s is normally non-nil; guard anyway so any
+                      ;; future drift injects no nil-source edge.
                       (if-let [s (:source (get forms fid))]
                         (reduce (fn [g os] (if (= os s) g (update g s (fnil conj #{}) os)))
                                 g owner-srcs)
                         g))
                     g fids)))
         g mm))
-     {} (:macro-deps m))))
+     {} (:macro-deps (derived m)))))
 
 (defn- reverse-file-graph
   "Invert a forward file graph {source #{dep-source}} to {dep-source #{dependent
@@ -786,27 +731,30 @@
             (into order remaining)
             (recur (into order ready) (into placed ready) (reduce disj remaining ready))))))))
 
-(defn- healthy-def? [m k]
-  (let [e (get-in m [:defs k])] (and e (not (:removed e)))))
+(defn- healthy-def?
+  "True when the derived index `idx` records a def for var-key k. (There is no longer
+  a tombstone flag: a var no live form defines simply has no :defs entry.)"
+  [idx k]
+  (some? (get (:defs idx) k)))
 
 (defn file-def-vars
-  "The fully-qualified name symbols the model currently records a healthy `def`
-  form for IN file `source` (tombstones - :removed defs - excluded), keyed off each
-  def's span :source. Exactly the population prune-file! may consider: only vars the
-  compiler saw defined by a top-level def can be judged 'deleted' by disappearance."
-  [m source]
-  (set (for [[k e] (:defs m)
-             :when (and (not (:removed e)) (= source (:source (:span e))))]
+  "The fully-qualified name symbols the derived index `idx` records a `def` form for
+  IN file `source`, keyed off each def's span :source. Exactly the population
+  prune-file! may consider: only vars the compiler saw defined by a top-level def can
+  be judged 'deleted' by disappearance. Pass (derived @model) as `idx`."
+  [idx source]
+  (set (for [[k e] (:defs idx)
+             :when (= source (:source (:span e)))]
          k)))
 
 (defn file-def-var-snapshot
-  "Capture {qsym -> the currently-interned Var object} for the healthy defs in file
-  `source`. This is prune-file!'s `prior`; take it *before* the reload so that,
-  since vars are keyed by name (not identity), prune can still tell a lingering
-  deleted-def var (the SAME Var object survives a reload) from one the reloaded
-  source deleted and re-created under a fresh identity (which must be preserved)."
+  "Capture {qsym -> the currently-interned Var object} for the defs in file `source`.
+  This is prune-file!'s `prior`; take it *before* the reload so that, since vars are
+  keyed by name (not identity), prune can still tell a lingering deleted-def var (the
+  SAME Var object survives a reload) from one the reloaded source deleted and
+  re-created under a fresh identity (which must be preserved)."
   [m source]
-  (into {} (for [k (file-def-vars m source)
+  (into {} (for [k (file-def-vars (derived m) source)
                  :let [home (find-ns (symbol (namespace k)))
                        v    (when home (get (ns-interns home) (symbol (name k))))]]
              [k v])))
@@ -825,12 +773,11 @@
   (design §9.3: reflective uses can't be seen, so warn-and-prune, don't block).
   Returns the pruned qsyms.
 
-  Model-side, nothing to do here: load-file!'s retract already handled the vanished
-  def - a deleted def still referenced by other forms became a tombstone in :defs
-  (:removed true, its usages preserved), one with no references left was dropped
-  outright, and either way :entity->form was cleared. This only reconciles the live
-  namespace: `require :reload` / `load` re-def existing vars but never *remove* a
-  var whose def was deleted, so the interned var would linger and shadow the source.
+  Model-side, nothing to do here: load-file!'s retract already dropped the vanished
+  def's form, so the derived :defs no longer records a def for it (its usages, living
+  on other files' forms, are untouched). This only reconciles the live namespace:
+  `require :reload` / `load` re-def existing vars but never *remove* a var whose def
+  was deleted, so the interned var would linger and shadow the source.
 
   Gating on `prior` (not `ns-interns` minus :defs) is deliberate: vars never recorded
   as a `def` are never candidates, so intern-created vars are left alone. In
@@ -850,13 +797,14 @@
                          "a full analysis, else it would unmap vars it simply never recorded.")
                     {:source source})))
   (let [m    @model
+        idx  (derived m)
         gone (for [[k old-var] prior
                    :let [home (find-ns (symbol (namespace k)))
                          cur  (when home (get (ns-interns home) (symbol (name k))))]
-                   :when (and old-var (identical? cur old-var) (not (healthy-def? m k)))]
+                   :when (and old-var (identical? cur old-var) (not (healthy-def? idx k)))]
                k)]
     (doseq [k gone]
-      (when-let [us (seq (get-in m [:usages k]))]
+      (when-let [us (seq (get (:usages idx) k))]
         (binding [*out* *err*]
           (println "WARN: pruning" (str k) "still referenced at"
                    (vec (for [s us] [(some-> (:from-ns s) ns-name) (:line s) (:column s)])))))
@@ -923,6 +871,8 @@
           order2)))))
 
 (defn snapshot
-  "The whole model, for inspection/tests."
+  "The whole model, for inspection/tests: the stored form log merged with the derived
+  by-entity indexes (:usages/:defs/:keyword-usages/:class-usages/:locals/:macro-deps),
+  so callers see the same keys as before the indexes became lazy."
   []
-  @model)
+  (let [m @model] (merge m (derived m))))
