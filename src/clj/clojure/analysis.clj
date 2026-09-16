@@ -93,8 +93,10 @@
 ;; "which form am I inside" thread-local (matching the thread-local sink binding),
 ;; so concurrent analyses on different threads cannot stamp facts with each other's
 ;; form ids. Only the recorded facts - and :next-fid, the global id source - live
-;; in the shared model. nil when no analysis is in flight; current-fid then yields
-;; nil and facts are simply recorded without provenance.
+;; in the shared model. Each stack entry is a thread-local OpenForm buffer, not a
+;; bare fid, so a form's facts accumulate off the shared atom until end-form! commits
+;; them. nil when no analysis is in flight; current-form then yields nil and facts are
+;; simply dropped (no form to attribute them to).
 (def ^:private ^:dynamic *form-stack* nil)
 
 ;; When bound to an atom, begin-form! logs every fid it allocates here. load-file!
@@ -168,13 +170,24 @@
   [^Class c]
   (.getName c))
 
-(defn- current-fid [] (when-let [s *form-stack*] (peek @s)))
+;; An open form is buffered in a thread-local mutable holder, NOT written to the
+;; shared model fact-by-fact. Facts accumulate in a plain ArrayList and the form's
+;; position is corrected in place (form-start! fires repeatedly, last wins); the
+;; whole form is committed to the model in a single swap! at end-form!. This keeps
+;; the per-fact hot path allocation-free (an ArrayList.add, no persistent-map spine
+;; rebuild) and off the shared atom - only begin-form! (fid bump) and end-form!
+;; (one commit) touch `model`. `pos` is [line column]; `fid` was allocated at begin
+;; so build-index still replays forms in allocation order.
+(deftype OpenForm [^long fid source ^longs pos ^java.util.ArrayList facts])
 
-;; The sink's one mutation: append a self-contained fact instr [op a b] to the
-;; open form. No index maintenance - the by-entity indexes are derived on read
-;; (build-index). nil fid (no form open) is a no-op; see the sink for why.
-(defn- add-fact! [fid instr]
-  (when fid (swap! model update-in [:forms fid :facts] conj instr))
+(defn- current-form ^OpenForm [] (when-let [s *form-stack*] (peek @s)))
+
+;; The sink's one mutation while a form is open: append a self-contained fact instr
+;; [op a b] to the open form's buffer. No model touch, no index maintenance - the
+;; by-entity indexes are derived on read (build-index). nil holder (no form open) is
+;; a no-op; see the sink for why.
+(defn- add-fact! [^OpenForm of instr]
+  (when of (.add ^java.util.ArrayList (.facts of) instr))
   nil)
 
 ;; --- retraction (structural only - drops forms; indexes re-derive) ---------
@@ -210,17 +223,16 @@
 ;; --- model mutators (called by the sink and by drivers) --------------------
 
 (defn- begin-form! [source line column]
-  ;; Allocate a globally-unique fid from the shared model, then push it on this
-  ;; thread's form stack. The fid used is (dec :next-fid) after the atomic bump.
-  (let [m'  (swap! model
-                   (fn [m]
-                     (let [fid (:next-fid m)]
-                       (-> m
-                           (update :next-fid inc)
-                           (assoc-in [:forms fid] {:source source :line line :column column
-                                                   :facts []})))))
+  ;; Allocate a globally-unique fid from the shared model (the only begin-time model
+  ;; touch - just the counter bump), then push a fresh thread-local buffer for the
+  ;; form on this thread's stack. The form itself is not written to the model until
+  ;; end-form! commits it. The fid used is (dec :next-fid) after the atomic bump.
+  (let [m'  (swap! model update :next-fid inc)
         fid (dec (:next-fid m'))]
-    (when *form-stack* (swap! *form-stack* conj fid))
+    (when *form-stack*
+      (swap! *form-stack* conj
+             (OpenForm. fid source (long-array [(long line) (long column)])
+                        (java.util.ArrayList.))))
     (when *created-fids* (swap! *created-fids* conj fid)))
   nil)
 
@@ -235,27 +247,36 @@
   ;; earlier calls are redundant swaps. Accepted: this is the analysis path, not a
   ;; hot loop, and the waste is bounded by a form's leading-comment count; avoiding
   ;; it would mean restructuring the reader's read() loop for no correctness gain.
-  (when-let [fid (current-fid)]
-    (swap! model update-in [:forms fid] #(assoc % :line line :column column)))
+  (when-let [of (current-form)]
+    (let [^longs pos (.pos of)]
+      (aset pos 0 (long line))
+      (aset pos 1 (long column))))
   nil)
 
 (defn- end-form! []
-  (let [fid (current-fid)]
+  (let [^OpenForm of (current-form)]
     (when *form-stack* (swap! *form-stack* pop))
-    (when fid
-      (swap! model
-             (fn [m]
-               (let [fe (get-in m [:forms fid])]
-                 (if (empty? (:facts fe))
-                   (update m :forms dissoc fid)          ; drop empty forms (e.g. outer do, EOF)
-                   ;; File the form under its file (the reload unit); keep the owning
-                   ;; namespace as metadata for the lints that read live ns state.
-                   (-> m
-                       (assoc-in [:forms fid :ns] (some-> *ns* ns-name))
-                       (update-in [:source->forms (:source fe)] (fnil conj #{}) fid))))))))
+    ;; Commit the buffered form in one swap!. Empty forms (e.g. an outer do, EOF) are
+    ;; simply never written - the begin-time fid bump already burned their id, exactly
+    ;; as the old drop-empty path did. A non-empty form is installed whole: its facts
+    ;; (frozen from the buffer), position, file membership and owning namespace (read
+    ;; from *ns* now, after the form - so an `(ns ...)` form files under the ns it
+    ;; established). The reload unit is the file, so it is also filed under :source.
+    (when (and of (not (.isEmpty ^java.util.ArrayList (.facts of))))
+      (let [fid    (.fid of)
+            src    (.source of)
+            ^longs pos (.pos of)]
+        (swap! model
+               (fn [m]
+                 (-> m
+                     (assoc-in [:forms fid] {:source src
+                                             :line (aget pos 0) :column (aget pos 1)
+                                             :ns (some-> *ns* ns-name)
+                                             :facts (vec (.facts of))})
+                     (update-in [:source->forms src] (fnil conj #{}) fid)))))))
   nil)
 
-;; Invariant: a fact is recorded ONLY when a form is open (current-fid non-nil).
+;; Invariant: a fact is recorded ONLY when a form is open (current-form non-nil).
 ;; Without a form there is nowhere to file it (no fid to attribute it to, and it
 ;; could never be dropped on reload - a ghost), so every sink method is a no-op when
 ;; no form is open. This never drops anything real: load / require always open a
@@ -275,42 +296,42 @@
     ;; when-let on the key, not let: var-key is nil only for a nil-ns var, which the
     ;; compiler should never resolve to here - but if one slips through, skip it
     ;; rather than write a nil key that would later NPE (namespace nil) in queries.
-    (when-let [fid (current-fid)]
+    (when-let [of (current-form)]
       (when-let [k (var-key target)]
-        (add-fact! fid [:usages k (span source line column el ec from-ns nil)])))
+        (add-fact! of [:usages k (span source line column el ec from-ns nil)])))
     nil)
   (varDef [_ v source line column el ec]
-    (when-let [fid (current-fid)]
+    (when-let [of (current-form)]
       (when-let [k (var-key v)]
-        (add-fact! fid [:defs k (span source line column el ec)])))
+        (add-fact! of [:defs k (span source line column el ec)])))
     nil)
   (localDef [_ binding name ns source line column el ec]
-    (when-let [fid (current-fid)]
-      (add-fact! fid [:locals binding (merge (local-span source line column el ec) {:ns ns :name name})]))
+    (when-let [of (current-form)]
+      (add-fact! of [:locals binding (merge (local-span source line column el ec) {:ns ns :name name})]))
     nil)
   (localUsage [_ binding ns source line column el ec]
-    (when-let [fid (current-fid)]
-      (add-fact! fid [:local-use binding (assoc (local-span source line column el ec) :ns ns)]))
+    (when-let [of (current-form)]
+      (add-fact! of [:local-use binding (assoc (local-span source line column el ec) :ns ns)]))
     nil)
   (keywordUsage [_ kw from-ns source line column el ec]
-    (when-let [fid (current-fid)]
-      (add-fact! fid [:keyword-usages kw (span source line column el ec from-ns nil)]))
+    (when-let [of (current-form)]
+      (add-fact! of [:keyword-usages kw (span source line column el ec from-ns nil)]))
     nil)
   (classUsage [_ c from-ns source line column el ec]
-    (when-let [fid (current-fid)]
-      (add-fact! fid [:class-usages (class-key c) (span source line column el ec from-ns nil)]))
+    (when-let [of (current-form)]
+      (add-fact! of [:class-usages (class-key c) (span source line column el ec from-ns nil)]))
     nil)
   (macroExpansion [_ macro from-ns source line column el ec record-usage?]
-    (when-let [fid (current-fid)]
+    (when-let [of (current-form)]
      (when-let [mk (var-key macro)]      ; skip a nil-ns macro var (see varUsage)
       (let [ns-sym (ns-name from-ns)]
         ;; Always record the compile-time edge (stale reload needs it even for
         ;; expansion-introduced calls); record the macro *usage* only for a
         ;; source-written call. The edge's fid (the form's own, filled in by
         ;; build-index) carries the expanding form's file, which the §9 cascade reads.
-        (add-fact! fid [:macro-dep ns-sym mk])
+        (add-fact! of [:macro-dep ns-sym mk])
         (when record-usage?
-          (add-fact! fid [:usages mk (span source line column el ec from-ns true)])))))
+          (add-fact! of [:usages mk (span source line column el ec from-ns true)])))))
     nil))
 
 ;; --- drivers ---------------------------------------------------------------
