@@ -113,8 +113,7 @@
 ;; The four coordinates are always ints at the sink boundary (IAnalysisSink passes
 ;; them as int); an absent end-line/end-column arrives non-nat and is stored as -1.
 ;; from-ns is the referencing namespace (nil for a def); macro is true for a
-;; macro-call usage, else nil. Locals do NOT use this record (see local-span): they
-;; are few and carry :ns/:name/:uses instead, so they stay plain maps.
+;; macro-call usage, else nil. Locals use their own record (LocalSpan) below.
 (defrecord Span [source ^int line ^int column ^int end-line ^int end-column from-ns macro])
 
 (defn- norm-end [x] (if (nat-int? x) (int x) -1))
@@ -124,13 +123,19 @@
   ([source line column el ec from-ns macro]
    (->Span source (int line) (int column) (norm-end el) (norm-end ec) from-ns (when macro true))))
 
+;; A local binding's def/use site. Locals are numerous too (every fn-arg and
+;; let-binding), so they get the same lightweight-record treatment as Span rather
+;; than a map built via merge: one allocation per local, primitive int coordinates,
+;; no boxing. `lns` is the owning namespace; `lname` the binding's source name
+;; (present for a def, nil for a use). Fields are named to avoid shadowing
+;; clojure.core/ns and /name; build-index (local->map) projects them to the public
+;; :ns/:name keys, so the query surface stays plain maps.
+(defrecord LocalSpan [source ^int line ^int column ^int end-line ^int end-column lns lname])
+
 (defn- local-span
-  "A local binding's coordinate map. Locals stay plain maps (they are few, and carry
-  :ns/:name/:uses that the usage Span record does not model)."
-  [source line column end-line end-column]
-  (cond-> {:source source :line line :column column}
-    (nat-int? end-line)   (assoc :end-line end-line)
-    (nat-int? end-column) (assoc :end-column end-column)))
+  ([source line column el ec lns] (local-span source line column el ec lns nil))
+  ([source line column el ec lns lname]
+   (->LocalSpan source (int line) (int column) (norm-end el) (norm-end ec) lns lname)))
 
 (defn- span->map
   "Normalise a Span record to the documented plain-map span shape, for the public
@@ -146,6 +151,17 @@
 
 (defn- spans->maps [spans]
   (when spans (into #{} (map span->map) spans)))
+
+(defn- local->map
+  "Normalise a LocalSpan record to the plain-map local shape build-index files in the
+  :locals index - {:source :line :column :ns [:name] [:end-line :end-column]} - so the
+  public locals surface (unused-locals, snapshot) carries no record type. :name is
+  omitted for a use (lname nil), matching the map the sink used to build."
+  [l]
+  (cond-> {:source (:source l) :line (:line l) :column (:column l) :ns (:lns l)}
+    (nat-int? (:end-line l))   (assoc :end-line (:end-line l))
+    (nat-int? (:end-column l)) (assoc :end-column (:end-column l))
+    (:lname l)                 (assoc :name (:lname l))))
 
 (defn- var-key
   "Canonical model key for a var: its fully-qualified name symbol (my.ns/foo).
@@ -307,11 +323,11 @@
     nil)
   (localDef [_ binding name ns source line column el ec]
     (when-let [of (current-form)]
-      (add-fact! of [:locals binding (merge (local-span source line column el ec) {:ns ns :name name})]))
+      (add-fact! of [:locals binding (local-span source line column el ec ns name)]))
     nil)
   (localUsage [_ binding ns source line column el ec]
     (when-let [of (current-form)]
-      (add-fact! of [:local-use binding (assoc (local-span source line column el ec) :ns ns)]))
+      (add-fact! of [:local-use binding (local-span source line column el ec ns)]))
     nil)
   (keywordUsage [_ kw from-ns source line column el ec]
     (when-let [of (current-form)]
@@ -530,13 +546,14 @@
           :keyword-usages (update-in idx [:keyword-usages a] (fnil conj #{}) b)
           :class-usages   (update-in idx [:class-usages a] (fnil conj #{}) b)
           :defs           (assoc-in idx [:defs a] {:span b})
-          ;; A local's def carries its full info; keep any :uses already gathered
-          ;; from local-use facts earlier in this form (def normally precedes use).
+          ;; A local's def carries its full info (a LocalSpan record); project it to
+          ;; the plain-map index entry and keep any :uses already gathered from
+          ;; local-use facts earlier in this form (def normally precedes use).
           :locals         (update-in idx [:locals a]
-                                     (fn [cur] (merge b {:uses (get cur :uses #{})})))
+                                     (fn [cur] (assoc (local->map b) :uses (get cur :uses #{}))))
           :local-use      (cond-> idx
                             (get-in idx [:locals a])
-                            (update-in [:locals a :uses] (fnil conj #{}) b))
+                            (update-in [:locals a :uses] (fnil conj #{}) (local->map b)))
           ;; a = defining ns-sym, b = macro qsym; the edge is stamped with fid (the
           ;; expanding form), so the §9 file cascade can find the expanding file.
           :macro-dep      (update-in idx [:macro-deps a b] (fnil conj #{}) fid)
