@@ -73,7 +73,10 @@
 ;;                                    whose mtime differs is "changed"
 ;; derived (built by build-index from :forms, cached keyed by :forms identity):
 ;;   :usages          {qsym  #{span}}       qsym = fully-qualified var name (my.ns/foo)
-;;                                          span = {:source :line :column :end-line :end-column :from-ns}
+;;                                          span = a Span record (compact, primitive
+;;                                          int coords); the public queries normalise
+;;                                          it to {:source :line :column :end-line
+;;                                          :end-column :from-ns [:macro]} via span->map
 ;;   :defs            {qsym  {:span span}}   only vars a live form defines
 ;;   :locals          {binding {:ns :name ...span :uses #{span}}}
 ;;   :keyword-usages  {kw    #{span}}
@@ -101,10 +104,46 @@
 ;; nil outside load-file!, so ordinary analyses pay nothing for it.
 (def ^:private ^:dynamic *created-fids* nil)
 
-(defn- span [source line column end-line end-column]
+;; A usage/def span. The sink files one per var/keyword/class occurrence - by far
+;; the most numerous fact - so its shape drives allocation during an analysed load.
+;; A record with primitive int coordinates costs ~1/7th the bytes of the equivalent
+;; array-map (measured), chiefly by not boxing the four coordinates into Integers.
+;; The four coordinates are always ints at the sink boundary (IAnalysisSink passes
+;; them as int); an absent end-line/end-column arrives non-nat and is stored as -1.
+;; from-ns is the referencing namespace (nil for a def); macro is true for a
+;; macro-call usage, else nil. Locals do NOT use this record (see local-span): they
+;; are few and carry :ns/:name/:uses instead, so they stay plain maps.
+(defrecord Span [source ^int line ^int column ^int end-line ^int end-column from-ns macro])
+
+(defn- norm-end [x] (if (nat-int? x) (int x) -1))
+
+(defn- span
+  ([source line column el ec] (span source line column el ec nil nil))
+  ([source line column el ec from-ns macro]
+   (->Span source (int line) (int column) (norm-end el) (norm-end ec) from-ns (when macro true))))
+
+(defn- local-span
+  "A local binding's coordinate map. Locals stay plain maps (they are few, and carry
+  :ns/:name/:uses that the usage Span record does not model)."
+  [source line column end-line end-column]
   (cond-> {:source source :line line :column column}
     (nat-int? end-line)   (assoc :end-line end-line)
     (nat-int? end-column) (assoc :end-column end-column)))
+
+(defn- span->map
+  "Normalise a Span record to the documented plain-map span shape, for the public
+  query API - so results carry no record type and compare = to map literals. Omits
+  an absent end-line/end-column (stored as -1) and a nil from-ns/macro, exactly
+  reproducing the map the sink used to build."
+  [s]
+  (cond-> {:source (:source s) :line (:line s) :column (:column s)}
+    (nat-int? (:end-line s))   (assoc :end-line (:end-line s))
+    (nat-int? (:end-column s)) (assoc :end-column (:end-column s))
+    (:from-ns s)               (assoc :from-ns (:from-ns s))
+    (:macro s)                 (assoc :macro true)))
+
+(defn- spans->maps [spans]
+  (when spans (into #{} (map span->map) spans)))
 
 (defn- var-key
   "Canonical model key for a var: its fully-qualified name symbol (my.ns/foo).
@@ -238,7 +277,7 @@
     ;; rather than write a nil key that would later NPE (namespace nil) in queries.
     (when-let [fid (current-fid)]
       (when-let [k (var-key target)]
-        (add-fact! fid [:usages k (assoc (span source line column el ec) :from-ns from-ns)])))
+        (add-fact! fid [:usages k (span source line column el ec from-ns nil)])))
     nil)
   (varDef [_ v source line column el ec]
     (when-let [fid (current-fid)]
@@ -247,19 +286,19 @@
     nil)
   (localDef [_ binding name ns source line column el ec]
     (when-let [fid (current-fid)]
-      (add-fact! fid [:locals binding (merge (span source line column el ec) {:ns ns :name name})]))
+      (add-fact! fid [:locals binding (merge (local-span source line column el ec) {:ns ns :name name})]))
     nil)
   (localUsage [_ binding ns source line column el ec]
     (when-let [fid (current-fid)]
-      (add-fact! fid [:local-use binding (assoc (span source line column el ec) :ns ns)]))
+      (add-fact! fid [:local-use binding (assoc (local-span source line column el ec) :ns ns)]))
     nil)
   (keywordUsage [_ kw from-ns source line column el ec]
     (when-let [fid (current-fid)]
-      (add-fact! fid [:keyword-usages kw (assoc (span source line column el ec) :from-ns from-ns)]))
+      (add-fact! fid [:keyword-usages kw (span source line column el ec from-ns nil)]))
     nil)
   (classUsage [_ c from-ns source line column el ec]
     (when-let [fid (current-fid)]
-      (add-fact! fid [:class-usages (class-key c) (assoc (span source line column el ec) :from-ns from-ns)]))
+      (add-fact! fid [:class-usages (class-key c) (span source line column el ec from-ns nil)]))
     nil)
   (macroExpansion [_ macro from-ns source line column el ec record-usage?]
     (when-let [fid (current-fid)]
@@ -271,7 +310,7 @@
         ;; build-index) carries the expanding form's file, which the §9 cascade reads.
         (add-fact! fid [:macro-dep ns-sym mk])
         (when record-usage?
-          (add-fact! fid [:usages mk (assoc (span source line column el ec) :from-ns from-ns :macro true)])))))
+          (add-fact! fid [:usages mk (span source line column el ec from-ns true)])))))
     nil))
 
 ;; --- drivers ---------------------------------------------------------------
@@ -518,27 +557,27 @@
   (my.ns/foo). Returns a set of spans
   {:from-ns :source :line :column :end-line :end-column [:macro]}."
   [var-or-sym]
-  (get (:usages (derived @model)) (->var-key var-or-sym)))
+  (spans->maps (get (:usages (derived @model)) (->var-key var-or-sym))))
 
 (defn definition
   "Definition site recorded for a var - pass the Var or its fully-qualified name
   symbol. Returns a span, or nil. A var referenced but defined by no live form (its
   def deleted from source, or never analysed) is treated as undefined - returns nil."
   [var-or-sym]
-  (:span (get (:defs (derived @model)) (->var-key var-or-sym))))
+  (some-> (:span (get (:defs (derived @model)) (->var-key var-or-sym))) span->map))
 
 (defn find-keyword-usages
   "Occurrence sites recorded for keyword kw. Auto-resolved keywords are indexed
   fully-qualified, so pass e.g. (keyword \"my.ns\" \"x\")."
   [kw]
-  (get (:keyword-usages (derived @model)) kw))
+  (spans->maps (get (:keyword-usages (derived @model)) kw)))
 
 (defn find-class-usages
   "Occurrence sites recorded for class c - a java.lang.Class, or its fully-qualified
   name as a string/symbol. Usages are keyed by class name, so a reloaded class's
   occurrences unify with the original's and no stale Class/loader is pinned."
   [c]
-  (get (:class-usages (derived @model)) (if (class? c) (.getName ^Class c) (str c))))
+  (spans->maps (get (:class-usages (derived @model)) (if (class? c) (.getName ^Class c) (str c)))))
 
 (defn macro-deps
   "Compile-time macro dependency edges. No arg: {ns-sym #{macro-qsym}}. With a
@@ -873,6 +912,16 @@
 (defn snapshot
   "The whole model, for inspection/tests: the stored form log merged with the derived
   by-entity indexes (:usages/:defs/:keyword-usages/:class-usages/:locals/:macro-deps),
-  so callers see the same keys as before the indexes became lazy."
+  so callers see the same keys as before the indexes became lazy. Span records are
+  normalised to plain maps here too, so the whole public surface is record-free and
+  spans compare = to map literals."
   []
-  (let [m @model] (merge m (derived m))))
+  (let [m        @model
+        idx      (derived m)
+        norm-set (fn [mm] (reduce-kv (fn [a k s] (assoc a k (spans->maps s))) {} mm))]
+    (merge m idx
+           {:usages         (norm-set (:usages idx))
+            :keyword-usages (norm-set (:keyword-usages idx))
+            :class-usages   (norm-set (:class-usages idx))
+            :defs           (reduce-kv (fn [a k e] (assoc a k (update e :span span->map)))
+                                       {} (:defs idx))})))
