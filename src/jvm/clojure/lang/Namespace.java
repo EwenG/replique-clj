@@ -14,7 +14,6 @@ package clojure.lang;
 
 import java.io.ObjectStreamException;
 import java.io.Serializable;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class Namespace extends AReference implements Serializable {
@@ -25,21 +24,32 @@ final public Symbol name;
 transient final AtomicReference<IPersistentMap> mappings = new AtomicReference<IPersistentMap>();
 transient final AtomicReference<IPersistentMap> aliases = new AtomicReference<IPersistentMap>();
 
-final static ConcurrentHashMap<Symbol, Namespace> namespaces = new ConcurrentHashMap<Symbol, Namespace>();
+// The JVM's namespaces. The statics below address NamespaceWorld.DEFAULT, so
+// find-ns / create-ns / remove-ns / all-ns and every caller in the compiler keep
+// their present meaning; other worlds are reached through a NamespaceWorld value,
+// never through here.
 
 public String toString(){
 	return name.toString();
 }
 
 Namespace(Symbol name){
+	this(name, null);
+}
+
+// initialMappings is what the namespace starts out mapping, or null for the host's
+// default imports. Resolved here rather than in NamespaceWorld so RT.DEFAULT_IMPORTS
+// is still read at namespace-creation time, as it always was, and not during class
+// initialization.
+Namespace(Symbol name, IPersistentMap initialMappings){
 	super(name.meta());
 	this.name = name;
-	mappings.set(RT.DEFAULT_IMPORTS);
+	mappings.set(initialMappings != null ? initialMappings : RT.DEFAULT_IMPORTS);
 	aliases.set(RT.map());
 }
 
 public static ISeq all(){
-	return RT.seq(namespaces.values());
+	return NamespaceWorld.DEFAULT.all();
 }
 
 public Symbol getName(){
@@ -204,22 +214,17 @@ public Var refer(Symbol sym, Var var){
 }
 
 public static Namespace findOrCreate(Symbol name){
-	Namespace ns = namespaces.get(name);
-	if(ns != null)
-		return ns;
-	Namespace newns = new Namespace(name);
-	ns = namespaces.putIfAbsent(name, newns);
-	return ns == null ? newns : ns;
+	return NamespaceWorld.DEFAULT.findOrCreate(name);
 }
 
 public static Namespace remove(Symbol name){
 	if(name.equals(RT.CLOJURE_NS.name))
 		throw new IllegalArgumentException("Cannot remove clojure namespace");
-	return namespaces.remove(name);
+	return NamespaceWorld.DEFAULT.remove(name);
 }
 
 public static Namespace find(Symbol name){
-	return namespaces.get(name);
+	return NamespaceWorld.DEFAULT.find(name);
 }
 
 public Object getMapping(Symbol name){

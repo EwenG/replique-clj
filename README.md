@@ -15,7 +15,7 @@ class files; it is `clojure.lang.*` itself that is built for 21.
 - **This fork does not promise to stay byte-identical to upstream.** Divergence in `src` is on the
   table where it earns its keep. Judge a change on its merits — a benchmark, a bug, the vendored
   test suite passing — not on whether it perturbs the diff against the tag.
-- **Behaviour is stock Clojure 1.12.5 with analysis off** (the default — see the third divergence
+- **Behaviour is stock Clojure 1.12.5 with analysis off** (the default — see the second divergence
   below) — the reader, the numerics, source metadata (`:line` / `:column` on lists and `^meta`
   seqs) — with the compiler diverging as listed below.
 - **The rest of the difference is the build** and the packaging (`groupId` / `version`). See
@@ -23,9 +23,10 @@ class files; it is `clojure.lang.*` itself that is built for 21.
 
 ## Divergence from upstream
 
-`git diff clojure-1.12.5 -- src test` lists it; `test` is untouched. Two divergences in `src`:
-one small, measured compiler change, and one larger — a gated, off-by-default analysis subsystem
-(the bulk of the diff by line count).
+`git diff clojure-1.12.5 -- src test` lists it; `test` is untouched. Three divergences in `src`:
+one small, measured compiler change; one larger — a gated, off-by-default analysis subsystem
+(the bulk of the diff by line count); and three hooks that exist only so a compiler for another
+target can be written against this runtime.
 
 - **`Reflector.getMethods` caches `Class.getMethods()` in a `ClassValue`.** `Class.getMethods()`
   copies the whole public-method array *and every `Method` object in it* on every call, and the
@@ -106,6 +107,32 @@ dump is not — the archive is then rejected at startup and you silently get no 
 > right call on the merits: reading is only ~5% of AOT compile time, so even a 2.7× reader buys
 > ~3.4% overall — macroexpansion (~24%) and analysis (~22%) are where the time actually goes. Not
 > worth carrying a reader rewrite. The work lives in the git history if you want it back.
+
+- **Three hooks for a front end targeting another platform.** Small, off by default, and inert
+  for anything that does not ask for them. The consumer is the sibling project
+  [`../replique-cljs`](../replique-cljs) — a ClojureScript compiler built on this runtime — and
+  its `doc/cljs-compiler.md` is where the design lives.
+
+  **`clojure.lang.NamespaceWorld`** (new, ~90 lines) gives the namespace table an identity, so
+  there can be more than one. Namespaces were always just symbol tables; a second world lets a
+  front end intern its own vars in its own `clojure.string` without colliding with the JVM's.
+  `NamespaceWorld.DEFAULT` holds the JVM's namespaces and is what `Namespace.find` /
+  `findOrCreate` / `remove` / `all` — and therefore `find-ns`, `create-ns`, `remove-ns`, `all-ns`
+  — address, so that path is unchanged and costs no indirection it did not already pay. A
+  `Namespace` does **not** know which world it is in: every caller that resolves a symbol already
+  holds the world explicitly, and a back-pointer would be a second source of truth to keep in
+  agreement with the first.
+
+  **`LispReader.PLATFORM_FEATURE`** is the reader conditional's platform key, as a dynamic var.
+  Unbound it is `:clj`, which is what this runtime always reads with. A front end reading the same
+  `.cljc` source for another target *binds* it to that target's keyword rather than adding one,
+  because `readCondDelimited` takes the **first** matching feature in written order — leaving
+  `:clj` in the set beside `:cljs` would make `#?(:clj a :cljs b)` always yield `a`.
+
+  **`Compiler.RECORD_POSITIONS`** lets source positions be recorded without an analysis sink
+  installed. Positions were already recorded whenever analysis was on; this separates *wanting the
+  positions* from *having somewhere to report events*, which is what a front end needs — it reads
+  with this runtime's reader and keeps the positions for its own source maps.
 
 ## Build
 

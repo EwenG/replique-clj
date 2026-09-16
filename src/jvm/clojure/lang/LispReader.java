@@ -139,9 +139,10 @@ static boolean isWhitespace(int ch){
 	return Character.isWhitespace(ch) || ch == ',';
 }
 
-// True when the compiler wants source positions recorded (analysis is on).
+// True when the compiler wants source positions recorded - because analysis is on,
+// or because a front end asked for them directly (Compiler.RECORD_POSITIONS).
 static boolean positionsRequested(){
-	return Compiler.ANALYSIS_SINK.deref() != null;
+	return Compiler.recordPositions();
 }
 
 static private Object attachSourcePosition(IObj o, int line, int column, int endLine, int endColumn){
@@ -228,6 +229,23 @@ static public final Keyword EOFTHROW = Keyword.intern(null,"eofthrow");
 static private final Keyword PLATFORM_KEY = Keyword.intern(null, "clj");
 static private final Object PLATFORM_FEATURES = PersistentHashSet.create(PLATFORM_KEY);
 
+// The platform feature installed into every read's feature set. Unbound means
+// PLATFORM_KEY (:clj) - what this runtime always reads with, and the only value the
+// vendored compiler ever uses. A front end reading the same .cljc source for another
+// target binds this to that target's keyword (:cljs) instead of adding it, because
+// readCondDelimited takes the FIRST matching feature in written order: leaving :clj
+// in the set alongside :cljs would make #?(:clj a :cljs b) always yield a.
+static final public Var PLATFORM_FEATURE = Var.create(null).setDynamic();
+
+static private Keyword platformKey(){
+	Object k = PLATFORM_FEATURE.deref();
+	return k == null ? PLATFORM_KEY : (Keyword) k;
+}
+
+static private Object platformFeatures(Keyword key){
+	return key == PLATFORM_KEY ? PLATFORM_FEATURES : PersistentHashSet.create(key);
+}
+
 // Reader conditional options - use with :read-cond
 static public final Keyword COND_ALLOW = Keyword.intern(null, "allow");
     static public final Keyword COND_PRESERVE = Keyword.intern(null, "preserve");
@@ -269,15 +287,16 @@ static private Object ensurePending(Object pendingForms) {
 }
 
 static private Object installPlatformFeature(Object opts) {
+    Keyword platform = platformKey();
     if(opts == null)
-        return RT.mapUniqueKeys(LispReader.OPT_FEATURES, PLATFORM_FEATURES);
+        return RT.mapUniqueKeys(LispReader.OPT_FEATURES, platformFeatures(platform));
     else {
         IPersistentMap mopts = (IPersistentMap) opts;
         Object features = mopts.valAt(OPT_FEATURES);
         if (features == null)
-            return mopts.assoc(LispReader.OPT_FEATURES, PLATFORM_FEATURES);
+            return mopts.assoc(LispReader.OPT_FEATURES, platformFeatures(platform));
         else
-            return mopts.assoc(LispReader.OPT_FEATURES, RT.conj((IPersistentSet) features, PLATFORM_KEY));
+            return mopts.assoc(LispReader.OPT_FEATURES, RT.conj((IPersistentSet) features, platform));
     }
 }
 
@@ -328,7 +347,7 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 			// during an analysis load - rare enough to not warrant reader-identity
 			// tracking on this hot path; a cold reanalysis reconciles the position.
 			if(!isRecursive && (r instanceof LineNumberingPushbackReader)
-			   && positionsRequested() && Compiler.readingTopLevelForm())
+			   && Compiler.readingTopLevelForm())
 				{
 				IAnalysisSink sink = Compiler.analysisSink();
 				if(sink != null)
