@@ -535,32 +535,54 @@
   the old incremental tombstone yielded). Pure function of `forms`.
 
   Returns {:usages :defs :keyword-usages :class-usages :locals :macro-deps}, each
-  shaped exactly as the eagerly-maintained index was, so the queries are unchanged."
+  shaped exactly as the eagerly-maintained index was, so the queries are unchanged.
+
+  The six by-entity sub-indexes are accumulated as TRANSIENT maps: on a large log a
+  single entity map grows to thousands of keys, and a persistent update-in would
+  rebuild its spine on every one of the (many) facts touching it. Transient assoc!
+  mutates in place, so replaying the log is close to allocation-free apart from the
+  entity values themselves (the persistent sets / entry maps that are the actual
+  data). The transient must be threaded (assoc! may promote and return a new object),
+  so each sub-index is re-stored into the (also transient) idx via its return value.
+  The result is frozen with persistent! - a plain, fully persistent index."
   [forms]
-  (reduce
-   (fn [idx fid]
-     (reduce
-      (fn [idx [op a b]]
-        (case op
-          :usages         (update-in idx [:usages a] (fnil conj #{}) b)
-          :keyword-usages (update-in idx [:keyword-usages a] (fnil conj #{}) b)
-          :class-usages   (update-in idx [:class-usages a] (fnil conj #{}) b)
-          :defs           (assoc-in idx [:defs a] {:span b})
-          ;; A local's def carries its full info (a LocalSpan record); project it to
-          ;; the plain-map index entry and keep any :uses already gathered from
-          ;; local-use facts earlier in this form (def normally precedes use).
-          :locals         (update-in idx [:locals a]
-                                     (fn [cur] (assoc (local->map b) :uses (get cur :uses #{}))))
-          :local-use      (cond-> idx
-                            (get-in idx [:locals a])
-                            (update-in [:locals a :uses] (fnil conj #{}) (local->map b)))
-          ;; a = defining ns-sym, b = macro qsym; the edge is stamped with fid (the
-          ;; expanding form), so the §9 file cascade can find the expanding file.
-          :macro-dep      (update-in idx [:macro-deps a b] (fnil conj #{}) fid)
-          idx))
-      idx (:facts (get forms fid))))
-   {:usages {} :defs {} :keyword-usages {} :class-usages {} :locals {} :macro-deps {}}
-   (sort (keys forms))))
+  (let [idx (reduce
+             (fn [idx fid]
+               (reduce
+                (fn [idx [op a b]]
+                  (case op
+                    :usages         (let [s (get idx :usages)]
+                                      (assoc! idx :usages (assoc! s a (conj (get s a #{}) b))))
+                    :keyword-usages (let [s (get idx :keyword-usages)]
+                                      (assoc! idx :keyword-usages (assoc! s a (conj (get s a #{}) b))))
+                    :class-usages   (let [s (get idx :class-usages)]
+                                      (assoc! idx :class-usages (assoc! s a (conj (get s a #{}) b))))
+                    :defs           (let [s (get idx :defs)]
+                                      (assoc! idx :defs (assoc! s a {:span b})))
+                    ;; A local's def carries its full info (a LocalSpan record); project it
+                    ;; to the plain-map index entry and keep any :uses already gathered from
+                    ;; local-use facts earlier in this form (def normally precedes use).
+                    :locals         (let [s (get idx :locals)]
+                                      (assoc! idx :locals
+                                              (assoc! s a (assoc (local->map b)
+                                                                 :uses (get (get s a) :uses #{})))))
+                    :local-use      (let [s   (get idx :locals)
+                                          cur (get s a)]
+                                      (if cur
+                                        (assoc! idx :locals
+                                                (assoc! s a (update cur :uses (fnil conj #{}) (local->map b))))
+                                        idx))
+                    ;; a = defining ns-sym, b = macro qsym; the edge is stamped with fid (the
+                    ;; expanding form), so the §9 file cascade can find the expanding file.
+                    :macro-dep      (let [s (get idx :macro-deps)]
+                                      (assoc! idx :macro-deps
+                                              (assoc! s a (update (get s a {}) b (fnil conj #{}) fid))))
+                    idx))
+                idx (:facts (get forms fid))))
+             (transient {:usages (transient {}) :defs (transient {}) :keyword-usages (transient {})
+                         :class-usages (transient {}) :locals (transient {}) :macro-deps (transient {})})
+             (sort (keys forms)))]
+    (reduce-kv (fn [m k v] (assoc m k (persistent! v))) {} (persistent! idx))))
 
 (defn- derived
   "The cached by-entity indexes for model value `m` (deref the model once and pass
