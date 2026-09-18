@@ -64,9 +64,16 @@
 ;; is what the old incremental tombstone yielded.
 ;;
 ;; stored (write model - mutated only by the sink / drivers):
-;;   :forms           {fid {:ns :source :line :column :facts [instr]}}
-;;                                          instr = [op a b], self-contained so the
-;;                                          derived indexes can be rebuilt from it alone
+;;   :forms           {fid {:ns :source :line :column + one key per non-empty fact
+;;                          category: :usages :defs :keyword-usages :class-usages
+;;                          :locals :local-uses :macro-deps, each a vector of facts}}
+;;                                          Facts are stored BY CATEGORY rather than as
+;;                                          tagged [op a b] tuples, so each fact is a
+;;                                          single self-describing object (a Span /
+;;                                          LocalSpan / MacroDep carrying its own entity
+;;                                          key) - no wrapper allocated per fact, and
+;;                                          none retained. Still self-contained, so the
+;;                                          derived indexes rebuild from forms alone.
 ;;   :source->forms   {source #{fid}}   the file each form belongs to (the reload unit)
 ;;   :next-fid        long          global unique-id source for forms (shared)
 ;;   :file-mtime      {source long}   per-file on-disk mtime baseline (§9); a live file
@@ -115,28 +122,43 @@
 ;; them as int); an absent end-line/end-column arrives non-nat and is stored as -1.
 ;; from-ns is the referencing namespace (nil for a def); macro is true for a
 ;; macro-call usage, else nil. Locals use their own record (LocalSpan) below.
-(defrecord Span [source ^int line ^int column ^int end-line ^int end-column from-ns macro])
+;;
+;; `entity` is the thing this span is ABOUT - the var key for a usage/def, the Keyword
+;; for a keyword usage, the class-name string for a class usage. Carrying it on the
+;; span makes a fact a SINGLE object: the form's per-category lists hold bare spans, so
+;; there is no [op a b] tuple wrapper per fact (one fewer allocation each, and one
+;; fewer object retained in the :forms log for the life of the code). span->map never
+;; exposes it, so the public span shape is unchanged.
+(defrecord Span [entity source ^int line ^int column ^int end-line ^int end-column from-ns macro])
 
 (defn- norm-end [x] (if (nat-int? x) (int x) -1))
 
 (defn- span
-  ([source line column el ec] (span source line column el ec nil nil))
-  ([source line column el ec from-ns macro]
-   (->Span source (int line) (int column) (norm-end el) (norm-end ec) from-ns (when macro true))))
+  ([entity source line column el ec] (span entity source line column el ec nil nil))
+  ([entity source line column el ec from-ns macro]
+   (->Span entity source (int line) (int column) (norm-end el) (norm-end ec)
+           from-ns (when macro true))))
 
 ;; A local binding's def/use site. Locals are numerous too (every fn-arg and
 ;; let-binding), so they get the same lightweight-record treatment as Span rather
 ;; than a map built via merge: one allocation per local, primitive int coordinates,
-;; no boxing. `lns` is the owning namespace; `lname` the binding's source name
-;; (present for a def, nil for a use). Fields are named to avoid shadowing
-;; clojure.core/ns and /name; build-index (local->map) projects them to the public
-;; :ns/:name keys, so the query surface stays plain maps.
-(defrecord LocalSpan [source ^int line ^int column ^int end-line ^int end-column lns lname])
+;; no boxing. `binding` is the opaque identity token linking a def to its uses (the
+;; entity key, carried on the span for the same one-object-per-fact reason as Span).
+;; `lns` is the owning namespace; `lname` the binding's source name (present for a def,
+;; nil for a use). Fields are named to avoid shadowing clojure.core/ns and /name;
+;; build-index (local->map) projects them to the public :ns/:name keys, so the query
+;; surface stays plain maps.
+(defrecord LocalSpan [binding source ^int line ^int column ^int end-line ^int end-column lns lname])
 
 (defn- local-span
-  ([source line column el ec lns] (local-span source line column el ec lns nil))
-  ([source line column el ec lns lname]
-   (->LocalSpan source (int line) (int column) (norm-end el) (norm-end ec) lns lname)))
+  ([binding source line column el ec lns] (local-span binding source line column el ec lns nil))
+  ([binding source line column el ec lns lname]
+   (->LocalSpan binding source (int line) (int column) (norm-end el) (norm-end ec) lns lname)))
+
+;; A compile-time macro-dependency edge: namespace `mns` expanded a call to macro var
+;; `mvar`. The only fact with no span, so it gets its own two-field holder rather than a
+;; tuple - a deftype (not a record) since nothing needs map access to it.
+(deftype MacroDep [mns mvar])
 
 (defn- span->map
   "Normalise a Span record to the documented plain-map span shape, for the public
@@ -195,24 +217,50 @@
 ;; current :next-fid.
 (deftype FileFrame [source ^java.util.ArrayList buffer ^longs counter])
 
+;; Fact categories. Facts are stored in one list PER CATEGORY rather than in a single
+;; list of [op a b] tuples, so the category is implied by which list a fact is in and
+;; each fact is a single self-describing object (the span, carrying its own entity).
+;; These are array slots on the open form, so they are plain int constants.
+(def ^:private ^:const CAT-USAGES   0)
+(def ^:private ^:const CAT-DEFS     1)
+(def ^:private ^:const CAT-KEYWORDS 2)
+(def ^:private ^:const CAT-CLASSES  3)
+(def ^:private ^:const CAT-LOCALS   4)
+(def ^:private ^:const CAT-LOCALUSE 5)
+(def ^:private ^:const CAT-MACRODEP 6)
+(def ^:private ^:const N-CATS       7)
+
+;; The model key each category is stored under on a committed form entry, indexed by
+;; the constants above.
+(def ^:private cat-keys
+  [:usages :defs :keyword-usages :class-usages :locals :local-uses :macro-deps])
+
 ;; An open form is buffered in a thread-local mutable holder, NOT written to the shared
-;; model fact-by-fact. Facts accumulate in a plain ArrayList and the form's position is
+;; model fact-by-fact. Facts accumulate in per-category ArrayLists (`cats`, allocated
+;; lazily - most forms touch only one or two categories) and the form's position is
 ;; corrected in place (form-start! fires repeatedly, last wins); at end-form! the
 ;; finished form is handed to its file `frame`'s buffer. So the sink never touches the
 ;; shared atom - not per fact, not per form. `pos` is [line column]; `seq` is the form's
 ;; begin-order rank within its file, used to assign a fid = base + seq at commit, so
 ;; build-index still replays a file's forms in begin order.
-(deftype OpenForm [^long seq ^FileFrame frame ^longs pos ^java.util.ArrayList facts])
+(deftype OpenForm [^long seq ^FileFrame frame ^longs pos ^objects cats])
 
 (defn- current-frame ^FileFrame [] (when-let [s *file-stack*] (peek @s)))
 (defn- current-form  ^OpenForm  [] (when-let [s *form-stack*] (peek @s)))
 
-;; The sink's one mutation while a form is open: append a self-contained fact instr
-;; [op a b] to the open form's buffer. No model touch, no index maintenance - the
-;; by-entity indexes are derived on read (build-index). nil holder (no form open) is
-;; a no-op; see the sink for why.
-(defn- add-fact! [^OpenForm of instr]
-  (when of (.add ^java.util.ArrayList (.facts of) instr))
+;; The sink's one mutation while a form is open: append a fact to the open form's list
+;; for category `cat`, creating that list on first use. The fact is a single object that
+;; carries its own entity key (Span/LocalSpan/MacroDep), so there is no tuple wrapper.
+;; No model touch, no index maintenance - the by-entity indexes are derived on read
+;; (build-index). nil holder (no form open) is a no-op; see the sink for why.
+(defn- add-fact! [^OpenForm of ^long cat fact]
+  (when of
+    (let [^objects cats (.cats of)]
+      (if-let [^java.util.ArrayList l (aget cats cat)]
+        (.add l fact)
+        (let [l (java.util.ArrayList.)]
+          (aset cats cat l)
+          (.add l fact)))))
   nil)
 
 ;; --- retraction (structural only - drops forms; indexes re-derive) ---------
@@ -248,7 +296,7 @@
       (aset c 0 (inc seq))
       (swap! *form-stack* conj
              (OpenForm. seq fr (long-array [(long line) (long column)])
-                        (java.util.ArrayList.)))))
+                        (object-array N-CATS)))))
   nil)
 
 (defn- form-start! [line column]
@@ -274,19 +322,29 @@
     ;; Hand the finished form to its file frame's buffer - no model touch. Empty forms
     ;; (e.g. an outer do, EOF) are dropped; their begin-order rank still counted, so it
     ;; leaves a fid gap at commit, exactly as burning the id did before. A non-empty
-    ;; form is frozen whole: its facts (from the ArrayList), position, and owning
-    ;; namespace (read from *ns* NOW, after the form - so an `(ns ...)` form files under
-    ;; the ns it established). :seq is the begin-order rank; commit-frame! turns it into
-    ;; the fid. Filed under the frame's :source (the file, the reload unit).
-    (when (and of (not (.isEmpty ^java.util.ArrayList (.facts of))))
-      (let [^longs pos     (.pos of)
-            ^FileFrame fr  (.frame of)]
-        (.add ^java.util.ArrayList (.buffer fr)
-              {:seq (.seq of) :source (.source fr)
-               :line (aget pos 0) :column (aget pos 1)
-               :ns (some-> *ns* ns-name)
-               :facts (vec (.facts of))}))))
-  nil)
+    ;; form is frozen whole: each non-empty category list frozen to a vector under its
+    ;; own key (empty categories are simply absent, keeping form entries small), plus
+    ;; position and owning namespace (read from *ns* NOW, after the form - so an
+    ;; `(ns ...)` form files under the ns it established). :seq is the begin-order rank;
+    ;; commit-frame! turns it into the fid. Filed under the frame's :source (the file).
+    (when of
+      (let [^objects cats (.cats of)]
+        (when (some #(let [^java.util.ArrayList l (aget cats (long %))]
+                       (and l (not (.isEmpty l))))
+                    (range N-CATS))
+          (let [^longs pos    (.pos of)
+                ^FileFrame fr (.frame of)]
+            (.add ^java.util.ArrayList (.buffer fr)
+                  (reduce (fn [fe i]
+                            (let [^java.util.ArrayList l (aget cats (long i))]
+                              (if (and l (not (.isEmpty l)))
+                                (assoc fe (nth cat-keys i) (vec l))
+                                fe)))
+                          {:seq (.seq of) :source (.source fr)
+                           :line (aget pos 0) :column (aget pos 1)
+                           :ns (some-> *ns* ns-name)}
+                          (range N-CATS)))))))
+  nil))
 
 ;; --- file frames: begin/commit one file's forms atomically -----------------
 
@@ -346,10 +404,12 @@
 ;; form; only a bare eval outside a form window (an unsupported use of run-analysis)
 ;; would land here, and that was never retractable anyway.
 ;;
-;; Each method builds a SELF-CONTAINED fact instr [op a b] and appends it - no index
-;; is touched here. build-index replays these instrs (in fid order) into the query
-;; indexes on read. So the instr must carry everything the index needs: a def
-;; carries its span (not just the qsym), a local its full info (ns/name/span).
+;; Each method builds ONE self-contained fact object and appends it to its category -
+;; no index is touched here. build-index replays the categories (in fid order) into the
+;; query indexes on read, so the fact must carry everything the index needs, INCLUDING
+;; its own entity key: a usage/def its var key, a keyword usage its keyword, a local its
+;; binding token plus full info (ns/name/span). That is what lets a fact be a single
+;; object with no [op a b] tuple around it.
 (deftype AnalysisSink []
   IAnalysisSink
   (beginFile [_ source] (begin-file! source))
@@ -363,28 +423,28 @@
     ;; rather than write a nil key that would later NPE (namespace nil) in queries.
     (when-let [of (current-form)]
       (when-let [k (var-key target)]
-        (add-fact! of [:usages k (span source line column el ec from-ns nil)])))
+        (add-fact! of CAT-USAGES (span k source line column el ec from-ns nil))))
     nil)
   (varDef [_ v source line column el ec]
     (when-let [of (current-form)]
       (when-let [k (var-key v)]
-        (add-fact! of [:defs k (span source line column el ec)])))
+        (add-fact! of CAT-DEFS (span k source line column el ec))))
     nil)
   (localDef [_ binding name ns source line column el ec]
     (when-let [of (current-form)]
-      (add-fact! of [:locals binding (local-span source line column el ec ns name)]))
+      (add-fact! of CAT-LOCALS (local-span binding source line column el ec ns name)))
     nil)
   (localUsage [_ binding ns source line column el ec]
     (when-let [of (current-form)]
-      (add-fact! of [:local-use binding (local-span source line column el ec ns)]))
+      (add-fact! of CAT-LOCALUSE (local-span binding source line column el ec ns)))
     nil)
   (keywordUsage [_ kw from-ns source line column el ec]
     (when-let [of (current-form)]
-      (add-fact! of [:keyword-usages kw (span source line column el ec from-ns nil)]))
+      (add-fact! of CAT-KEYWORDS (span kw source line column el ec from-ns nil)))
     nil)
   (classUsage [_ c from-ns source line column el ec]
     (when-let [of (current-form)]
-      (add-fact! of [:class-usages (class-key c) (span source line column el ec from-ns nil)]))
+      (add-fact! of CAT-CLASSES (span (class-key c) source line column el ec from-ns nil)))
     nil)
   (macroExpansion [_ macro from-ns source line column el ec record-usage?]
     (when-let [of (current-form)]
@@ -394,9 +454,9 @@
         ;; expansion-introduced calls); record the macro *usage* only for a
         ;; source-written call. The edge's fid (the form's own, filled in by
         ;; build-index) carries the expanding form's file, which the §9 cascade reads.
-        (add-fact! of [:macro-dep ns-sym mk])
+        (add-fact! of CAT-MACRODEP (MacroDep. ns-sym mk))
         (when record-usage?
-          (add-fact! of [:usages mk (span source line column el ec from-ns true)])))))
+          (add-fact! of CAT-USAGES (span mk source line column el ec from-ns true))))))
     nil))
 
 ;; --- drivers ---------------------------------------------------------------
@@ -587,41 +647,56 @@
   entity values themselves (the persistent sets / entry maps that are the actual
   data). The transient must be threaded (assoc! may promote and return a new object),
   so each sub-index is re-stored into the (also transient) idx via its return value.
-  The result is frozen with persistent! - a plain, fully persistent index."
+  The result is frozen with persistent! - a plain, fully persistent index.
+
+  Facts are stored per CATEGORY on the form (no [op a b] tuples), so there is no tag to
+  dispatch on: each category list is folded straight into its sub-index, and every fact
+  carries its own entity key. Locals are folded before local-uses, so a form's binding
+  defs are all registered before any of its uses are attached (a local is lexically
+  scoped to its form, so this is exactly the right scope)."
   [forms]
-  (let [idx (reduce
+  (let [add-span (fn [idx k ^Span s]
+                   (let [sub (get idx k)
+                         e   (.entity s)]
+                     (assoc! idx k (assoc! sub e (conj (get sub e #{}) s)))))
+        idx (reduce
              (fn [idx fid]
-               (reduce
-                (fn [idx [op a b]]
-                  (case op
-                    :usages         (let [s (get idx :usages)]
-                                      (assoc! idx :usages (assoc! s a (conj (get s a #{}) b))))
-                    :keyword-usages (let [s (get idx :keyword-usages)]
-                                      (assoc! idx :keyword-usages (assoc! s a (conj (get s a #{}) b))))
-                    :class-usages   (let [s (get idx :class-usages)]
-                                      (assoc! idx :class-usages (assoc! s a (conj (get s a #{}) b))))
-                    :defs           (let [s (get idx :defs)]
-                                      (assoc! idx :defs (assoc! s a {:span b})))
-                    ;; A local's def carries its full info (a LocalSpan record); project it
-                    ;; to the plain-map index entry and keep any :uses already gathered from
-                    ;; local-use facts earlier in this form (def normally precedes use).
-                    :locals         (let [s (get idx :locals)]
-                                      (assoc! idx :locals
-                                              (assoc! s a (assoc (local->map b)
-                                                                 :uses (get (get s a) :uses #{})))))
-                    :local-use      (let [s   (get idx :locals)
-                                          cur (get s a)]
-                                      (if cur
-                                        (assoc! idx :locals
-                                                (assoc! s a (update cur :uses (fnil conj #{}) (local->map b))))
-                                        idx))
-                    ;; a = defining ns-sym, b = macro qsym; the edge is stamped with fid (the
-                    ;; expanding form), so the §9 file cascade can find the expanding file.
-                    :macro-dep      (let [s (get idx :macro-deps)]
-                                      (assoc! idx :macro-deps
-                                              (assoc! s a (update (get s a {}) b (fnil conj #{}) fid))))
-                    idx))
-                idx (:facts (get forms fid))))
+               (let [fe (get forms fid)]
+                 (as-> idx idx
+                   (reduce (fn [idx s] (add-span idx :usages s)) idx (:usages fe))
+                   (reduce (fn [idx s] (add-span idx :keyword-usages s)) idx (:keyword-usages fe))
+                   (reduce (fn [idx s] (add-span idx :class-usages s)) idx (:class-usages fe))
+                   (reduce (fn [idx ^Span s]
+                             (let [sub (get idx :defs)]
+                               (assoc! idx :defs (assoc! sub (.entity s) {:span s}))))
+                           idx (:defs fe))
+                   ;; A local's def carries its full info (a LocalSpan); project it to the
+                   ;; plain-map index entry, keeping any :uses already gathered.
+                   (reduce (fn [idx ^LocalSpan l]
+                             (let [sub (get idx :locals)
+                                   b   (.binding l)]
+                               (assoc! idx :locals
+                                       (assoc! sub b (assoc (local->map l)
+                                                            :uses (get (get sub b) :uses #{}))))))
+                           idx (:locals fe))
+                   (reduce (fn [idx ^LocalSpan l]
+                             (let [sub (get idx :locals)
+                                   b   (.binding l)
+                                   cur (get sub b)]
+                               (if cur
+                                 (assoc! idx :locals
+                                         (assoc! sub b (update cur :uses (fnil conj #{}) (local->map l))))
+                                 idx)))
+                           idx (:local-uses fe))
+                   ;; The edge is stamped with fid (the expanding form), so the §9 file
+                   ;; cascade can find the expanding file.
+                   (reduce (fn [idx ^MacroDep d]
+                             (let [sub (get idx :macro-deps)
+                                   n   (.mns d)]
+                               (assoc! idx :macro-deps
+                                       (assoc! sub n (update (get sub n {}) (.mvar d)
+                                                             (fnil conj #{}) fid)))))
+                           idx (:macro-deps fe)))))
              (transient {:usages (transient {}) :defs (transient {}) :keyword-usages (transient {})
                          :class-usages (transient {}) :locals (transient {}) :macro-deps (transient {})})
              (sort (keys forms)))]
