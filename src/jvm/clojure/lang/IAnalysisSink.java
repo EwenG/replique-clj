@@ -22,6 +22,23 @@ package clojure.lang;
 public interface IAnalysisSink{
 
 /**
+ * Marks the start of loading one source file (design §7.3). Compiler.load is
+ * re-entrant - a require/load triggered while evaluating a form calls it again -
+ * so these calls nest, and the nesting is exactly the file load stack: every
+ * {@link #beginForm} until the matching {@link #endFile} belongs to this file.
+ * {@link #endFile} is issued only when the file loads to completion; if loading
+ * throws (a compile error), no {@code endFile} fires for that file, so the sink
+ * can commit the files that fully loaded and discard the one that did not -
+ * matching what the compiler actually left defined. {@code source} is the
+ * classpath-relative path the form events also carry.
+ */
+void beginFile(String source);
+
+/** Marks the successful end of loading the file opened by the matching {@link
+ * #beginFile}. Not called if the file's load threw. */
+void endFile(String source);
+
+/**
  * Marks the start of analysis of one top-level form (design §7.3). All events
  * emitted until the matching {@link #endForm} belong to this form and are
  * filed under it for retract-and-replace. Calls nest (a top-level {@code (do

@@ -88,23 +88,24 @@
 
 (defonce ^:private model (atom empty-model))
 
-;; The stack of active (nested) top-level forms is per-thread, not part of the
-;; shared model: with-sink binds it to a fresh atom for each analysis. This keeps
-;; "which form am I inside" thread-local (matching the thread-local sink binding),
-;; so concurrent analyses on different threads cannot stamp facts with each other's
-;; form ids. Only the recorded facts - and :next-fid, the global id source - live
-;; in the shared model. Each stack entry is a thread-local OpenForm buffer, not a
-;; bare fid, so a form's facts accumulate off the shared atom until end-form! commits
-;; them. nil when no analysis is in flight; current-form then yields nil and facts are
-;; simply dropped (no form to attribute them to).
+;; Two thread-local stacks, bound together by with-sink for the analysis extent
+;; (matching the thread-local sink binding, so concurrent analyses on different
+;; threads never mix). Neither is part of the shared model; the model is touched
+;; only when a whole FILE commits.
+;;
+;; *file-stack*: the file load stack. beginFile pushes a FileFrame, endFile pops and
+;; commits it. Compiler.load is re-entrant, so a require nested in a form pushes a
+;; child frame that fully commits (or, on a compile error, is discarded) before the
+;; parent form continues - which is exactly what makes a failed reload keep the files
+;; that fully loaded and drop only the one that threw. Each frame buffers its own
+;; file's completed forms off the shared atom until it commits, in one swap!.
+;;
+;; *form-stack*: the active (nested) top-level forms within the current file. Each
+;; entry is an OpenForm buffer accumulating that form's facts; end-form! hands the
+;; finished form to its file frame. nil when no analysis is in flight; current-form
+;; then yields nil and facts are simply dropped (no form to attribute them to).
+(def ^:private ^:dynamic *file-stack* nil)
 (def ^:private ^:dynamic *form-stack* nil)
-
-;; When bound to an atom, begin-form! logs every fid it allocates here. load-file!
-;; uses this to roll back a failed reload precisely - retracting exactly the forms
-;; that reload created (wherever endForm filed them) - instead of resetting the
-;; whole shared model, which would clobber facts other threads committed meanwhile.
-;; nil outside load-file!, so ordinary analyses pay nothing for it.
-(def ^:private ^:dynamic *created-fids* nil)
 
 ;; A usage/def span. The sink files one per var/keyword/class occurrence - by far
 ;; the most numerous fact - so its shape drives allocation during an analysed load.
@@ -186,17 +187,25 @@
   [^Class c]
   (.getName c))
 
-;; An open form is buffered in a thread-local mutable holder, NOT written to the
-;; shared model fact-by-fact. Facts accumulate in a plain ArrayList and the form's
-;; position is corrected in place (form-start! fires repeatedly, last wins); the
-;; whole form is committed to the model in a single swap! at end-form!. This keeps
-;; the per-fact hot path allocation-free (an ArrayList.add, no persistent-map spine
-;; rebuild) and off the shared atom - only begin-form! (fid bump) and end-form!
-;; (one commit) touch `model`. `pos` is [line column]; `fid` was allocated at begin
-;; so build-index still replays forms in allocation order.
-(deftype OpenForm [^long fid source ^longs pos ^java.util.ArrayList facts])
+;; A file being loaded. `buffer` collects its completed forms (plain maps, each with a
+;; per-file :seq = begin-order rank); `counter` is a one-long mutable holding the next
+;; rank (= count of forms begun in this file). Both are thread-local and touched only
+;; by the loading thread, so no synchronisation. The frame commits its buffer to the
+;; model in one swap! at endFile (commit-frame!): fids = base + :seq off the model's
+;; current :next-fid.
+(deftype FileFrame [source ^java.util.ArrayList buffer ^longs counter])
 
-(defn- current-form ^OpenForm [] (when-let [s *form-stack*] (peek @s)))
+;; An open form is buffered in a thread-local mutable holder, NOT written to the shared
+;; model fact-by-fact. Facts accumulate in a plain ArrayList and the form's position is
+;; corrected in place (form-start! fires repeatedly, last wins); at end-form! the
+;; finished form is handed to its file `frame`'s buffer. So the sink never touches the
+;; shared atom - not per fact, not per form. `pos` is [line column]; `seq` is the form's
+;; begin-order rank within its file, used to assign a fid = base + seq at commit, so
+;; build-index still replays a file's forms in begin order.
+(deftype OpenForm [^long seq ^FileFrame frame ^longs pos ^java.util.ArrayList facts])
+
+(defn- current-frame ^FileFrame [] (when-let [s *file-stack*] (peek @s)))
+(defn- current-form  ^OpenForm  [] (when-let [s *form-stack*] (peek @s)))
 
 ;; The sink's one mutation while a form is open: append a self-contained fact instr
 ;; [op a b] to the open form's buffer. No model touch, no index maintenance - the
@@ -224,32 +233,22 @@
         m))
     m))
 
-;; Re-add one previously-retracted form to the live model, used only by load-file!
-;; to roll back a failed reload without disturbing any other form. Restores just the
-;; stored layer (the form and its file membership) from the pre-reload snapshot; the
-;; indexes re-derive from it. `snap` is that snapshot.
-(defn- reinstate-form [m snap fid]
-  (if-let [fe (get-in snap [:forms fid])]
-    (let [m (assoc-in m [:forms fid] fe)]
-      (if-let [src (:source fe)]
-        (update-in m [:source->forms src] (fnil conj #{}) fid)
-        m))
-    m))
-
 ;; --- model mutators (called by the sink and by drivers) --------------------
 
 (defn- begin-form! [source line column]
-  ;; Allocate a globally-unique fid from the shared model (the only begin-time model
-  ;; touch - just the counter bump), then push a fresh thread-local buffer for the
-  ;; form on this thread's stack. The form itself is not written to the model until
-  ;; end-form! commits it. The fid used is (dec :next-fid) after the atomic bump.
-  (let [m'  (swap! model update :next-fid inc)
-        fid (dec (:next-fid m'))]
-    (when *form-stack*
+  ;; Assign the form a begin-order rank from its file frame's counter (NO model touch)
+  ;; and push a fresh buffer for it on the form stack, carrying its frame so end-form!
+  ;; routes it back to the right file. The form is not written to the model here, nor
+  ;; at end-form! - commit-frame! turns the rank into a real fid (base + rank) when the
+  ;; file commits. A form outside any file frame (a bare eval under run-analysis, an
+  ;; unsupported use) has no frame and is dropped.
+  (when-let [^FileFrame fr (current-frame)]
+    (let [^longs c (.counter fr)
+          seq      (aget c 0)]
+      (aset c 0 (inc seq))
       (swap! *form-stack* conj
-             (OpenForm. fid source (long-array [(long line) (long column)])
-                        (java.util.ArrayList.))))
-    (when *created-fids* (swap! *created-fids* conj fid)))
+             (OpenForm. seq fr (long-array [(long line) (long column)])
+                        (java.util.ArrayList.)))))
   nil)
 
 (defn- form-start! [line column]
@@ -272,24 +271,72 @@
 (defn- end-form! []
   (let [^OpenForm of (current-form)]
     (when *form-stack* (swap! *form-stack* pop))
-    ;; Commit the buffered form in one swap!. Empty forms (e.g. an outer do, EOF) are
-    ;; simply never written - the begin-time fid bump already burned their id, exactly
-    ;; as the old drop-empty path did. A non-empty form is installed whole: its facts
-    ;; (frozen from the buffer), position, file membership and owning namespace (read
-    ;; from *ns* now, after the form - so an `(ns ...)` form files under the ns it
-    ;; established). The reload unit is the file, so it is also filed under :source.
+    ;; Hand the finished form to its file frame's buffer - no model touch. Empty forms
+    ;; (e.g. an outer do, EOF) are dropped; their begin-order rank still counted, so it
+    ;; leaves a fid gap at commit, exactly as burning the id did before. A non-empty
+    ;; form is frozen whole: its facts (from the ArrayList), position, and owning
+    ;; namespace (read from *ns* NOW, after the form - so an `(ns ...)` form files under
+    ;; the ns it established). :seq is the begin-order rank; commit-frame! turns it into
+    ;; the fid. Filed under the frame's :source (the file, the reload unit).
     (when (and of (not (.isEmpty ^java.util.ArrayList (.facts of))))
-      (let [fid    (.fid of)
-            src    (.source of)
-            ^longs pos (.pos of)]
-        (swap! model
-               (fn [m]
-                 (-> m
-                     (assoc-in [:forms fid] {:source src
-                                             :line (aget pos 0) :column (aget pos 1)
-                                             :ns (some-> *ns* ns-name)
-                                             :facts (vec (.facts of))})
-                     (update-in [:source->forms src] (fnil conj #{}) fid)))))))
+      (let [^longs pos     (.pos of)
+            ^FileFrame fr  (.frame of)]
+        (.add ^java.util.ArrayList (.buffer fr)
+              {:seq (.seq of) :source (.source fr)
+               :line (aget pos 0) :column (aget pos 1)
+               :ns (some-> *ns* ns-name)
+               :facts (vec (.facts of))}))))
+  nil)
+
+;; --- file frames: begin/commit one file's forms atomically -----------------
+
+(defn- commit-frame!
+  "Install a whole file's buffered forms in ONE swap!, replacing that file's prior
+  forms. The file's current forms are retracted and its buffered ones added in the same
+  swap, so a reload is an atomic replace of just this file: fids = base + :seq off the
+  model's current :next-fid (read inside the swap, so files committing on different
+  threads get disjoint blocks), and :next-fid advances by the file's begin count (all
+  begins, empties included, matching the old fid gaps). Because each file commits when
+  its own load COMPLETES, a reload that throws part-way never reaches its commit - that
+  file keeps its prior forms while every file that fully loaded (a transitive require,
+  a sibling) is already in. A file with nothing buffered and no prior forms is a no-op,
+  so the :forms identity - hence the derived-index cache - is preserved."
+  [^FileFrame fr]
+  (let [source                     (.source fr)
+        ^java.util.ArrayList buffer (.buffer fr)
+        begin-count                (aget ^longs (.counter fr) 0)]
+    (when (or (pos? (.size buffer))
+              (seq (get-in @model [:source->forms source])))
+      (swap! model
+             (fn [m]
+               (let [m     (reduce retract-form m (get-in m [:source->forms source]))
+                     base  (long (:next-fid m))
+                     forms (persistent!
+                            (reduce (fn [t fe]
+                                      (assoc! t (+ base (long (:seq fe))) (dissoc fe :seq)))
+                                    (transient (:forms m)) buffer))
+                     s->f  (reduce (fn [s2f fe]
+                                     (update s2f source (fnil conj #{}) (+ base (long (:seq fe)))))
+                                   (:source->forms m) buffer)]
+                 (assoc m :forms forms :source->forms s->f
+                          :next-fid (+ base (long begin-count))))))))
+  nil)
+
+(defn- begin-file! [source]
+  ;; A new file's load began (Compiler.load re-entered): push a fresh frame. No model
+  ;; touch - the file commits only when it finishes (end-file!).
+  (when *file-stack*
+    (swap! *file-stack* conj (FileFrame. source (java.util.ArrayList.) (long-array [0]))))
+  nil)
+
+(defn- end-file! [_source]
+  ;; The file finished loading (no throw): pop its frame and commit it. A throw during
+  ;; the file's load means end-file! is never called for it (the compiler skips endFile
+  ;; on error), so the frame is discarded with the stack unwind - its forms never reach
+  ;; the model, and the file keeps whatever it had before.
+  (when-let [fr (current-frame)]
+    (swap! *file-stack* pop)
+    (commit-frame! fr))
   nil)
 
 ;; Invariant: a fact is recorded ONLY when a form is open (current-form non-nil).
@@ -305,6 +352,8 @@
 ;; carries its span (not just the qsym), a local its full info (ns/name/span).
 (deftype AnalysisSink []
   IAnalysisSink
+  (beginFile [_ source] (begin-file! source))
+  (endFile [_ source] (end-file! source))
   (beginForm [_ source line column] (begin-form! source line column))
   (formStart [_ line column] (form-start! line column))
   (endForm [_] (end-form!))
@@ -357,14 +406,16 @@
   []
   (reset! model empty-model))
 
-(defn- with-sink [thunk]
-  ;; Bind the sink and a fresh per-thread form stack together, for the same
-  ;; dynamic extent: every form begin/end and fact recorded on this thread during
-  ;; the analysis uses this thread's own stack. *created-fids* is deliberately NOT
-  ;; bound here: begin-form! nil-guards it, so an ordinary analysis leaves it nil
-  ;; and pays nothing; when a caller (load-file!) has established it, this inherits
-  ;; that binding so the caller sees every fid this analysis allocates, for rollback.
+(defn- with-sink
+  "Run `thunk` with the sink installed and fresh per-thread file + form stacks. Commits
+  happen file-by-file as each file's load completes (commit-frame! at endFile), so there
+  is nothing to flush here. If `thunk` throws, the file that was loading never commits
+  (its frame is discarded with the stack unwind) while every file that fully loaded is
+  already in - the reload's atomicity is per file, matching what the compiler left
+  defined."
+  [thunk]
   (push-thread-bindings {Compiler/ANALYSIS_SINK (->AnalysisSink)
+                         #'*file-stack*         (atom [])
                          #'*form-stack*         (atom [])})
   (try (thunk) (finally (pop-thread-bindings))))
 
@@ -382,7 +433,11 @@
   re-evaluate the whole codebase. Only files actually touched this run are
   snapshotted (their :source->forms changed); baselines for untouched files - e.g.
   ones edited but not yet reloaded - are left intact, so a pending staleness flag
-  elsewhere is not silently cleared."
+  elsewhere is not silently cleared.
+
+  Every file this run (re)compiles replaces its own prior forms atomically as it
+  finishes loading (commit-frame!), so re-running analysis over a file is idempotent -
+  no accumulation - without any explicit retraction here."
   [thunk]
   (let [before (:source->forms @model)
         result (with-sink thunk)]
@@ -481,40 +536,28 @@
   source)
 
 (defn load-file!
-  "Single-file analysis: retract `source`'s prior forms, then reload the file under
-  the sink so the model is replaced cleanly - no accumulation. Removes forms deleted
-  from source (their facts vanish with the form, and the derived indexes reflect it).
-  Refreshes the stored source mtime. `source` is the classpath-relative source path
-  the compiler records (e.g. \"app/util.clj\").
+  "Single-file analysis: replace `source`'s prior forms by reloading the file under the
+  sink - no accumulation. Removes forms deleted from source (their facts vanish with the
+  form, and the derived indexes reflect it). Refreshes the stored source mtime. `source`
+  is the classpath-relative source path the compiler records (e.g. \"app/util.clj\").
 
-  Reloads via the file's resource (`load`), NOT require-by-namespace, so it handles
-  a file that defines several namespaces (a require can't even name a file's second
+  Reloads via the file's resource (`load`), NOT require-by-namespace, so it handles a
+  file that defines several namespaces (a require can't even name a file's second
   namespace) and keeps :source consistent with the cold analysis.
 
-  Atomic: retract + reload + mtime update either all take effect or, if the reload
-  throws (typically an edited source with a compile/syntax error), none do - the
-  file is reverted to its prior state and the error re-thrown. The rollback reverts
-  ONLY this file, via swap! (never reset!): it retracts this reload's created forms
-  belonging to `source` and reinstates the file's prior forms from a pre-retract
-  snapshot, so facts other threads committed meanwhile, and any OTHER file this
-  reload happened to load fresh (an edit adding a new require), are preserved. The
-  mtime is left unrefreshed on failure, so the file stays flagged stale and retries."
+  Atomic BY CONSTRUCTION, per file: each file's forms are buffered and committed - the
+  file's old forms retracted and its new ones added - in one swap! only when THAT file's
+  load completes (commit-frame! at endFile). If the reload of `source` throws (typically
+  an edited source with a compile/syntax error) its frame never commits, so `source`
+  keeps its prior forms with no rollback bookkeeping - while every file the reload
+  transitively loaded to completion (a fresh require, a sibling) is kept, matching what
+  the compiler actually left defined. The mtime is refreshed by run-analysis only for
+  files whose forms actually changed, so a failed `source` stays flagged stale and
+  retries."
   [source]
   (check-resource-source! source)
-  (let [snapshot @model
-        old-fids (get-in snapshot [:source->forms source])]
-    (binding [*created-fids* (atom [])]
-      (try
-        (retract-source* source)
-        (run-analysis #(load-source! source))
-        (record-file-mtime! source)
-        (catch Throwable t
-          (swap! model
-                 (fn [m]
-                   (let [mine (filter #(= source (:source (get-in m [:forms %]))) @*created-fids*)
-                         m    (reduce retract-form m mine)]
-                     (reduce (fn [m fid] (reinstate-form m snapshot fid)) m old-fids))))
-          (throw t))))))
+  (run-analysis #(load-source! source))
+  source)
 
 ;; --- derived query indexes (built from :forms, cached) ---------------------
 

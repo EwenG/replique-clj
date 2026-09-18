@@ -8405,6 +8405,15 @@ public static Object load(Reader rdr, String sourcePath, String sourceName) {
                         ));
 
 	Object readerOpts = readerOpts(sourceName);
+	// One beginFile/endFile brackets this file's whole load. Compiler.load is
+	// re-entrant (a require while evaluating a form re-enters here), so these
+	// nest as the file load stack. endFile is emitted only on normal completion,
+	// below - a throw skips it, letting the sink discard the failed file's forms
+	// while keeping the ones that fully loaded. Gated on sink so the off path
+	// stays byte-for-byte stock.
+	IAnalysisSink fileSink = analysisSink();
+	if(fileSink != null)
+		fileSink.beginFile(sourcePath);
 	try
 		{
 		// One analysis form spans read+eval of a top-level form, so read-time
@@ -8463,6 +8472,11 @@ public static Object load(Reader rdr, String sourcePath, String sourceName) {
 					sink.endForm();
 				}
 			}
+		// Reached only when the read loop drains to EOF without throwing: the file
+		// loaded to completion, so close its analysis frame (commit). A throw above
+		// jumps past this to catch/finally, leaving the frame open (discarded).
+		if(fileSink != null)
+			fileSink.endFile(sourcePath);
 		}
 	catch(LispReader.ReaderException e)
 		{
