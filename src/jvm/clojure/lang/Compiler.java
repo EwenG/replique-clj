@@ -468,9 +468,24 @@ static int[] symbolPosition(Symbol sym){
 // capture them at read time, positioned at the symbol as written. orig is the
 // symbol as read (carrying the reader position); resolved is the fully-qualified
 // symbol syntax-quote produced. Only source-written references are recorded, and
-// the lookups never throw - a not-yet-defined or unresolvable reference is
-// silently skipped (usages are keyed by Var/Class identity, so we need the
-// object, not just the name).
+// a not-yet-defined or unresolvable reference is silently skipped (usages are
+// keyed by Var/Class identity, so we need the object, not just the name).
+//
+// RT.classForNameNonLoading sneaky-throws ClassNotFoundException rather than
+// returning null, so every lookup here goes through maybeClassNonLoading, exactly
+// as maybeClass guards its own. The miss is the COMMON case, not the exceptional
+// one: `(foo bar) read in ns user resolves to user/foo, and "user" is not a class.
+static Class maybeClassNonLoading(String name){
+	try
+		{
+		return RT.classForNameNonLoading(name);
+		}
+	catch(Exception e)
+		{
+		return null;
+		}
+}
+
 static void sinkSyntaxQuoteRef(Object orig, Symbol resolved){
 	if(analysisSink() == null || !(orig instanceof Symbol) || !isSourceSymbol((Symbol) orig))
 		return;
@@ -493,7 +508,7 @@ static void sinkSyntaxQuoteRef(Object orig, Symbol resolved){
 			// normal static-member path in analyzeSymbol, which records a class
 			// usage over the whole Classname/member token (origSym), not just the
 			// class part - so find-class-usages sees it inside a macro body too.
-			Class c = RT.classForNameNonLoading(resolved.ns);
+			Class c = maybeClassNonLoading(resolved.ns);
 			if(c != null)
 				sinkClassUsage(c, origSym);
 			}
@@ -506,7 +521,7 @@ static void sinkSyntaxQuoteRef(Object orig, Symbol resolved){
 			cname = cname.substring(0, cname.length() - 1);
 		if(cname.indexOf('.') > 0)
 			{
-			Class c = RT.classForNameNonLoading(cname);
+			Class c = maybeClassNonLoading(cname);
 			if(c != null)
 				sinkClassUsage(c, ctor ? carryClassPosition(origSym, Symbol.intern(cname)) : origSym);
 			}
@@ -7558,10 +7573,15 @@ private static Expr analyze(C context, Object form, String name) {
                 && !(form instanceof IType)
                 && ((IPersistentCollection) form).count() == 0)
 				{
+				// Empty collections take this fast path instead of Vector/Map/SetExpr.parse,
+				// so they need the same literalMeta treatment: reader positions are not
+				// part of [] / {} / #{} as a value, and wrapping in MetaExpr over them
+				// would both leak them at runtime and defeat EmptyExpr's shared constant.
 				Expr ret = new EmptyExpr(form);
-				if(RT.meta(form) != null)
+				IPersistentMap emeta = literalMeta(form);
+				if(emeta != null)
 					ret = new MetaExpr(ret, MapExpr
-							.parse(context == C.EVAL ? context : C.EXPRESSION, ((IObj) form).meta()));
+							.parse(context == C.EVAL ? context : C.EXPRESSION, emeta));
 				return ret;
 				}
 		else if(form instanceof ISeq)

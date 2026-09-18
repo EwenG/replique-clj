@@ -1251,18 +1251,24 @@ public static class SyntaxQuoteReader extends AFn{
 		if(form instanceof IObj && RT.meta(form) != null)
 			{
 			IPersistentMap full = ((IObj) form).meta();
-			//filter line and column numbers - incl. the Layer 1 end-line/end-column,
-			//so an analysed syntax-quote does not stamp the macro *body* position onto
-			//emitted symbols (which would make them look source-written, and record a
-			//phantom usage, at every expansion site). When analysis is off, END keys
-			//are absent and the attached meta stays the full original - upstream-identical.
+			//filter line and column numbers - and, under analysis only, the Layer 1
+			//end-line/end-column too, so an analysed syntax-quote does not stamp the
+			//macro *body* position onto emitted symbols (which would make them look
+			//source-written, and record a phantom usage, at every expansion site).
 			//Known cost (analysis-and-reload.md §11): a form carrying other metadata too
 			//(a type hint / user meta) loses :line/:column under analysis, so macro-body
 			//diagnostics for it report the enclosing form's line, unlike a plain require.
-			IPersistentMap newMeta = full.without(RT.LINE_KEY).without(RT.COLUMN_KEY)
-			                             .without(END_LINE_KEY).without(END_COLUMN_KEY);
+			//
+			//The END keys are dropped only when analysis is on, INCLUDING from the map
+			//that decides whether to emit with-meta at all. Off, they are ordinary user
+			//data: `^{:end-line 7} [1] must keep that metadata exactly as upstream does,
+			//and gating on a map they had been stripped from silently dropped it.
+			boolean rec = positionsRequested();
+			IPersistentMap newMeta = full.without(RT.LINE_KEY).without(RT.COLUMN_KEY);
+			if(rec)
+				newMeta = newMeta.without(END_LINE_KEY).without(END_COLUMN_KEY);
 			if(newMeta.count() > 0)
-				return RT.list(WITH_META, ret, syntaxQuote(positionsRequested() ? newMeta : full));
+				return RT.list(WITH_META, ret, syntaxQuote(rec ? newMeta : full));
 			}
 		return ret;
 	}

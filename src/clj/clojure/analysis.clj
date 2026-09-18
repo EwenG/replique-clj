@@ -543,9 +543,13 @@
   "The on-disk last-modified time of the file behind classpath resource `source`,
   or nil if it can't be resolved to a file (never loaded from a file, moved,
   deleted, or now behind a jar - a jar-entry URL has protocol \"jar\", not
-  \"file\"). No namespace->path munging: the source path IS the resource path."
+  \"file\"). No namespace->path munging: the source path IS the resource path.
+
+  `source` is nil for a load with no file behind it at all - load-string,
+  load-reader, and anything else reaching Compiler.load without a source path -
+  which is the same \"no file\" answer, not an error. io/resource would NPE on it."
   [source]
-  (when-let [u (io/resource source)]
+  (when-let [u (and source (io/resource source))]
     (when (= "file" (.getProtocol u))
       (.lastModified (resource->file u)))))
 
