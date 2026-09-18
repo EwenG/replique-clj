@@ -379,6 +379,38 @@ static boolean isSourceSymbol(Symbol sym){
 	return m != null && m.containsKey(RT.LINE_KEY);
 }
 
+// The metadata of a collection literal that is part of its VALUE - i.e. that the
+// compiler must emit as a runtime withMeta - or null when there is none.
+//
+// Under analysis the reader annotates every vector/map/set with its source position,
+// which is NOT part of the value: it is provenance the analysis and the CLJS compiler
+// read off the form, not something the program wrote. Left in, it is ruinous - a
+// literal with metadata cannot take the constant-folding branch in
+// Vector/Map/SetExpr.parse, so every literal in the file stops being a hoisted
+// constant and is rebuilt, along with its four-key position map, on EVERY evaluation.
+// That is both a large compile-time cost and a runtime tax on the analysed program,
+// and it makes (meta [1 2]) non-nil where stock gives nil.
+//
+// So strip the four reader position keys and, if nothing the program wrote remains,
+// report no metadata - restoring constant folding and stock runtime semantics.
+// Gated on recordPositions(): with analysis off the keys are never on a collection
+// literal in the first place, and stock compilation is untouched by construction.
+// User-written metadata (^:foo [1 2]) survives, and now matches stock exactly rather
+// than arriving with four position keys merged in.
+//
+// clojure.cljs.analyzer/wrap-meta makes the same split for ClojureScript, via
+// clojure.cljs.reader/program-meta; this keeps the two compilers in step.
+static IPersistentMap literalMeta(Object form){
+	if(!(form instanceof IObj))
+		return null;
+	IPersistentMap m = ((IObj) form).meta();
+	if(m == null || !recordPositions())
+		return m;
+	m = m.without(RT.LINE_KEY).without(RT.COLUMN_KEY)
+	     .without(LispReader.END_LINE_KEY).without(LispReader.END_COLUMN_KEY);
+	return RT.count(m) > 0 ? m : null;
+}
+
 // Carry orig's reader position onto cls (the class symbol split out of a
 // Foo. constructor form), trimming the trailing dot from the end column, so
 // (Foo. ...) records a class usage at Foo. No-op when orig has no position
@@ -3781,9 +3813,10 @@ public static class MapExpr implements Expr{
 			}
 
 		Expr ret = new MapExpr(keyvals);
-		if(form instanceof IObj && ((IObj) form).meta() != null)
+		IPersistentMap fmeta = literalMeta(form);
+		if(fmeta != null)
 			return new MetaExpr(ret, MapExpr
-					.parse(context == C.EVAL ? context : C.EXPRESSION, ((IObj) form).meta()));
+					.parse(context == C.EVAL ? context : C.EXPRESSION, fmeta));
 		else if(keysConstant)
 			{
 			// TBD: Add more detail to exception thrown below.
@@ -3852,9 +3885,10 @@ public static class SetExpr implements Expr{
 				constant = false;
 			}
 		Expr ret = new SetExpr(keys);
-		if(form instanceof IObj && ((IObj) form).meta() != null)
+		IPersistentMap fmeta = literalMeta(form);
+		if(fmeta != null)
 			return new MetaExpr(ret, MapExpr
-					.parse(context == C.EVAL ? context : C.EXPRESSION, ((IObj) form).meta()));
+					.parse(context == C.EVAL ? context : C.EXPRESSION, fmeta));
 		else if(constant)
 			{
 			IPersistentSet set = PersistentHashSet.EMPTY;
@@ -3925,9 +3959,10 @@ public static class VectorExpr implements Expr{
 				constant = false;
 			}
 		Expr ret = new VectorExpr(args);
-		if(form instanceof IObj && ((IObj) form).meta() != null)
+		IPersistentMap fmeta = literalMeta(form);
+		if(fmeta != null)
 			return new MetaExpr(ret, MapExpr
-					.parse(context == C.EVAL ? context : C.EXPRESSION, ((IObj) form).meta()));
+					.parse(context == C.EVAL ? context : C.EXPRESSION, fmeta));
 		else if (constant)
 			{
 			IPersistentVector rv = PersistentVector.EMPTY;
