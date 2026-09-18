@@ -148,11 +148,24 @@ static boolean positionsRequested(){
 static private Object attachSourcePosition(IObj o, int line, int column, int endLine, int endColumn){
 	IPersistentMap meta = o.meta();
 	if(meta == null)
-		meta = PersistentArrayMap.EMPTY;
-	meta = meta.assoc(RT.LINE_KEY, line)
-	           .assoc(RT.COLUMN_KEY, column)
-	           .assoc(END_LINE_KEY, endLine)
-	           .assoc(END_COLUMN_KEY, endColumn);
+		// Fast path, and the overwhelming majority: a freshly read symbol or
+		// collection carries no metadata. Build the four-key map in ONE allocation
+		// rather than four chained assocs, which allocate four PersistentArrayMaps
+		// and four growing backing arrays (2,4,6,8 slots) to reach the same result.
+		// Identical keys, identical insertion order and identical boxing, so the map
+		// is = to what the chain produced - this is a representation change only.
+		// The ctor aliases the array, which is fine: it is freshly made here and
+		// never touched again, and the four keys are distinct constants.
+		meta = new PersistentArrayMap(new Object[]{
+				RT.LINE_KEY, line, RT.COLUMN_KEY, column,
+				END_LINE_KEY, endLine, END_COLUMN_KEY, endColumn});
+	else
+		// Something already annotated this object (a type hint, user metadata).
+		// Keep the chained assocs so existing keys merge exactly as before.
+		meta = meta.assoc(RT.LINE_KEY, line)
+		           .assoc(RT.COLUMN_KEY, column)
+		           .assoc(END_LINE_KEY, endLine)
+		           .assoc(END_COLUMN_KEY, endColumn);
 	return o.withMeta(meta);
 }
 
@@ -1376,13 +1389,31 @@ public static class ListReader extends AFn{
 		if(line != -1)
 			{
 			Object meta = RT.meta(s);
-			meta = RT.assoc(meta, RT.LINE_KEY, RT.get(meta, RT.LINE_KEY, line));
-			meta = RT.assoc(meta, RT.COLUMN_KEY, RT.get(meta,RT.COLUMN_KEY, column));
-			if(positionsRequested() && r instanceof LineNumberingPushbackReader)
+			boolean rec = positionsRequested() && r instanceof LineNumberingPushbackReader;
+			if(meta == null && rec)
 				{
+				// Analysis fast path: a freshly read list has no metadata, so build all
+				// four position keys in ONE allocation instead of four chained assocs.
+				// Same keys, same order, same values (getLineNumber before
+				// getColumnNumber, as the assocs did) - an = map, just cheaper. The
+				// sink-off path below is untouched and stays byte-for-byte stock.
 				LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
-				meta = RT.assoc(meta, END_LINE_KEY, lr.getLineNumber());
-				meta = RT.assoc(meta, END_COLUMN_KEY, lr.getColumnNumber());
+				int el = lr.getLineNumber();
+				int ec = lr.getColumnNumber();
+				meta = new PersistentArrayMap(new Object[]{
+						RT.LINE_KEY, line, RT.COLUMN_KEY, column,
+						END_LINE_KEY, el, END_COLUMN_KEY, ec});
+				}
+			else
+				{
+				meta = RT.assoc(meta, RT.LINE_KEY, RT.get(meta, RT.LINE_KEY, line));
+				meta = RT.assoc(meta, RT.COLUMN_KEY, RT.get(meta,RT.COLUMN_KEY, column));
+				if(rec)
+					{
+					LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
+					meta = RT.assoc(meta, END_LINE_KEY, lr.getLineNumber());
+					meta = RT.assoc(meta, END_COLUMN_KEY, lr.getColumnNumber());
+					}
 				}
 			return s.withMeta((IPersistentMap)meta);
 			}
