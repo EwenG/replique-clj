@@ -149,16 +149,13 @@ static private Object attachSourcePosition(IObj o, int line, int column, int end
 	IPersistentMap meta = o.meta();
 	if(meta == null)
 		// Fast path, and the overwhelming majority: a freshly read symbol or
-		// collection carries no metadata. Build the four-key map in ONE allocation
-		// rather than four chained assocs, which allocate four PersistentArrayMaps
-		// and four growing backing arrays (2,4,6,8 slots) to reach the same result.
-		// Identical keys, identical insertion order and identical boxing, so the map
-		// is = to what the chain produced - this is a representation change only.
-		// The ctor aliases the array, which is fine: it is freshly made here and
-		// never touched again, and the four keys are distinct constants.
-		meta = new PersistentArrayMap(new Object[]{
-				RT.LINE_KEY, line, RT.COLUMN_KEY, column,
-				END_LINE_KEY, endLine, END_COLUMN_KEY, endColumn});
+		// collection carries no metadata. One SpanMeta holds the four coordinates as
+		// primitive ints - a single object, where the equivalent PersistentArrayMap
+		// costs the map, an eight-slot backing array and a boxed Integer per
+		// coordinate past the Integer cache (and four chained assocs would allocate
+		// four of the first two). SpanMeta is = to, and hashes as, that map; see its
+		// class comment for why that is exact rather than approximate.
+		meta = new SpanMeta(line, column, endLine, endColumn);
 	else
 		// Something already annotated this object (a type hint, user metadata).
 		// Keep the chained assocs so existing keys merge exactly as before.
@@ -1392,17 +1389,16 @@ public static class ListReader extends AFn{
 			boolean rec = positionsRequested() && r instanceof LineNumberingPushbackReader;
 			if(meta == null && rec)
 				{
-				// Analysis fast path: a freshly read list has no metadata, so build all
-				// four position keys in ONE allocation instead of four chained assocs.
-				// Same keys, same order, same values (getLineNumber before
-				// getColumnNumber, as the assocs did) - an = map, just cheaper. The
-				// sink-off path below is untouched and stays byte-for-byte stock.
+				// Analysis fast path: a freshly read list has no metadata, so the four
+				// position keys become ONE SpanMeta (primitive ints, no array, no
+				// boxing) instead of four chained assocs. Same keys, same order, same
+				// values (getLineNumber before getColumnNumber, as the assocs did) -
+				// an = map, just cheaper. The sink-off path below is untouched and
+				// stays byte-for-byte stock.
 				LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
 				int el = lr.getLineNumber();
 				int ec = lr.getColumnNumber();
-				meta = new PersistentArrayMap(new Object[]{
-						RT.LINE_KEY, line, RT.COLUMN_KEY, column,
-						END_LINE_KEY, el, END_COLUMN_KEY, ec});
+				meta = new SpanMeta(line, column, el, ec);
 				}
 			else
 				{
