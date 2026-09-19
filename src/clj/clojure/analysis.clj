@@ -78,6 +78,9 @@
 ;;   :next-fid        long          global unique-id source for forms (shared)
 ;;   :file-mtime      {source long}   per-file on-disk mtime baseline (§9); a live file
 ;;                                    whose mtime differs is "changed"
+;;   :non-files       #{source}     the sources a jar answers to, so changed-files can
+;;                                  skip resolving them (§9); dropped by
+;;                                  classpath-changed!, refilled as they are resolved
 ;; derived (built by build-index from :forms, cached keyed by :forms identity):
 ;;   :usages          {qsym  #{span}}       qsym = fully-qualified var name (my.ns/foo)
 ;;                                          span = a Span record (compact, primitive
@@ -91,7 +94,7 @@
 ;;   :macro-deps      {ns-sym {macro-qsym #{fid}}}   compile-time edges (§9); each fid
 ;;                                          carries the expanding form's file (:source)
 (def ^:private empty-model
-  {:forms {} :source->forms {} :next-fid 0 :file-mtime {}})
+  {:forms {} :source->forms {} :next-fid 0 :file-mtime {} :non-files #{}})
 
 (defonce ^:private model (atom empty-model))
 
@@ -539,22 +542,50 @@
     (catch java.net.URISyntaxException _
       (java.io.File. (.getPath u)))))
 
-(defn- file-mtime
-  "The on-disk last-modified time of the file behind classpath resource `source`,
-  or nil if it can't be resolved to a file (never loaded from a file, moved,
-  deleted, or now behind a jar - a jar-entry URL has protocol \"jar\", not
-  \"file\"). No namespace->path munging: the source path IS the resource path.
+(defn- resolve-source
+  "How the classpath answers `source`, as [mtime jar?]:
+
+    [n false]    a file, last modified at n
+    [nil true]   something that is not a file - a jar entry, most often
+    [nil false]  nothing at all - never loaded from a file, moved, or deleted
+
+  No namespace->path munging: the source path IS the resource path.
+
+  The last two are told apart because only the middle one is worth remembering, and
+  `changed-files` remembers it. Whether a jar answers to a name is settled until the
+  classpath changes under the process; whether nothing answers to it is settled by
+  nothing at all - a file deleted and written back, a branch changed underneath - so
+  that one is asked again every time.
 
   `source` is nil for a load with no file behind it at all - load-string,
   load-reader, and anything else reaching Compiler.load without a source path -
   which is the same \"no file\" answer, not an error. io/resource would NPE on it."
   [source]
-  (when-let [u (and source (io/resource source))]
-    (when (= "file" (.getProtocol u))
-      (.lastModified (resource->file u)))))
+  (if-let [^java.net.URL u (and source (io/resource source))]
+    (if (= "file" (.getProtocol u))
+      [(.lastModified (resource->file u)) false]
+      [nil true])
+    [nil false]))
 
 (defn- record-file-mtime! [source]
-  (swap! model assoc-in [:file-mtime source] (file-mtime source))
+  (swap! model assoc-in [:file-mtime source] (first (resolve-source source)))
+  nil)
+
+(defn classpath-changed!
+  "Forget which analysed sources a jar answers to - see `changed-files`.
+
+  To be called by whatever reads the classpath again: adding a directory or a jar
+  to the loader, or noticing that one appeared. A source is skipped there because
+  a jar answered to its name last time anything asked, and that stops being true
+  the moment something earlier on the classpath answers to it instead - a file
+  written over a library namespace is a file somebody then wants reloaded, and
+  this is what lets it be seen.
+
+  Costs one resolution of every skipped source on the next `changed-files` and
+  nothing after that, so calling it when nothing changed is slow rather than
+  wrong. Not calling it when something did is wrong."
+  []
+  (swap! model assoc :non-files #{})
   nil)
 
 (defn snapshot-mtimes!
@@ -869,12 +900,27 @@
   "Analysed files (classpath-relative source paths) whose on-disk mtime differs from
   the recorded baseline - edited since last analysis/reload. A file that no longer
   resolves to a file (mtime nil - moved, deleted, or now behind a jar) is skipped:
-  reloading it would only fail, so it is not flagged."
+  reloading it would only fail, so it is not flagged.
+
+  A source a jar answers to is skipped without being resolved at all, and is
+  remembered here as one, because resolving a source costs a classloader lookup
+  per source per call and most of a real model is library namespaces read out of
+  jars - 477 of the 868 files in one measured project - none of which anybody can
+  edit. Remembered here rather than where they are analysed, which is the only
+  other place that resolves them: the set is dropped whenever the classpath
+  changes (see `classpath-changed!`), so one only ever filled by a load would sit
+  empty from the first drop until the next load."
   []
-  (let [m @model]
-    (set (for [source (keys (:source->forms m))
-               :let [now (file-mtime source)]
-               :when (and (some? now) (not= now (get-in m [:file-mtime source])))]
+  (let [m @model
+        non-files (:non-files m)
+        asked (vec (for [source (keys (:source->forms m))
+                         :when (not (contains? non-files source))]
+                     (into [source] (resolve-source source))))
+        in-jars (into #{} (for [[source _ jar?] asked :when jar?] source))]
+    (when (seq in-jars)
+      (swap! model update :non-files (fnil into #{}) in-jars))
+    (set (for [[source now] asked
+               :when (and (some? now) (not= now (get (:file-mtime m) source)))]
            source))))
 
 (defn- macro-owner
