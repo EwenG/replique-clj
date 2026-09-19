@@ -5681,11 +5681,37 @@ static public class ObjExpr implements Expr{
 
 		if(partial)
 			{
-			if(value instanceof IObj && RT.count(((IObj) value).meta()) > 0)
+			// literalMeta, not meta(): the same split the collection literals take in
+			// Vector/Map/SetExpr.parse, for the same reason and with more at stake.
+			// Under analysis the reader annotates every symbol it reads, and a quoted
+			// symbol is a CONSTANT - so 'foo, which stock emits as two pushes and a
+			// Symbol.intern, would emit that plus a four-entry map plus a withMeta.
+			// A file that is mostly quoted symbols pays that thousands of times over,
+			// and sci/impl/namespaces.cljc - already split by a macro named
+			// avoid-method-too-large, because it sits at the 64K method limit on stock -
+			// went over it with "Method code too large!". It also put reader positions on
+			// values the program can read back: (meta 'foo) came out annotated where
+			// stock gives nil.
+			//
+			// Nothing needs them here. The positions are read during analysis, off the
+			// form the analyzer holds; what is emitted is the value the program will
+			// see at runtime, and that value is stock's. User-written metadata survives
+			// exactly as before, and with recordPositions() off literalMeta hands back
+			// meta() unchanged, so stock compilation is untouched by construction.
+			//
+			// This is the emitted path only. A constant evaluated rather than compiled -
+			// which is every quoted value under a plain load, since ConstantExpr.eval
+			// hands back the object the analyzer holds - keeps its reader positions, so
+			// the symbols inside (:arglists (meta #'f)) are still annotated under
+			// analysis where stock gives nil. That costs no bytecode and nothing reads
+			// it: = ignores metadata and *print-meta* is off, so it shows up only for
+			// somebody who went looking. Stripping it would mean walking every quoted
+			// structure at analyze time, which is a real cost for a cosmetic gain.
+			IPersistentMap vmeta = literalMeta(value);
+			if(RT.count(vmeta) > 0)
 				{
 				gen.checkCast(IOBJ_TYPE);
-                Object m = ((IObj) value).meta();
-				emitValue(elideMeta(m), gen);
+				emitValue(elideMeta(vmeta), gen);
 				gen.checkCast(IPERSISTENTMAP_TYPE);
 				gen.invokeInterface(IOBJ_TYPE,
 				                    Method.getMethod("clojure.lang.IObj withMeta(clojure.lang.IPersistentMap)"));
