@@ -359,6 +359,23 @@
     (an/retract-file! source)
     (is (nil? (an/definition 'cache.a/x)))))
 
+(deftest the-query-indexes-are-built-once-per-form-log
+  ;; The other half of the bargain the test above tests one side of: the indexes
+  ;; are replayed from the whole form log, so every query would pay for the whole
+  ;; model if asking twice built them twice. Nothing public exposes the cache, and
+  ;; nothing public can tell a hit from a miss - a correct answer is a correct
+  ;; answer either way - so the test asks the private for the index itself and
+  ;; looks at its identity. The model is deliberately not empty: an empty index is
+  ;; built from constants, and would come back identical from a cache that had
+  ;; never worked at all.
+  (let [source (written! "cachehit/a.clj"
+                         "(ns cachehit.a)"
+                         "(def x 1)")]
+    (analysed! source)
+    (let [idx (#'an/derived @@#'an/model)]
+      (is (seq (:defs idx)))
+      (is (identical? idx (#'an/derived @@#'an/model))))))
+
 (deftest nothing-is-recorded-without-the-sink
   (let [source (written! "nosink/a.clj"
                          "(ns nosink.a)"
@@ -555,6 +572,37 @@
     ;; A self-edge would leave topo-order with no file it could place first, so it
     ;; would give up and load them in whatever order the set came out in.
     (is (= {a #{m}} (macro-graph)))))
+
+(deftest the-macro-graph-is-built-once-per-form-log
+  ;; The graph is a pure function of the form log, and the editor's freshness gate
+  ;; asks what is stale - hence for the graph - before every find-usages, so it is
+  ;; cached on the identity of :forms rather than rebuilt from every macro-dep edge
+  ;; in the model on each question. Two things have to hold, and the second is what
+  ;; makes the first safe to do: asked twice of an untouched model it is the very
+  ;; same map, and asked of a model that has moved on it is a map built from what
+  ;; the model now says. The graph is deliberately never empty here - an empty one
+  ;; is the constant {}, so a cache that had never worked at all would still hand
+  ;; back an identical value for it.
+  (let [m (written! "cached/m.clj"
+                    "(ns cached.m)"
+                    "(defmacro plus [x] (list '+ x 1))")
+        a (written! "cached/a.clj"
+                    "(ns cached.a (:require [cached.m]))"
+                    "(def am (cached.m/plus 1))")
+        b (written! "cached/b.clj"
+                    "(ns cached.b (:require [cached.m]))"
+                    "(def bm (cached.m/plus 2))")]
+    (analysed! m a)
+    (let [graph (macro-graph)]
+      (is (= {a #{m}} graph))
+      (is (identical? graph (macro-graph)))
+      (testing "a file analysed since is in the graph"
+        (analysed! b)
+        (is (= {a #{m} b #{m}} (macro-graph)))
+        (is (not (identical? graph (macro-graph)))))
+      (testing "and a file retracted since is out of it"
+        (an/retract-file! b)
+        (is (= {a #{m}} (macro-graph)))))))
 
 (deftest a-macro-dependency-orders-a-reload
   (testing "a file's macro dependencies are loaded before it"

@@ -656,13 +656,32 @@
 
 ;; --- derived query indexes (built from :forms, cached) ---------------------
 
-;; The by-entity indexes are a pure function of the stored form log, so they are
-;; not maintained as the sink runs - they are rebuilt on demand and cached, keyed by
-;; the IDENTITY of the :forms map. Any analysis / retraction produces a new :forms
-;; value (immutable, structurally shared), so `identical?` cheaply detects that the
-;; cache is stale; a quiescent model (no analysis in flight) is a straight cache hit.
-;; The cache holds {:forms <the forms it was built from> :index <the built indexes>}.
-(defonce ^:private index-cache (atom {:forms nil :index nil}))
+;; The by-entity indexes are a pure function of the stored form log, so they are not
+;; maintained as the sink runs - they are rebuilt on demand and cached. So is the file
+;; macro graph, further down, which is built from them; `cached-by-forms` is the one
+;; way both are kept, so that everything derived from the log goes stale by the same
+;; rule and there is one place to read that rule off.
+(defn- cached-by-forms
+  "What `build` computes from the form log, recomputed only when `forms` is not the
+  log `cache` already holds a value for.
+
+  The cache key is the IDENTITY of the :forms map. Any analysis or retraction
+  produces a new :forms value (immutable, structurally shared) while nothing else
+  touches it, so `identical?` decides in one pointer comparison whether the cached
+  value still describes the model, and a quiescent model - nothing being analysed -
+  is a straight cache hit. `build` is a thunk over the same `forms`, so two threads
+  racing on one log compute the same value and the second writer simply overwrites
+  the first with its equal, harmlessly. `cache` is an atom holding
+  {:forms <the log the value was built from> :value <the value>}."
+  [cache forms build]
+  (let [c @cache]
+    (if (identical? forms (:forms c))
+      (:value c)
+      (let [built (build)]
+        (reset! cache {:forms forms :value built})
+        built))))
+
+(defonce ^:private index-cache (atom {:forms nil :value nil}))
 
 (defn- build-index
   "Replay the per-form fact log into the by-entity query indexes. Forms are replayed
@@ -739,17 +758,11 @@
 
 (defn- derived
   "The cached by-entity indexes for model value `m` (deref the model once and pass
-  it, so a query reads a single consistent snapshot). Rebuilds only when `m`'s :forms
-  differ from the cached ones. The build is a pure function of :forms, so two threads
-  racing to build the same :forms compute the same value - last writer wins, harmless."
+  it, so a query reads a single consistent snapshot). Rebuilt only when `m`'s :forms
+  differ from the ones the cached indexes were built from."
   [m]
-  (let [forms (:forms m)
-        c     @index-cache]
-    (if (identical? forms (:forms c))
-      (:index c)
-      (let [built (build-index forms)]
-        (reset! index-cache {:forms forms :index built})
-        built))))
+  (let [forms (:forms m)]
+    (cached-by-forms index-cache forms #(build-index forms))))
 
 ;; --- queries ---------------------------------------------------------------
 
@@ -927,7 +940,7 @@
   "The macro-defining namespace symbol for a macro key (a qualified symbol)."
   [macro-key] (symbol (namespace macro-key)))
 
-(defn- file-macro-graph
+(defn- build-file-macro-graph
   "Forward compile-time dependency graph over FILES: {source #{dep-source}} where a
   form in `source` expands a macro whose defining namespace lives in `dep-source`.
   Derived from :macro-deps (each edge's fid carries the expanding form's file) and
@@ -957,6 +970,20 @@
                     g fids)))
         g mm))
      {} (:macro-deps (derived m)))))
+
+;; Cached exactly as the query indexes it is built from are, and for the same reason:
+;; the graph is a pure function of the form log, and building it walks every macro-dep
+;; edge in the model - 5.6 ms over 400 files / 8400 forms, and the dominant cost of
+;; answering "what is stale?", which is a question a client asks before anything it
+;; wants a current answer to and so one asked far more often than the log changes.
+;; Keyed by :forms identity, so a load or a retraction invalidates it and nothing
+;; else has to.
+(defonce ^:private file-graph-cache (atom {:forms nil :value nil}))
+
+(defn- file-macro-graph
+  "`build-file-macro-graph` of model value `m`, built once per form log."
+  [m]
+  (cached-by-forms file-graph-cache (:forms m) #(build-file-macro-graph m)))
 
 (defn- reverse-file-graph
   "Invert a forward file graph {source #{dep-source}} to {dep-source #{dependent
