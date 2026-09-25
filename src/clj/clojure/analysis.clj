@@ -43,7 +43,7 @@
       :author "replique-clj"}
     clojure.analysis
   (:require [clojure.java.io :as io])
-  (:import [clojure.lang IAnalysisSink Compiler Var]))
+  (:import [clojure.lang IAnalysisSink Compiler RT Var]))
 
 ;; Vars are keyed by their fully-qualified name symbol (my.ns/foo), not by Var
 ;; object identity: a var deleted and later redefined mints a NEW Var object, so
@@ -442,7 +442,10 @@
       (add-fact! of CAT-LOCALUSE (local-span binding source line column el ec ns)))
     nil)
   (keywordUsage [_ kw from-ns source line column el ec]
-    (when-let [of (current-form)]
+    ;; The branch of a reader conditional this platform does not take is read with
+    ;; *suppress-read* on: it is another platform's code, not this program's. A #_
+    ;; discard is read normally and IS recorded - it is still written in the file.
+    (when-let [of (when-not (RT/suppressRead) (current-form))]
       (add-fact! of CAT-KEYWORDS (span kw source line column el ec from-ns nil)))
     nil)
   (classUsage [_ c from-ns source line column el ec]

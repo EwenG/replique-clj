@@ -194,6 +194,20 @@
 
 ;; --- what the sink records -------------------------------------------------
 
+(deftest keywords-in-code-the-program-does-not-run
+  (let [_ (written! "records/k.cljc"
+                    "(ns records.k)"
+                    "#_(def k0 :top-discard)"
+                    "(def k1 [1 #_:nested-discard 2])"
+                    "(def k2 #?(:clj :clj-branch :cljs :cljs-branch))")]
+    (an/run-analysis #(load "/records/k"))
+    (testing "a #_ discard is still written in the file, at the top level or nested"
+      (is (= [2] (map :line (an/find-keyword-usages :top-discard))))
+      (is (= [3] (map :line (an/find-keyword-usages :nested-discard)))))
+    (testing "the branch of a reader conditional this platform does not take is not"
+      (is (= [4] (map :line (an/find-keyword-usages :clj-branch))))
+      (is (empty? (an/find-keyword-usages :cljs-branch))))))
+
 (deftest what-a-loaded-file-records
   (let [source (written! "records/a.clj"
                          "(ns records.a)"

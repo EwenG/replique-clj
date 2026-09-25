@@ -16,7 +16,8 @@ Implementation progress (see §10 for the full sequence):
   - **A. Locals** — `registerLocal` + `analyzeSymbol` local branch; `localDef`/`localUsage`;
     `unused-locals` query. Synthetic (macro-introduced) locals filtered via `isSourceSymbol`.
   - **B. Keywords** — reader-side `keywordUsage` (keywords can't hold metadata); auto-resolved
-    `::x`/`::alias/x` indexed fully-qualified; `find-keyword-usages`.
+    `::x`/`::alias/x` indexed fully-qualified; `find-keyword-usages`. A reader conditional's untaken branch (read under
+    `*suppress-read*`) records nothing; a `#_` discard is still recorded.
   - **C. Interop** — `classUsage` from `HostExpr.maybeClass` + the two `analyzeSymbol` class
     branches; `(Foo. ...)` position carried through the constructor desugaring in `macroexpand1`
     (`carryClassPosition`). Covers `new`, type hints, static/instance members. `find-class-usages`.
