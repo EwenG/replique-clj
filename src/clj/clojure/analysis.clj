@@ -35,7 +35,8 @@
   written on disk and never reflects an un-saved REPL eval.
 
   Drivers: run-analysis (cold), load-file! (single file, atomic), stale-reload!
-  (macro-aware cascade, §9), retract-file!. Query with find-usages, definition,
+  (macro-aware cascade, §9), reload-files! (a given set, in macro order),
+  retract-file!. Query with find-usages, definition,
   unused-*, file-namespaces, etc. - find-usages/definition take a Var or its
   fully-qualified name symbol.
 
@@ -1117,12 +1118,13 @@
                             (dep-fn x)))
             order)))
 
-(defn stale-reload!
-  "Macro-aware stale reload (design §9.2). Computes the stale set (changed files +
-  their transitive macro-dependent files), reloads each via load-file! in macro-
+(defn reload-files!
+  "Reload `files` (classpath-relative source paths) via load-file! in macro-
   dependency (topological) order - macro-defining files before the files that
-  re-expand them - and optionally prunes vanished vars (:prune true). Returns the
-  final reload order (a vector of source paths).
+  re-expand them - and optionally prune vanished vars (:prune true). Returns the
+  final reload order (a vector of source paths). stale-reload! is this over
+  stale-files; clojure.cljs.analysis calls it over the macro files a ClojureScript
+  compile depends on.
 
   Fail-fast, like require: if a file fails to compile, load-file! re-throws and the
   reload stops there (files later in the order, and the second pass, do not run).
@@ -1146,7 +1148,7 @@
   version). An edit that calls a macro which did not exist in the dependency's old
   version can still make pass 1 error if misordered; ordering by the new requires
   would be needed for that, which this does not do."
-  [& {:keys [prune]}]
+  [files & {:keys [prune]}]
   (let [dep-fn  (fn [g] (fn [s] (get g s #{})))
         reload! (fn [order]
                   (doseq [source order]
@@ -1156,7 +1158,7 @@
                     (let [prior (when prune (file-def-var-snapshot @model source))]
                       (load-file! source)
                       (when prune (prune-file! source prior)))))
-        stale   (stale-files)
+        stale   (set files)
         order1  (topo-order stale (dep-fn (file-macro-graph @model)))]
     (reload! order1)
     ;; Pass 1 completed the macro graph; re-derive the order from it.
@@ -1166,6 +1168,15 @@
         (let [order2 (topo-order stale df)]
           (reload! order2)
           order2)))))
+
+(defn stale-reload!
+  "Macro-aware stale reload (design §9.2): reload-files! over the stale set
+  (stale-files - changed files + their transitive macro-dependent files), in
+  macro-dependency order, optionally pruning vanished vars (:prune true). Returns
+  the final reload order (a vector of source paths). Fail-fast, two-pass - see
+  reload-files!."
+  [& {:keys [prune]}]
+  (reload-files! (stale-files) :prune prune))
 
 (defn snapshot
   "The whole model, for inspection/tests: the stored form log merged with the derived
