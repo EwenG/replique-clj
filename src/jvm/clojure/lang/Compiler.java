@@ -902,7 +902,28 @@ public static class TheVarExpr implements Expr{
 			Symbol sym = (Symbol) RT.second(form);
 			Var v = lookupVar(sym, false);
 			if(v != null)
+				{
+				// #'foo is a reference to the var, written where it is written, and
+				// the one place the analysis would otherwise miss one: (var foo)
+				// resolves here and never reaches analyzeSymbol, so without this a
+				// (alter-var-root #'a/b ...) or a (binding [*x* v] ...) - whose
+				// expansion var-izes the symbol the source wrote - records nothing,
+				// and renaming the var leaves that text behind.
+				//
+				// The span is the SYMBOL's and not the reader macro's, as everywhere
+				// else: what a client replaces is the name, and the #' in front of it
+				// stays. Guarded by isSourceSymbol for analyzeSymbol's reason - a
+				// symbol a macro conjured carries no position and is not a place in
+				// anybody's file.
+				IAnalysisSink sink = analysisSink();
+				if(sink != null && isSourceSymbol(sym))
+					{
+					int[] pos = symbolPosition(sym);
+					sink.varUsage(v, currentNS(), (String) SOURCE_PATH.deref(),
+					              pos[0], pos[1], pos[2], pos[3]);
+					}
 				return new TheVarExpr(v);
+				}
 			throw Util.runtimeException("Unable to resolve var: " + sym + " in this context");
 		}
 	}

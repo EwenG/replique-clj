@@ -259,6 +259,54 @@
       (is (= 6 (count (an/file-forms source))))
       (is (= (an/file-forms source) (an/ns-forms 'records.a))))))
 
+(deftest a-var-quote-is-a-usage-of-the-var
+  ;; #'a/b is a reference to the var, written where it is written - and the one
+  ;; the compiler would otherwise miss, because (var b) resolves in
+  ;; TheVarExpr$Parser and never reaches analyzeSymbol. What is behind it in real
+  ;; code is alter-var-root, add-watch, a with-redefs, and binding - whose
+  ;; expansion var-izes the very symbol the source wrote.
+  (let [target (written! "vq/t.clj"
+                         "(ns vq.t)"
+                         "(def ^:dynamic *flag* true)"
+                         "(defn f [] 1)"
+                         "(defmacro m [] 1)")
+        uses   (written! "vq/u.clj"
+                         "(ns vq.u"
+                         "  (:require [vq.t :as t]))"
+                         "(def plain t/f)"
+                         "(alter-var-root #'vq.t/*flag* (constantly false))"
+                         "(alter-var-root #'t/f (constantly (fn [] 2)))"
+                         "(defn g [] (binding [t/*flag* false] (t/f)))"
+                         "(def macro-var #'t/m)"
+                         "(def quoted 'vq.t/f)"
+                         "(defmacro conjured [] (list 'var (symbol \"vq.t\" \"f\")))"
+                         "(def by-a-macro (conjured))")]
+    (analysed! target uses)
+    (testing "the span is the symbol's, so the #' in front of it stays put"
+      (let [flag (sort-by :line (an/find-usages 'vq.t/*flag*))]
+        (is (= ["vq.t/*flag*" "t/*flag*"] (mapv text-at flag)))
+        (is (= [4 6] (mapv :line flag)))
+        (is (every? #(= 'vq.u (ns-name (:from-ns %))) flag))))
+    (testing "written under an alias or in full, it is the same var"
+      (let [f (sort-by :line (an/find-usages 'vq.t/f))]
+        (is (= ["t/f" "t/f" "t/f"] (mapv text-at f)))
+        (is (= [3 5 6] (mapv :line f)))))
+    (testing "a macro can be var-quoted where it cannot be called for its value"
+      (let [m (an/find-usages 'vq.t/m)]
+        (is (= 1 (count m)))
+        (is (= "t/m" (text-at (first m))))))
+    (testing "and a QUOTED symbol is still not a usage: it is data, and what it
+    names is decided, if ever, at run time"
+      (is (not-any? #(= 8 (:line %)) (an/find-usages 'vq.t/f))))
+    (testing "nor is a var-quote a macro CONJURED, which is written in nobody's
+    file: the symbol carries no reader position, and recording it would put a
+    place-to-go at the line of whatever expanded it"
+      (is (not-any? #(= 10 (:line %)) (an/find-usages 'vq.t/f))))
+    (testing "the def of the macro that defines a name is not a usage of it
+    either - defmacro's own expansion var-quotes the name twice"
+      (let [m (an/find-usages 'vq.t/m)]
+        (is (= [7] (mapv :line m)))))))
+
 (deftest a-second-analysis-of-a-file-replaces-the-first
   (let [source (written! "again/a.clj"
                          "(ns again.a)"

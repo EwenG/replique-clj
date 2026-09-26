@@ -320,6 +320,37 @@
       (aset pos 1 (long column))))
   nil)
 
+(defn- def-echo?
+  "Is `s` a usage sitting exactly on one of `defs`? A macro that defines a name
+  often writes that same symbol again in its expansion - `defmacro' hands the
+  name to `(. (var name) (setMacro))' and returns `(var name)' - and the copy
+  carries the reader's position, so it passes the capture rule and arrives as a
+  reference to the var at the very place the var is being defined. It is the
+  definition seen twice, not a use.
+
+  Only a var-quote can produce one: a def's name never reaches `analyzeSymbol'.
+  `clojure.cljs.analysis' has the same rule for the same reason, and had it
+  first - there a `deftype' expansion echoes the type's name."
+  [defs ^Span s]
+  (contains? defs [(.entity s) (.line s) (.column s)]))
+
+(defn- drop-def-echoes!
+  "Remove from this form's usages the ones that are its own defs seen twice.
+
+  Per FORM, which is the scope that makes it safe: a var-quote of a name defined
+  somewhere else in the same file is a real reference and is kept, and so is one
+  written on the same line as a def of a DIFFERENT var. What is dropped is a
+  usage of the very var this form defines, at the very position the def is
+  recorded at."
+  [^objects cats]
+  (let [^java.util.ArrayList uses (aget cats CAT-USAGES)
+        ^java.util.ArrayList defs (aget cats CAT-DEFS)]
+    (when (and uses defs (not (.isEmpty uses)) (not (.isEmpty defs)))
+      (let [at (into #{} (map (fn [^Span s] [(.entity s) (.line s) (.column s)])) defs)]
+        (.removeIf uses (reify java.util.function.Predicate
+                          (test [_ x] (boolean (def-echo? at x))))))))
+  nil)
+
 (defn- end-form! []
   (let [^OpenForm of (current-form)]
     (when *form-stack* (swap! *form-stack* pop))
@@ -333,6 +364,7 @@
     ;; commit-frame! turns it into the fid. Filed under the frame's :source (the file).
     (when of
       (let [^objects cats (.cats of)]
+        (drop-def-echoes! cats)
         (when (some #(let [^java.util.ArrayList l (aget cats (long %))]
                        (and l (not (.isEmpty l))))
                     (range N-CATS))

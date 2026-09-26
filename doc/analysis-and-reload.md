@@ -212,6 +212,7 @@ Few and centralized:
 | --- | --- |
 | var **usage** | `analyzeSymbol` var branch (`Compiler.java:7910`, the `registerVar(v); return new VarExpr(v)` path), gated on `isSourceSymbol` |
 | var / class **usage in a syntax-quote body** | `LispReader.syntaxQuote` → `Compiler.sinkSyntaxQuoteRef`: templated references (macro bodies) captured at read time, positioned at the written symbol |
+| var **usage at a var-quote** | `TheVarExpr.Parser.parse`: `#'a/b` resolves here and never reaches `analyzeSymbol`, so without this an `alter-var-root`, an `add-watch`, a `with-redefs` or a `binding` - whose expansion var-izes the very symbol the source wrote - records nothing. Gated on `isSourceSymbol`, positioned at the symbol rather than at the reader macro, so what a rename replaces is the name and the `#'` stays |
 | local **usage** | `analyzeSymbol` local branch (`Compiler.java:7869`, `LocalBindingExpr`) |
 | local **definition** (+ scope extent) | `registerLocal` (`Compiler.java:7313`); `let`/`loop`/`fn` parsers for scope entry/exit |
 | var **definition** | `DefExpr.Parser.parse` (`Compiler.java:524`, already calls `registerVar`) |
@@ -219,6 +220,16 @@ Few and centralized:
 | macro **usage** + compile-time edge | `macroexpand1` (`Compiler.java:7566`): always record the compile-time edge "this file depends on M"; record the "macro M used here" usage only for a source-written call (the macro name is textually present) |
 | keyword usage | in the **reader**, at `::` resolution (`matchSymbol`) — see §6 |
 | require / refer / alias / import | do **not** parse `ns` forms; let them run, then read `Namespace` alias/mapping/refer state (authoritative; handles `ns`, bare `require`, `use`, dynamic requires uniformly) |
+
+One rule cleans up after the last of those. A macro that DEFINES a name often
+writes that same symbol again in its expansion - `defmacro` hands the name to
+`(. (var name) (setMacro))` and then returns `(var name)` - and the copy carries
+the reader's position, so it arrives as a var usage sitting exactly on the def.
+`clojure.analysis`'s `drop-def-echoes!` drops a usage whose entity and position
+match a def recorded **in the same form**: it is the definition seen twice, not a
+use. Per form, so a var-quote of something defined elsewhere in the same file is
+a real reference and is kept. `clojure.cljs.analysis` has the same rule, and had
+it first - there a `deftype` expansion echoes the type's name.
 
 Output: a stream of typed, positioned semantic events, tagged with provenance (§7.2).
 
