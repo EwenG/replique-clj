@@ -21,6 +21,14 @@ Implementation progress (see §10 for the full sequence):
   - **C. Interop** — `classUsage` from `HostExpr.maybeClass` + the two `analyzeSymbol` class
     branches; `(Foo. ...)` position carried through the constructor desugaring in `macroexpand1`
     (`carryClassPosition`). Covers `new`, type hints, static/instance members. `find-class-usages`.
+    Also the interfaces a `deftype*`/`reify` names (`NewInstanceExpr.build`), which is where a
+    type says what it is. A PROTOCOL is named in source and reaches the compiler as the interface
+    it generated, so `clojure.core/parse-opts+specs` carries the written symbol's position onto
+    the substituted one (`carry-position`, `carryClassPosition`'s shape) and the occurrence lands
+    where the protocol is named; `find-usages` of a protocol merges in the class usages of its
+    `:on-interface`, so "who implements this" is answered by the same query as "who calls it".
+    The interfaces an expansion added - `reify`'s `IObj`, `defrecord`'s `IRecord` and the rest -
+    carry no position and are not recorded, by the capture rule below.
   - **D. Macro edges** — `macroexpand1` tap emits `macroExpansion`, always feeding the
     `:macro-deps` compile-time dependency graph that drives §9 stale reload, and feeding
     `:usages` (macro calls bypass `analyzeSymbol`) only for source-written calls. `:inline`
@@ -166,6 +174,17 @@ so normal reads are unaffected in behaviour and speed. Scope:
   form-level diagnostics (duplicate keys, etc.).
 - **Literals** (numbers, strings, chars, `nil`, `true/false`, regex) — skip until a specific
   lint needs them. They have no reference identity, so find-usages is meaningless for them.
+
+**Where the end of a span comes from.** Not from where the reader stands: a token is terminated
+by reading one character past it and putting it back, and `LineNumberingPushbackReader.unread`
+cannot give a newline back — the wrapped `LineNumberReader` has already counted the line, and
+unread only decrements the column. Read that way, a name that ends its line ends at column 0 of
+the next one, which no editor can highlight and no `subs` can cut. So the reader keeps a second
+pair of coordinates beside the stock line and column — moved only by a character that stays read,
+rolled back by `unread`, and exposed as `getEndLineNumber`/`getEndColumnNumber`. Every end
+position is read from those; the stock pair is untouched, so nothing that was reading it shifts.
+ClojureScript reads through the same `LispReader` (`clojure.cljs.reader`), so its spans are the
+same spans.
 
 **The capture rule: a usage is recorded exactly where the referenced name is textually
 present in source.** Because positions are attached *in the reader*, only user-written nodes
@@ -493,8 +512,15 @@ the explicit operation that removes vars whose defining form vanished from the s
 - Uses **def provenance** (§7.2): "form at position P defined vars {…}" — a form removed from
   source ⇒ prune exactly the vars that form defined (handles the multi-var `defprotocol` /
   `defrecord` / `defmulti` cases that name-set diffing gets wrong).
-- The prune itself is `ns-unmap`, **runtime-only** (each pruned var unmapped in its own home
-  namespace — a file's vars may span several). The model side is already reconciled by
+- The prune itself is `ns-unmap`, **runtime-only**, and it unmaps each pruned var **wherever any
+  namespace maps it** — its own home (a file's vars may span several), and every namespace that
+  `refer`red it, under the name that namespace refers it as. One sweep over `ns-map` finds all
+  three cases (interned, referred, referred-and-renamed) and finds each by the name it is written
+  as; the match is by **Var identity**, so a namespace with a var of its own under the same name
+  keeps it. Leaving a refer behind would leave the name resolving in the referring file while the
+  defining file no longer says it — the state prune exists to get out of, and the one that file
+  would next be compiled against. The walk is only taken when something was actually pruned, so a
+  reload that deleted nothing pays nothing. The model side is already reconciled by
   `load-file!`'s retract before `prune-file!` runs: a deleted def still referenced by other forms
   becomes a **tombstone** in `:defs` (`:removed true`, its `:usages` preserved so the now-dangling
   references stay findable), and once its last reference is gone the tombstone is dropped by
@@ -521,6 +547,17 @@ the explicit operation that removes vars whose defining form vanished from the s
   `ns-unmap`+re-`intern`) is a different object, so it is preserved rather than destroyed. The
   "still deleted" test is "no healthy `:defs` entry for it **anywhere**" — so a def *moved* to
   another file that has since been reloaded (both files are stale, both reload) is not pruned.
+- **A second sweep for protocol methods.** A `defprotocol`'s method vars are `intern`ed, never
+  `def`-ed, so def provenance says nothing about them and the identity-guarded first sweep can
+  never be their judge. The protocol is, and it is the authority: after the def sweep,
+  `prune-file!` walks the protocols F defines - those the sweep just unmapped included - and
+  unmaps every var in the protocol's home namespace whose `:protocol` is **identical** to that
+  protocol var and whose name its live `:sigs` no longer lists (all of them when the protocol
+  itself has gone). So deleting a method from a protocol, or deleting the whole `defprotocol`,
+  stops the name resolving instead of leaving a var that answers to nobody: today's failure is a
+  runtime `No implementation of method: :m of protocol: #'ns/P`, which reads like a missing
+  `extend-type` rather than like code that is behind. A var an explicit `intern` made is still
+  left alone - nothing records it, and nothing else speaks for it either.
 - **Precondition: prune only right after a full (re)analysis of F.** Prune deletes vars that were
   in F's pre-reload defs but that the model now records no healthy `:defs` entry for, reading that
   absence as "deleted from source." That equivalence holds only when `:defs` was *just* fully
@@ -533,8 +570,11 @@ the explicit operation that removes vars whose defining form vanished from the s
 **Out of scope for v1 (note so they aren't surprises):**
 - `defmethod` is **not a var** — removing one mutates a multimethod, needing method-level
   provenance ("form P added dispatch value V to multi M"), a parallel mechanism.
-- **Refers aren't owned by a file** — `refer`/`use` put other namespaces' mappings in a namespace's
-  map. Prune only vars where `var.ns` is a namespace the file defines; leave refers to the require graph.
+- ~~**Refers aren't owned by a file**~~ — they are not, but leaving them was worse: a referred name
+  went on resolving after the def behind it was pruned, so the two halves of one name disagreed.
+  Prune now sweeps them too (see the `ns-unmap` bullet above). What is still out of scope is
+  putting one back: a refer the source still asks for is restored by reloading the file that asks,
+  not by prune.
 - `declare` / forward decls define a var with no root — provenance handles them; don't mistake
   "no root value" for "not defined."
 

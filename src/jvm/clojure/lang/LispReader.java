@@ -178,7 +178,8 @@ static Object attachCollectionPosition(Object coll, PushbackReader r, boolean re
 	if(rec && coll instanceof IObj)
 		{
 		LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
-		return attachSourcePosition((IObj) coll, startLine, startColumn, lr.getLineNumber(), lr.getColumnNumber());
+		return attachSourcePosition((IObj) coll, startLine, startColumn,
+		                            lr.getEndLineNumber(), lr.getEndColumnNumber());
 		}
 	return coll;
 }
@@ -412,7 +413,7 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 				{
 				LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
 				ret = attachSourcePosition((IObj) ret, startLine, startColumn,
-				                           lr.getLineNumber(), lr.getColumnNumber());
+				                           lr.getEndLineNumber(), lr.getEndColumnNumber());
 				}
 			else if(recordPos && ret instanceof Keyword)
 				{
@@ -423,7 +424,8 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 					LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
 					sink.keywordUsage((Keyword) ret, Compiler.currentNS(),
 					                  (String) Compiler.SOURCE_PATH.deref(),
-					                  startLine, startColumn, lr.getLineNumber(), lr.getColumnNumber());
+					                  startLine, startColumn,
+					                  lr.getEndLineNumber(), lr.getEndColumnNumber());
 					}
 				}
 			return ret;
@@ -1398,12 +1400,12 @@ public static class ListReader extends AFn{
 				// Analysis fast path: a freshly read list has no metadata, so the four
 				// position keys become ONE SpanMeta (primitive ints, no array, no
 				// boxing) instead of four chained assocs. Same keys, same order, same
-				// values (getLineNumber before getColumnNumber, as the assocs did) -
+				// values (the end pair read in the same order as the assocs read it) -
 				// an = map, just cheaper. The sink-off path below is untouched and
 				// stays byte-for-byte stock.
 				LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
-				int el = lr.getLineNumber();
-				int ec = lr.getColumnNumber();
+				int el = lr.getEndLineNumber();
+				int ec = lr.getEndColumnNumber();
 				meta = new SpanMeta(line, column, el, ec);
 				}
 			else
@@ -1413,8 +1415,8 @@ public static class ListReader extends AFn{
 				if(rec)
 					{
 					LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
-					meta = RT.assoc(meta, END_LINE_KEY, lr.getLineNumber());
-					meta = RT.assoc(meta, END_COLUMN_KEY, lr.getColumnNumber());
+					meta = RT.assoc(meta, END_LINE_KEY, lr.getEndLineNumber());
+					meta = RT.assoc(meta, END_COLUMN_KEY, lr.getEndColumnNumber());
 					}
 				}
 			return s.withMeta((IPersistentMap)meta);

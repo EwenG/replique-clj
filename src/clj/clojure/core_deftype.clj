@@ -50,11 +50,29 @@
              (drop-while seq? (next s)))
       ret)))
 
+(defn- carry-position
+  "`to`, carrying the reader position of `from` where it has one.
+
+  A protocol is named in source and reaches the compiler as the interface it
+  generated (see parse-opts+specs), which is a symbol nothing wrote and no position
+  points at - so the analysis, which records only what source wrote, would see a
+  type implement nothing. Carrying the position over is what makes implementing a
+  protocol a place where the protocol is written.
+
+  Nothing to carry unless the reader was recording positions, which it does only
+  while the analysis is on: without them this is the symbol it was given, and
+  macroexpansion is what it always was."
+  [from to]
+  (let [m (meta from)]
+    (if (and (:line m) (instance? clojure.lang.IObj to))
+      (with-meta to (select-keys m [:line :column :end-line :end-column]))
+      to)))
+
 (defn- parse-opts+specs [opts+specs]
   (let [[opts specs] (parse-opts opts+specs)
         impls (parse-impls specs)
         interfaces (-> (map #(if (var? (resolve %)) 
-                               (:on (deref (resolve %)))
+                               (carry-position % (:on (deref (resolve %))))
                                %)
                             (keys impls))
                        set

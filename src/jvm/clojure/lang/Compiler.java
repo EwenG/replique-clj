@@ -8959,9 +8959,20 @@ static public class NewInstanceExpr extends ObjExpr{
 		PersistentVector interfaces = PersistentVector.EMPTY;
 		for(ISeq s = RT.seq(interfaceSyms);s!=null;s = s.next())
 			{
-			Class c = (Class) resolve((Symbol) s.first());
+			Symbol isym = (Symbol) s.first();
+			Class c = (Class) resolve(isym);
 			if(!c.isInterface())
 				throw new IllegalArgumentException("only interfaces are supported, had: " + c.getName());
+			// The interface a deftype/defrecord/reify names, which is the one place a
+			// type says what it is. sinkClassUsage takes only a source-written symbol,
+			// which is the filter that matters here: the interfaces a macro added -
+			// reify's IObj, defrecord's IRecord/IHashEq/java.util.Map and the rest -
+			// carry no reader position and are nothing anybody wrote, while a protocol
+			// arrives carrying the position of the symbol the source DID write
+			// (clojure.core/parse-opts+specs), so implementing a protocol is recorded
+			// where the protocol is named. See clojure.analysis/find-usages, which
+			// reads a protocol's implementations back out of the class index.
+			sinkClassUsage(c, isym);
 			interfaces = interfaces.cons(c);
 			}
 		Class superClass = Object.class;

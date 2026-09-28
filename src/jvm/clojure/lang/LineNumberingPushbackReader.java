@@ -30,6 +30,20 @@ private boolean _prev;
 private int _columnNumber = 1;
 private StringBuilder sb = null;
 
+// The position just past the last character that stayed read - what the end of a
+// source span wants, and what the line and column above cannot answer. A token is
+// terminated by reading one character too many and unreading it, and by then read()
+// has already moved them: for a newline the wrapped LineNumberReader has counted the
+// line and unread only decrements the column, so a name that ends its line reports as
+// ending at column 0 of the next one. End of input moves them the same way and leaves
+// nothing to unread. These four are kept alongside instead, so that nothing existing
+// shifts: the first pair moves only for a character that stays read, and unread rolls
+// it back by the one step a single-character pushback can need.
+private int _endLine = 1;
+private int _endColumn = 1;
+private int _prevEndLine = 1;
+private int _prevEndColumn = 1;
+
 public LineNumberingPushbackReader(Reader r){
 	super(new LineNumberReader(r));
 }
@@ -62,18 +76,41 @@ public int getColumnNumber(){
 	return _columnNumber;
 }
 
+// The line and column just past the last character consumed. See the fields.
+public int getEndLineNumber(){
+	return _endLine;
+}
+
+public int getEndColumnNumber(){
+	return _endColumn;
+}
+
 public int read() throws IOException{
     int c = super.read();
     _prev = _atLineStart;
+    _prevEndLine = _endLine;
+    _prevEndColumn = _endColumn;
     if((c == newline) || (c == -1))
         {
         _atLineStart = true;
         _columnNumber = 1;
+        if(c == newline)
+            {
+            // Just past a newline is the start of the line it ended. No span is ever
+            // taken here - every end is read at a token boundary, and a token never
+            // ends on a newline it kept - but the pair means "just past the last
+            // character consumed" and this is what keeps it meaning that. End of
+            // input consumed nothing, so it moves nothing.
+            _endLine = getLineNumber();
+            _endColumn = 1;
+            }
         }
     else
         {
         _atLineStart = false;
         _columnNumber++;
+        _endLine = getLineNumber();
+        _endColumn = _columnNumber;
         }
     if(sb != null && c != -1)
         sb.append((char)c);
@@ -84,6 +121,8 @@ public void unread(int c) throws IOException{
     super.unread(c);
     _atLineStart = _prev;
     _columnNumber--;
+    _endLine = _prevEndLine;
+    _endColumn = _prevEndColumn;
     if(sb != null)
         sb.deleteCharAt(sb.length()-1);
 }
@@ -107,6 +146,10 @@ public String readLine() throws IOException{
         _prev = false;
         _atLineStart = true;
         _columnNumber = 1;
+        _prevEndLine = _endLine;
+        _prevEndColumn = _endColumn;
+        _endLine = getLineNumber();
+        _endColumn = 1;
         break;
     }
     return line;
