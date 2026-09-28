@@ -1501,6 +1501,50 @@
       (prune-vars! source prior))
     nil))
 
+(def ^:dynamic *reload-progress*
+  "Where a reload says what it is doing while it does it, or nil.
+
+  A function of one map. reload-files! calls it before each pass and before each
+  file; stale-reload! calls it for the files it drops as gone. The maps are:
+
+    {:event :plan    :pass n :files [source ...]}   about to load these, in this order
+    {:event :loading :pass n :file source :nth i :of n}
+    {:event :deleted :files [source ...]}           these are gone and are being dropped
+
+  clojure.cljs.analysis reports a ClojureScript reload through this same var and
+  adds :dialect :cljs to its own events, because half of such a reload is Clojure
+  macro files loaded here - so a watcher that bound two vars would see half of one
+  reload in each, in no particular order relative to the other half. One stream,
+  in the order things happen; an event with no :dialect came from this side.
+
+  Nil by default, and called for its effect: a reload that nobody is watching costs
+  nothing, and what a watcher does with an event is none of this namespace's
+  business. A caller that wants the events printed binds it to something that
+  prints - which is what a REPL does, so that a reload of forty files is forty lines
+  arriving as they happen rather than one vector at the end.
+
+  WHY THE EVENTS ARE NOT JUST THE RETURN VALUE. reload-files! already answers the
+  order it loaded, and that answer arrives when the loading has finished - which is
+  exactly the moment it stops being useful. What a person wants from a reload that
+  takes twenty seconds is to see it moving, and what they want from one that never
+  comes back is the name of the file it is inside; both are questions about the
+  middle, and only something called from the middle can answer them.
+
+  Dynamic, so that the binding belongs to the thread doing the reload. Two REPLs
+  reloading at once are two threads, each printing into its own connection, and a
+  root binding would send both to whichever was set last.
+
+  Exceptions out of it are not caught. It is the caller's own function, called on
+  the caller's own thread, and a reload that failed because the thing watching it
+  threw is a failure worth seeing rather than swallowing."
+  nil)
+
+(defn- told!
+  "Tell *reload-progress* about `event`, if anything is listening."
+  [event]
+  (when-let [f *reload-progress*] (f event))
+  nil)
+
 (defn- topo-respected?
   "True when `order` already loads every file after all its macro-deps (per dep-fn).
   Deps outside `order` are ignored - they were not reloaded, so they are current."
@@ -1544,23 +1588,34 @@
   would be needed for that, which this does not do."
   [files & {:keys [prune]}]
   (let [dep-fn  (fn [g] (fn [s] (get g s #{})))
-        reload! (fn [order]
-                  (doseq [source order]
-                    ;; Snapshot the file's def-vars (with their Var identities) BEFORE
-                    ;; load-file! retracts them, so prune can tell which def forms
-                    ;; vanished - and preserve any re-created afresh (see prune-file!).
-                    (let [prior (when prune (file-def-var-snapshot @model source))]
-                      (load-file! source)
-                      (when prune (prune-file! source prior)))))
+        reload! (fn [pass order]
+                  ;; Announced before the first file rather than a file at a time,
+                  ;; because the order is the half nobody can work out: what needs
+                  ;; compiling is not what was edited, and it is known here, now,
+                  ;; before any of it has cost anything.
+                  (told! {:event :plan :pass pass :files order})
+                  (let [n (count order)]
+                    (doseq [[i source] (map-indexed vector order)]
+                      ;; BEFORE the file and not after it. A file that never
+                      ;; finishes compiling is the one worth naming, and a line
+                      ;; printed after a load names every file except that one.
+                      (told! {:event :loading :pass pass :file source
+                              :nth (inc i) :of n})
+                      ;; Snapshot the file's def-vars (with their Var identities) BEFORE
+                      ;; load-file! retracts them, so prune can tell which def forms
+                      ;; vanished - and preserve any re-created afresh (see prune-file!).
+                      (let [prior (when prune (file-def-var-snapshot @model source))]
+                        (load-file! source)
+                        (when prune (prune-file! source prior))))))
         stale   (set files)
         order1  (topo-order stale (dep-fn (file-compile-graph @model)))]
-    (reload! order1)
+    (reload! 1 order1)
     ;; Pass 1 completed the macro graph; re-derive the order from it.
     (let [df (dep-fn (file-compile-graph @model))]
       (if (topo-respected? order1 df)
         order1
         (let [order2 (topo-order stale df)]
-          (reload! order2)
+          (reload! 2 order2)
           order2)))))
 
 (defn stale-reload!
@@ -1584,6 +1639,7 @@
   [& {:keys [prune]}]
   (let [stale   (stale-files)
         deleted (deleted-files)]
+    (when (seq deleted) (told! {:event :deleted :files (vec (sort deleted))}))
     (doseq [source (sort deleted)] (drop-deleted-file! source prune))
     (reload-files! stale :prune prune)))
 
