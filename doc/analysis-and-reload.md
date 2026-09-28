@@ -504,6 +504,42 @@ a deliberately-skipped staleness hole; `:inline` is rare.)
 macroexpansion, so "re-evaluate macro calls only when recompiling stale files" needs nothing
 beyond the version edges + topo reload above.
 
+**Files that are gone.** A file whose source has been deleted (or renamed, or moved off the
+classpath) is not stale — staleness is "load it again", and there is nothing to load it from — so
+`changed-files` skips it and always did. It is not current either: the process still holds what
+the file defined, and the model still answers `definition` with a file no editor can open. So
+`stale-reload!` asks `deleted-files` as well as `stale-files`, and **drops** what it names
+(`drop-deleted-file!`) before loading anything:
+
+- its forms leave the model unconditionally — a record of what was read out of files cannot go on
+  answering for a file that cannot be read, and nothing will ever flag a gone file as changed, so
+  a reload that left it would leave it for good. `retract-file!` drops its staleness baselines with
+  its forms, so a dropped file is one the model has nothing left to say about;
+- with `:prune`, everything it defined is unmapped — the same prune a reloaded file gets, with the
+  whole file playing the part of the deleted `def`: no live form defines any of it, so all of it
+  goes, wherever it is mapped (§9.3), protocol methods included;
+- and its namespaces stop being **loaded libs** (`forget-lib!`, matching
+  `clojure.tools.namespace`'s `remove-lib`), unless another file still defines one of them. The
+  `ns` form in the file is what put the name in `*loaded-libs*`, whatever loaded the file, so
+  taking it out undoes what the file did — and it is what makes `(require 'that.ns)` say what the
+  disk says instead of finding the dead entry and doing nothing.
+
+The namespace **object** is left standing, with its aliases, its imports and any var an `intern`
+made in it. `remove-ns` would take all of that, and the model speaks for none of it; what is
+removed here is removed one definition at a time, each because the model recorded the file
+defining it.
+
+Deleted files are dropped **before** the stale files are loaded, as on the ClojureScript side, so
+that a stale file still using a gone definition fails where it uses it rather than compiling clean
+against a file nobody can open. They never seed the cascade and are not in the reload's answer:
+the files that expanded a deleted file's macros keep the expansion they have, which is a fact
+about what their source now says, and they say so the next time anything compiles them.
+
+Not a watcher. Whether a file is gone or merely between two writes is a question nothing can
+answer from the filesystem alone, and an editor that saves by writing a new file over the old one
+is a process where the answer changes twice per save — so `deleted-files` is asked by
+`stale-reload!`, which is asked for by hand, and never polled.
+
 ### 9.3 Prune — the explicit "undefine"
 
 The surgical counterpart to "vars persist" (§5). Default reload keeps vars alive; **prune** is

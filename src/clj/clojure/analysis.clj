@@ -36,7 +36,8 @@
 
   Drivers: run-analysis (cold), load-file! (single file, atomic), stale-reload!
   (macro-aware cascade, §9), reload-files! (a given set, in macro order),
-  retract-file!. Query with find-usages, definition,
+  retract-file!. changed-files / deleted-files are what the disk says about the
+  files already analysed. Query with find-usages, definition,
   unused-*, file-namespaces, etc. - find-usages/definition take a Var or its
   fully-qualified name symbol.
 
@@ -558,9 +559,17 @@
 (defn retract-file!
   "Remove every form produced by `source` from the model, preserving all other
   files' references to its vars (e.g. before dropping a deleted file). `source` is
-  the classpath-relative source path (e.g. \"app/util.clj\")."
+  the classpath-relative source path (e.g. \"app/util.clj\").
+
+  Its staleness baselines go with it, so that a file dropped is one the model has
+  nothing left to say about: none of what it recorded, and no record of when it last
+  read it. A file written back afterwards has not been analysed, and is analysed
+  when something loads it."
   [source]
   (retract-source* source)
+  (swap! model (fn [m] (-> m
+                           (update :file-mtime dissoc source)
+                           (update :non-files disj source))))
   nil)
 
 ;; --- §9: per-file source mtime (the staleness baseline) --------------------
@@ -1025,6 +1034,36 @@
                :when (and (some? now) (not= now (get (:file-mtime m) source)))]
            source))))
 
+(defn deleted-files
+  "Analysed files whose file is gone - deleted, renamed, or moved off the classpath.
+
+  What `changed-files` cannot answer for. A file that no longer resolves is not
+  stale there, and rightly: staleness is a file to load again, and there is nothing
+  to load this one from. It is not current either, though - the process still holds
+  what the file defined, and the model still answers for a file nobody can open -
+  and that is what this names.
+
+  A source is one of these when it was read from a real file, which a recorded
+  mtime is the record of, and nothing answers to its name now. A source a jar
+  answers to is NOT one: a file a jar has taken over is shadowed rather than gone,
+  and what this process holds still came from the file. Neither is a source that
+  never had a file behind it - a `load-string`, or a namespace read out of a jar all
+  along.
+
+  Costs one classpath lookup per analysed file that has a file behind it - the same
+  files `changed-files` resolves, and unrememberable for the same reason: whether
+  nothing answers to a name is settled by nothing at all.
+
+  Whether a file is gone or merely between two writes is not a question this can
+  answer, and an editor that saves by writing a new file over the old one is a
+  process where the answer changes twice per save. It is asked by `stale-reload!`,
+  which is asked for by hand."
+  []
+  (let [m @model]
+    (set (for [[source t] (:file-mtime m)
+               :when (and t (= [nil false] (resolve-source source)))]
+           source))))
+
 (defn- macro-owner
   "The macro-defining namespace symbol for a macro key (a qualified symbol)."
   [macro-key] (symbol (namespace macro-key)))
@@ -1191,6 +1230,54 @@
             :when (contains? vars v)]
       (ns-unmap ns sym))))
 
+(defn- prune-vars!
+  "What `prune-file!` does, without the precondition it checks - see it.
+
+  Called directly for a file the disk no longer has, whose forms have just been
+  retracted: `prune-file!` would refuse that file, and refuse it for the right
+  reason (a file with no forms is normally one nothing has analysed), but a file
+  just retracted is the one case where no forms is the answer rather than the
+  question. Everything `prior` holds is gone, since nothing defines any of it any
+  more, and every protocol the file defined is a deleted one."
+  [source prior]
+  (let [m        @model
+        idx      (derived m)
+        interned (fn [k]
+                   (when-let [home (find-ns (symbol (namespace k)))]
+                     (get (ns-interns home) (symbol (name k)))))
+        gone     (vec (for [[k old-var] prior
+                            :let [cur (interned k)]
+                            :when (and old-var (identical? cur old-var)
+                                       (not (healthy-def? idx k)))]
+                        k))
+        ;; and then the protocol methods, which no snapshot could have held: the
+        ;; protocols this file no longer defines lose all of theirs, and the ones it
+        ;; still defines lose the methods they stopped naming.
+        pruned-protocols (for [k gone
+                               :let [v (get prior k)]
+                               :when (protocol-value v)]
+                           [v true])
+        live-protocols   (for [k (file-def-vars idx source)
+                               :let [v (interned k)]
+                               :when (protocol-value v)]
+                           [v false])
+        methods  (vec (distinct (mapcat (fn [[v deleted?]]
+                                          (protocol-methods-gone v deleted?))
+                                        (concat pruned-protocols live-protocols))))
+        pruned   (into gone methods)
+        ;; Read while they are all still interned: the sweep works by identity, and
+        ;; unmapping one of them as we went would take away the answer to where the
+        ;; rest of its mappings are.
+        vars     (into #{} (keep interned) pruned)]
+    (doseq [k pruned]
+      (when-let [us (seq (get (:usages idx) k))]
+        (binding [*out* *err*]
+          (println "WARN: pruning" (str k) "still referenced at"
+                   (vec (for [s us] [(some-> (:from-ns s) ns-name)
+                                     (:line s) (:column s)]))))))
+    (unmap-everywhere! vars)
+    pruned))
+
 (defn prune-file!
   "Unmap the *runtime* vars whose defining `def` form vanished from file `source`.
   `prior` is the {qsym -> Var} snapshot the model recorded for `source` *before* the
@@ -1240,43 +1327,61 @@
                          "Run (load-file! \"" source "\") first - prune is only valid right after "
                          "a full analysis, else it would unmap vars it simply never recorded.")
                     {:source source})))
-  (let [m        @model
-        idx      (derived m)
-        interned (fn [k]
-                   (when-let [home (find-ns (symbol (namespace k)))]
-                     (get (ns-interns home) (symbol (name k)))))
-        gone     (vec (for [[k old-var] prior
-                            :let [cur (interned k)]
-                            :when (and old-var (identical? cur old-var)
-                                       (not (healthy-def? idx k)))]
-                        k))
-        ;; and then the protocol methods, which no snapshot could have held: the
-        ;; protocols this file no longer defines lose all of theirs, and the ones it
-        ;; still defines lose the methods they stopped naming.
-        pruned-protocols (for [k gone
-                               :let [v (get prior k)]
-                               :when (protocol-value v)]
-                           [v true])
-        live-protocols   (for [k (file-def-vars idx source)
-                               :let [v (interned k)]
-                               :when (protocol-value v)]
-                           [v false])
-        methods  (vec (distinct (mapcat (fn [[v deleted?]]
-                                          (protocol-methods-gone v deleted?))
-                                        (concat pruned-protocols live-protocols))))
-        pruned   (into gone methods)
-        ;; Read while they are all still interned: the sweep works by identity, and
-        ;; unmapping one of them as we went would take away the answer to where the
-        ;; rest of its mappings are.
-        vars     (into #{} (keep interned) pruned)]
-    (doseq [k pruned]
-      (when-let [us (seq (get (:usages idx) k))]
-        (binding [*out* *err*]
-          (println "WARN: pruning" (str k) "still referenced at"
-                   (vec (for [s us] [(some-> (:from-ns s) ns-name)
-                                     (:line s) (:column s)]))))))
-    (unmap-everywhere! vars)
-    pruned))
+  (prune-vars! source prior))
+
+(defn- forget-lib!
+  "Take namespace `n` out of the set `require` consults, so that requiring it loads
+  it again rather than answering that it is already there.
+
+  A namespace whose file has gone is not loaded, in the only sense the word has
+  here: nothing on the classpath defines it. `require` is the one thing that would
+  go on saying otherwise - silently, and for the life of the process - and a file
+  written back is then a file `require` refuses to read.
+  (`clojure.tools.namespace` does the same thing, for the same reason, when it
+  drops a deleted file.)
+
+  It is the `ns` form in the file that put the name there, whatever it was that
+  loaded the file - a `require`, a `load`, this model's own reload - so taking it
+  out is undoing what the file did rather than second-guessing whoever loaded it.
+
+  The namespace object itself is left standing, with whatever it still maps. What
+  goes is decided a definition at a time, each because the model says the source
+  stopped making it; `remove-ns` decides nothing - it would take the namespace's
+  aliases, its imports and every var an `intern` made in it, none of which the model
+  speaks for."
+  [n]
+  (dosync (commute @#'clojure.core/*loaded-libs* disj n))
+  nil)
+
+(defn- drop-deleted-file!
+  "Drop file `source`, whose file the disk no longer has: its forms leave the model,
+  and with `prune` its definitions leave the process.
+
+  The model side is unconditional - it is a record of what was read out of files,
+  and a file that cannot be read is not something it can go on answering for. A
+  `definition` pointing into a file an editor cannot open is worse than no answer,
+  and a reload that leaves it there leaves it there for good, since nothing will
+  ever flag a gone file as changed.
+
+  The process side is what `prune` asks for, and it is the same pruning a reloaded
+  file gets, with the whole file playing the part of the deleted def: every var the
+  file defined is one no live form defines now, so all of them go, wherever they are
+  mapped. Their namespaces stop being loaded libs - see `forget-lib!` - unless some
+  other file still defines them, which a file that shared a namespace with this one
+  does.
+
+  The order is the ClojureScript side's, and for its reason: the definitions of a
+  file that is gone are taken away BEFORE the stale files are loaded, so that a file
+  still using one of them says so, rather than compiling clean against a definition
+  from a file nobody can open."
+  [source prune]
+  (let [nss   (file-namespaces source)
+        prior (when prune (file-def-var-snapshot @model source))]
+    (retract-file! source)
+    (when prune
+      (doseq [n nss :when (empty? (ns-forms n))] (forget-lib! n))
+      (prune-vars! source prior))
+    nil))
 
 (defn- topo-respected?
   "True when `order` already loads every file after all its macro-deps (per dep-fn).
@@ -1343,9 +1448,23 @@
   (stale-files - changed files + their transitive macro-dependent files), in
   macro-dependency order, optionally pruning vanished vars (:prune true). Returns
   the final reload order (a vector of source paths). Fail-fast, two-pass - see
-  reload-files!."
+  reload-files!.
+
+  And the files that are gone are dropped first (deleted-files, drop-deleted-file!).
+  A deleted file cannot be reloaded, so it is not in the answer and never seeds the
+  cascade: the files that expanded its macros are left holding an expansion of a
+  macro nothing defines, which is what their source now says and what they will say
+  the next time anything compiles them. What a gone file defined stops resolving
+  with :prune, before the stale files are loaded, so one of them still using it
+  fails where it uses it rather than compiling clean against a file nobody can open.
+
+  Both sets are read before anything is dropped or loaded, since dropping a file
+  changes the macro graph the order comes from."
   [& {:keys [prune]}]
-  (reload-files! (stale-files) :prune prune))
+  (let [stale   (stale-files)
+        deleted (deleted-files)]
+    (doseq [source (sort deleted)] (drop-deleted-file! source prune))
+    (reload-files! stale :prune prune)))
 
 (defn snapshot
   "The whole model, for inspection/tests: the stored form log merged with the derived

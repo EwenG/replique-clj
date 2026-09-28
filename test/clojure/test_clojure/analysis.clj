@@ -610,6 +610,105 @@
       (is (= 7 @(resolve 'vanishing.a/x)))
       (is (empty? (an/changed-files))))))
 
+(deftest a-file-the-disk-no-longer-has-is-dropped-by-a-reload
+  (let [a (written! "gone/a.clj"
+                    "(ns gone.a)"
+                    "(defprotocol P"
+                    "  (m [this]))"
+                    "(def x 1)")
+        b (written! "gone/b.clj"
+                    "(ns gone.b"
+                    "  (:require [gone.a :as a :refer [x]]))"
+                    "(def y (+ x 1))")
+        err (java.io.StringWriter.)]
+    (analysed! a b)
+    (is (= 2 @(resolve 'gone.b/y)))
+    (deleted! a)
+    (testing "a file that is gone is not a changed file - there is nothing to load
+              it from - and this is what names it instead"
+      (is (empty? (an/changed-files)))
+      (is (= #{a} (an/deleted-files))))
+    (testing "so a reload reloads nothing, and says so"
+      (is (= [] (binding [*err* err] (an/stale-reload! :prune true)))))
+    (testing "and what the file defined stops resolving, where it was defined and
+              where another namespace referred it, its protocol's methods with it"
+      (is (nil? (ns-resolve 'gone.a 'x)))
+      (is (nil? (ns-resolve 'gone.a 'P)))
+      (is (nil? (ns-resolve 'gone.a 'm)))
+      (is (nil? (ns-resolve 'gone.b 'x))))
+    (testing "a var something still uses goes all the same, and says where"
+      (is (re-find #"gone\.a/x" (str err)))
+      (is (re-find #"gone\.b" (str err))))
+    (testing "the model stops answering for a file nobody can open, and stops
+              calling it deleted once it has been dropped"
+      (is (nil? (an/definition 'gone.a/x)))
+      (is (empty? (an/file-forms a)))
+      (is (empty? (an/deleted-files))))
+    (testing "its namespace stops being a loaded lib, so requiring it says what the
+              disk says rather than finding the dead entry and doing nothing"
+      (is (not (contains? @@#'clojure.core/*loaded-libs* 'gone.a)))
+      (is (thrown? java.io.FileNotFoundException (require 'gone.a))))
+    (testing "and the file that is still there is left alone"
+      (is (= 2 @(resolve 'gone.b/y)))
+      (is (some? (an/definition 'gone.b/y)))
+      (is (contains? @@#'clojure.core/*loaded-libs* 'gone.b)))))
+
+(deftest a-file-that-is-gone-is-dropped-only-when-something-asks
+  (let [a (written! "notgone/a.clj" "(ns notgone.a)" "(def x 1)")]
+    (analysed! a)
+    (deleted! a)
+    (testing "the model keeps it until a reload runs: a file between two writes
+              looks exactly like a file that is gone, and nothing here polls"
+      (is (= #{a} (an/deleted-files)))
+      (is (some? (an/definition 'notgone.a/x)))
+      (is (some? (ns-resolve 'notgone.a 'x))))
+    (testing "and one written back before that is a changed file again, which is
+              what an editor that saves by writing a new file over the old one
+              leaves behind"
+      (written! "notgone/a.clj" "(ns notgone.a)" "(def x 7)")
+      (is (empty? (an/deleted-files)))
+      (is (= [a] (an/stale-reload! :prune true)))
+      (is (= 7 @(resolve 'notgone.a/x))))))
+
+(deftest a-reload-that-drops-a-file-leaves-what-it-does-not-speak-for
+  (let [a (written! "keeps/a.clj"
+                    "(ns keeps.a)"
+                    "(def x 1)")
+        b (written! "keeps/b.clj"
+                    "(ns keeps.b)"
+                    "(def x 2)")]
+    (analysed! a b)
+    (intern 'keeps.a 'by-hand 3)
+    (.addAlias (the-ns 'keeps.a) 'bee (the-ns 'keeps.b))
+    (deleted! a)
+    (an/stale-reload! :prune true)
+    (testing "a var an intern made is left where it is: nothing recorded it, so
+              nothing here says it has gone"
+      (is (some? (ns-resolve 'keeps.a 'by-hand))))
+    (testing "the namespace object is left standing, with its aliases - the file
+              is what was dropped, not the namespace"
+      (is (some? (find-ns 'keeps.a)))
+      (is (= (the-ns 'keeps.b) (get (ns-aliases 'keeps.a) 'bee))))
+    (testing "and another namespace's var of the same name is another var"
+      (is (= 2 @(ns-resolve 'keeps.b 'x))))))
+
+(deftest a-namespace-another-file-still-defines-stays-loaded
+  (let [a (written! "shared/a.clj"
+                    "(ns shared.n)"
+                    "(def from-a 1)")
+        b (written! "shared/b.clj"
+                    "(ns shared.n)"
+                    "(def from-b 2)")]
+    (analysed! a b)
+    (deleted! a)
+    (an/stale-reload! :prune true)
+    (testing "what the gone file defined goes"
+      (is (nil? (ns-resolve 'shared.n 'from-a))))
+    (testing "but the namespace is still a loaded lib, because a file that is
+              still there still defines it - one namespace, two files"
+      (is (some? (ns-resolve 'shared.n 'from-b)))
+      (is (contains? @@#'clojure.core/*loaded-libs* 'shared.n)))))
+
 (deftest a-load-with-no-file-behind-it-asks-the-classpath-nothing
   ;; load-string, load-reader, and anything else that reaches the compiler with no
   ;; source path: the facts are recorded under a nil source, and asking the
@@ -663,6 +762,22 @@
       (is (= ["jarred/library.clj"] (an/stale-reload!)))
       (is (= 10 @(resolve 'jarred.library/value)))
       (is (empty? (an/changed-files))))))
+
+(deftest a-file-a-jar-answers-to-is-shadowed-rather-than-gone
+  (let [source (written! "shadowed/lib.clj"
+                         "(ns shadowed.lib)"
+                         "(def value 1)")]
+    (analysed! source)
+    (jar-on-the-classpath! "shadowlib" {"shadowed/lib.clj"
+                                        "(ns shadowed.lib)\n(def value 2)\n"})
+    (deleted! source)
+    (testing "a file a jar has taken over is not a file that is gone: something
+              still answers to the name, and what this process holds still came
+              from the file"
+      (is (empty? (an/deleted-files)))
+      (is (= [] (an/stale-reload! :prune true)))
+      (is (= 1 @(resolve 'shadowed.lib/value)))
+      (is (some? (an/definition 'shadowed.lib/value))))))
 
 ;; --- the macro graph, and what an edit makes stale --------------------------
 
