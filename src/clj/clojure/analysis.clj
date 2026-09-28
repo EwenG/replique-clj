@@ -1022,6 +1022,21 @@
 
 ;; --- stale reload + prune (design §9) --------------------------------------
 
+(defn analysed-files
+  "The classpath-relative source paths this process has analysed: every file the
+  compiler read under the sink and has not since had retracted.
+
+  The population `changed-files` and `stale-files` are answers about, and here for
+  the difference between the two ways their answer can be empty. \"Nothing has
+  changed since this process read these files\" and \"this process has read no
+  files\" read identically in an empty answer and are not the same fact - the
+  first says the program is up to date, the second says nothing at all - and only
+  a caller that can tell them apart can say which it is holding. The sink is a
+  thread binding `run-analysis` and `load-file!` push, so a namespace that arrived
+  by `require` at a prompt is loaded and is not in here."
+  []
+  (set (for [[source fids] (:source->forms @model) :when (seq fids)] source)))
+
 (defn changed-files
   "Analysed files (classpath-relative source paths) whose on-disk mtime differs from
   the recorded baseline - edited since last analysis/reload. A file that no longer
@@ -1255,21 +1270,159 @@
            (recur (into dirty fresh) (into (pop queue) fresh)))
          dirty)))))
 
+(defn- file-var-graph
+  "Forward dependency graph over `files` only: {source #{dep-source}} where a form
+  in `source` refers to a var that a `def` in `dep-source` defines. Self-edges are
+  dropped, and so is everything outside `files` - nothing else is being loaded, so
+  nothing else can be loaded out of order.
+
+  NOT a compile-time graph, and deliberately not part of the stale cascade: a file
+  that merely calls a var does not need compiling again when that var's file
+  changes, because a call re-resolves its var every time it runs. That is why
+  `file-compile-graph` is the right answer to WHAT IS STALE, and it is the wrong
+  answer to WHAT ORDER TO LOAD IT IN. A var that does not exist yet does not
+  re-resolve at run time: the compiler resolves `alias/sym` when it compiles the
+  form, and a name the loaded namespace does not have is `No such var` on the spot.
+  So two files being reloaded together, where one has just started using a
+  definition the other has just grown, have to be loaded in that order - and this
+  is the graph that says so. Ordering by it costs nothing: it loads the same files,
+  and only says which of them goes first.
+
+  Built against the set being reloaded rather than cached whole, because it can be:
+  one pass over the defs to find those the reloaded files own, and then a lookup of
+  each one's recorded usages, rather than a walk of every usage in the program."
+  [m files]
+  (let [idx    (derived m)
+        nodes  (set files)
+        usages (:usages idx)
+        owner  (reduce-kv (fn [acc k e]
+                            (let [src (:source (:span e))]
+                              (if (nodes src) (assoc acc k src) acc)))
+                          {} (:defs idx))]
+    (reduce-kv
+     (fn [g k home]
+       (reduce (fn [g span]
+                 (let [src (:source span)]
+                   (if (and (nodes src) (not= src home))
+                     (update g src (fnil conj #{}) home)
+                     g)))
+               g (get usages k)))
+     {} owner)))
+
+(defn- lib-names
+  "The namespace-name symbols the specs of a `:require` / `:use` /
+  `:require-macros` clause name, prefix lists expanded.
+
+  A spec is a symbol, or a sequential whose first element is a name and whose rest
+  is either options - which start with a keyword - or, when it does not, more specs
+  carrying that name as a prefix. That is the rule `require` itself reads them by,
+  and the reason the shapes cannot be told apart any other way: `[a b]` is the
+  prefix list a.b and `[a :as b]` is the lib a."
+  [specs]
+  (mapcat (fn [spec]
+            (cond
+              (symbol? spec) [spec]
+              (sequential? spec)
+              (let [[head & more] spec]
+                (when (symbol? head)
+                  (if (or (empty? more) (keyword? (first more)))
+                    [head]
+                    (map #(symbol (str head "." %)) (lib-names more)))))
+              :else nil))
+          specs))
+
+(defn- ns-declaration
+  "The `ns` form of source `source`, read off the disk AS IT IS NOW - the one thing
+  about a file that is about to be reloaded that the model cannot answer, because
+  everything the model holds about it was written the last time it was loaded.
+
+  Nil when the file has no `ns` form, and nil when it will not read for any reason
+  whatever, which is why every last thing in here is caught. The only use of the
+  answer is to put two files being reloaded in an order, nothing is lost by not
+  having it, and a file that does not read is the compiler's to complain about a
+  moment later, in its own words and at the right place."
+  [source]
+  (try
+    (when-let [url (io/resource source)]
+      (with-open [r (java.io.PushbackReader. (io/reader url))]
+        (binding [*read-eval* false
+                  *default-data-reader-fn* (fn [_tag value] value)]
+          (let [opts {:read-cond :allow :features #{:clj} :eof ::eof}]
+            (loop []
+              (let [form (read opts r)]
+                (cond
+                  (= ::eof form)                         nil
+                  (and (seq? form) (= 'ns (first form))) form
+                  :else                                  (recur))))))))
+    (catch Throwable _ nil)))
+
+(defn- ns-sources
+  "The sources namespace `n` could be loaded from: the classpath path `require`
+  derives from the name, in each extension the JVM side reads."
+  [n]
+  (let [base (-> (str n) (.replace \- \_) (.replace \. \/))]
+    [(str base ".clj") (str base ".cljc")]))
+
+(defn- file-require-graph
+  "Forward dependency graph over `files` only, read from their `ns` forms ON DISK:
+  {source #{dep-source}} where the new source of `source` requires a namespace that
+  another file being reloaded holds. Nothing outside `files`, and no self-edges.
+
+  This is the one ordering edge that cannot come from the model. `file-var-graph`
+  and `file-compile-graph` are built from what the compiler recorded the LAST time
+  these files were loaded, so they know every dependency the old sources had and
+  none that the edit introduces - and an edit that first reaches into a file this
+  one never touched before is exactly the one whose order matters most, because the
+  definition it has come for is a definition that was not there before. Switching
+  branches does it wholesale. A require is the declaration of that reach, it is
+  written at the top of the new file, and reading it costs one pass of the reader
+  over a file that is about to be handed to the compiler anyway.
+
+  A namespace is matched to a file the way `require` matches one - the name, with
+  dashes to underscores and dots to slashes - and also through the model, for a
+  file whose namespace is not named after it. Neither has to find anything: a
+  require of something not being reloaded says nothing about the order of what is."
+  [m files]
+  (let [nodes    (set files)
+        ns->srcs (reduce-kv (fn [acc _ fe]
+                              (if-let [n (:ns fe)]
+                                (update acc n (fnil conj #{}) (:source fe))
+                                acc))
+                            {} (:forms m))
+        sources  (fn [n] (filter nodes (into (set (ns-sources n)) (get ns->srcs n))))
+        clause?  (fn [x] (and (sequential? x)
+                              (#{:require :use :require-macros} (first x))))]
+    (reduce
+     (fn [g source]
+       (if-let [form (ns-declaration source)]
+         (let [deps (into #{} (comp (filter clause?)
+                                    (mapcat #(lib-names (rest %)))
+                                    (mapcat sources)
+                                    (remove #(= source %)))
+                          (rest form))]
+           (if (seq deps) (update g source (fnil into #{}) deps) g))
+         g))
+     {} nodes)))
+
 (defn- topo-order
-  "Order files so each file's compile-dependency files come first - the files whose
-  macros it expands, and the files whose generated classes it names. Cycles are broken
-  arbitrarily (remaining nodes appended). Deps outside `nodes` are ignored - they
-  are not being reloaded, so they are already current."
+  "Order files so each file's dependency files come first - the files whose macros
+  it expands, the files whose generated classes it names, and the files defining the
+  vars it refers to. Deps outside `nodes` are ignored - they are not being reloaded,
+  so they are already current.
+
+  A cycle is broken by placing ONE file and carrying on, rather than by giving up:
+  the files that are not in the cycle keep their order, and the cycle is cut at one
+  arbitrary but stable point (the lowest name left) instead of spilling every
+  remaining file out in whatever order a set happens to iterate in."
   [files dep-fn]
   (let [nodes (set files)]
     (loop [order [], placed #{}, remaining nodes]
       (if (empty? remaining)
         order
         (let [ready (filter (fn [n] (every? #(or (placed %) (not (nodes %))) (dep-fn n)))
-                            remaining)]
-          (if (empty? ready)
-            (into order remaining)
-            (recur (into order ready) (into placed ready) (reduce disj remaining ready))))))))
+                            remaining)
+              ready (if (seq ready) ready [(first (sort remaining))])]
+          (recur (into order ready) (into placed ready) (reduce disj remaining ready)))))))
 
 (defn- healthy-def?
   "True when the derived index `idx` records a def for var-key k. (There is no longer
@@ -1546,7 +1699,7 @@
   nil)
 
 (defn- topo-respected?
-  "True when `order` already loads every file after all its macro-deps (per dep-fn).
+  "True when `order` already loads every file after all its deps (per dep-fn).
   Deps outside `order` are ignored - they were not reloaded, so they are current."
   [order dep-fn]
   (let [idx (zipmap order (range))]
@@ -1555,9 +1708,10 @@
             order)))
 
 (defn reload-files!
-  "Reload `files` (classpath-relative source paths) via load-file! in compile-
-  dependency (topological) order - a file before the files that re-expand its macros
-  or re-resolve the classes its defs generate - and optionally prune vanished vars
+  "Reload `files` (classpath-relative source paths) via load-file! in dependency
+  (topological) order - a file before the files that re-expand its macros, before
+  the files that re-resolve the classes its defs generate, and before the files that
+  refer to the vars it defines - and optionally prune vanished vars
   (:prune true). Returns the
   final reload order (a vector of source paths). stale-reload! is this over
   stale-files; clojure.cljs.analysis calls it over the macro files a ClojureScript
@@ -1569,6 +1723,14 @@
   load-file! advances a file's mtime baseline only on a successful load, so the
   failed file and any not yet reached stay stale (see changed-files) and are retried
   on the next stale-reload! call.
+
+  THE ORDER IS OVER MORE THAN THE STALE CASCADE IS. What is stale is a question
+  about compile-time coupling alone (`file-compile-graph`), because a file that just
+  calls a var re-resolves it at run time and needs no reload. What ORDER to load in
+  is not: a var that does not exist yet is resolved at compile time and fails there,
+  so a plain var reference between two files that are BOTH being reloaded does
+  constrain them. `file-var-graph` supplies those edges, for the ordering only - no
+  extra file is loaded because of one.
 
   Two-pass, to handle a dependency introduced by the very edit being reloaded. The
   first-pass order comes from the pre-reload graph, which cannot yet know an edge
@@ -1582,10 +1744,20 @@
   fixed and every edited file analysed, so the recomputed graph - and its order - is
   stable.
 
-  Limitation: this repairs *stale* expansion (the macro exists but is the old
-  version). An edit that calls a macro which did not exist in the dependency's old
-  version can still make pass 1 error if misordered; ordering by the new requires
-  would be needed for that, which this does not do."
+  THE ORDER IS PART MODEL AND PART DISK, for one reason. The model's graphs are
+  built from what the compiler recorded the last time these files were loaded, so
+  they hold every edge the OLD sources had and none that the edit introduces - and
+  an edit that first reaches into a file the editing file never touched before is
+  the one whose order matters most, since the definition it has come for was not
+  there before. So the `ns` forms of the new sources are read as well
+  (`file-require-graph`), which is where a reach like that is declared.
+
+  Limitation: what is read off the disk is the `ns` form, so a dependency taken
+  without one - a `require` called at run time, a fully-qualified name in a file
+  that never mentions the namespace at the top - is not in the order unless the old
+  sources already had it. The reader is also asked for one form and not for a
+  judgment: a file it cannot read contributes no edges rather than an error, and is
+  left to the compiler to complain about a moment later."
   [files & {:keys [prune]}]
   (let [dep-fn  (fn [g] (fn [s] (get g s #{})))
         reload! (fn [pass order]
@@ -1608,10 +1780,21 @@
                         (load-file! source)
                         (when prune (prune-file! source prior))))))
         stale   (set files)
-        order1  (topo-order stale (dep-fn (file-compile-graph @model)))]
+        ;; Read once, before anything is loaded: the sources on disk are the new
+        ;; ones from here until the reload is over, so the answer cannot change
+        ;; under it, and reading them again for the second pass would only cost.
+        reqs    (file-require-graph @model stale)
+        graph   (fn []
+                  (let [m @model]
+                    (merge-with into
+                                (file-compile-graph m)
+                                (file-var-graph m stale)
+                                reqs)))
+        order1  (topo-order stale (dep-fn (graph)))]
     (reload! 1 order1)
-    ;; Pass 1 completed the macro graph; re-derive the order from it.
-    (let [df (dep-fn (file-compile-graph @model))]
+    ;; Pass 1 read every edited source, so the graph now holds the edges the edit
+    ;; added - macro, class and var alike; re-derive the order from it.
+    (let [df (dep-fn (graph))]
       (if (topo-respected? order1 df)
         order1
         (let [order2 (topo-order stale df)]
@@ -1622,7 +1805,7 @@
   "Stale reload (design §9.2): reload-files! over the stale set (stale-files -
   changed files + their transitive compile-time dependents, the files that expand
   their macros and the files that name the classes their defs generate), in
-  compile-dependency order, optionally pruning vanished vars (:prune true). Returns
+  dependency order, optionally pruning vanished vars (:prune true). Returns
   the final reload order (a vector of source paths). Fail-fast, two-pass - see
   reload-files!.
 

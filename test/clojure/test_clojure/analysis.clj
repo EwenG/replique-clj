@@ -562,6 +562,21 @@
 
 ;; --- what has changed on disk ----------------------------------------------
 
+(deftest what-has-been-analysed-is-a-question-of-its-own
+  (testing "a model with nothing in it has read nothing, and that is not the
+            same fact as nothing having changed: the two are one answer apart
+            and mean opposite things - one says the program is up to date, the
+            other says there is no program here to be out of date"
+    (is (empty? (an/analysed-files)))
+    (is (empty? (an/changed-files))))
+  (let [a (written! "readfiles/a.clj" "(ns readfiles.a)" "(def x 1)")]
+    (analysed! a)
+    (is (= #{a} (an/analysed-files)))
+    (testing "and a file retracted is a file it has not read, which is what
+              keeps the two questions the same question"
+      (an/retract-file! a)
+      (is (empty? (an/analysed-files))))))
+
 (deftest a-file-edited-after-it-was-loaded-is-changed
   (let [source (written! "edited/a.clj"
                          "(ns edited.a)"
@@ -798,6 +813,19 @@
   []
   (#'an/build-file-class-graph @@#'an/model))
 
+(defn- var-graph
+  "The forward file graph of var references among `files`, for the current model -
+  what orders a reload but does not decide what is in it, and private for
+  `macro-graph`'s reason."
+  [& files]
+  (#'an/file-var-graph @@#'an/model (set files)))
+
+(defn- require-graph
+  "The forward file graph of requires among `files`, read off the disk as it is now
+  - the ordering edges no model can hold, and private for `macro-graph`'s reason."
+  [& files]
+  (#'an/file-require-graph @@#'an/model (set files)))
+
 (deftest an-edit-makes-the-files-that-expand-its-macros-stale-too
   (let [m (written! "cascade/m.clj"
                     "(ns cascade.m)"
@@ -886,6 +914,11 @@
     (let [order (#'an/topo-order ["a" "b"] {"a" #{"b"} "b" #{"a"}})]
       (is (= #{"a" "b"} (set order)))
       (is (= 2 (count order)))))
+  (testing "and breaking it costs only the cycle: one file of it is placed and the
+            rest of the order goes on being an order, rather than every remaining
+            file being tipped out in whatever order a set iterates in"
+    (is (= ["a" "b" "z"] (#'an/topo-order ["z" "a" "b"]
+                                          {"a" #{"b"} "b" #{"a"} "z" #{"a" "b"}}))))
   (testing "and an order can say whether it already respects a graph"
     (is (true? (#'an/topo-respected? ["m" "a"] {"a" #{"m"}})))
     (is (false? (#'an/topo-respected? ["a" "m"] {"a" #{"m"}})))
@@ -954,6 +987,154 @@
         (is (= :y-new @(resolve 'pass.x/from-y))))
       (testing "and nothing is left stale"
         (is (empty? (an/changed-files)))))))
+
+(deftest a-var-reference-orders-a-reload-without-widening-it
+  ;; The bug this is about: `app` uses a var of `lib`'s, both are edited, and the
+  ;; edit moves the definition `app` uses. Nothing here is compile-time coupling -
+  ;; no macro is expanded and no generated class is named - so the compile graph has
+  ;; nothing to say, and the two were ordered by whatever the set gave up first.
+  ;; Half the time that is `app`, which the compiler then reads while `lib` still
+  ;; holds the OLD definitions: `No such var`. And since a failed load stays stale
+  ;; and the order is the same next time, every retry fails the same way.
+  ;;
+  ;; Written with no `:require` for it, so that the only thing that can supply the
+  ;; edge is what the compiler recorded: `app` resolves the name because `lib` is
+  ;; loaded, which is a shape a file of a namespace somebody else required has.
+  (let [lib (written! "varorder/lib.clj"
+                      "(ns varorder.lib)"
+                      "(clojure.test-clojure.analysis/loaded! 'lib)"
+                      "(defn old [] :old)")
+        app (written! "varorder/app.clj"
+                      "(ns varorder.app)"
+                      "(clojure.test-clojure.analysis/loaded! 'app)"
+                      "(def v (varorder.lib/old))")]
+    (analysed! lib app)
+    (testing "a plain var reference is no compile-time dependency, and the graphs
+              that decide what is stale go on saying so"
+      (is (= {} (macro-graph)))
+      (is (= {} (class-graph))))
+    (testing "and nothing is declared at the top of the file either"
+      (is (= {} (require-graph lib app))))
+    (testing "but it is a dependency for the purpose of ORDER, and is one there"
+      (is (= {app #{lib}} (var-graph lib app))))
+    (testing "over the files being reloaded and no others: a file that is not in
+              the set cannot be loaded out of order, so it is not an edge"
+      (is (= {} (var-graph app))))
+    (written! "varorder/lib.clj"
+              "(ns varorder.lib)"
+              "(clojure.test-clojure.analysis/loaded! 'lib)"
+              "(defn fresh [] :fresh)")
+    (written! "varorder/app.clj"
+              "(ns varorder.app)"
+              "(clojure.test-clojure.analysis/loaded! 'app)"
+              "(def v (varorder.lib/fresh))")
+    (reset! trace [])
+    (testing "so the file that defines is loaded before the file that refers"
+      (is (= [lib app] (an/stale-reload!)))
+      (is (= '[lib app] @trace)))
+    (testing "and the reference the edit introduced resolves, where loading the
+              other way round would have been No such var"
+      (is (= :fresh @(resolve 'varorder.app/v))))
+    (testing "one pass, and nothing left stale"
+      (is (= 2 (count @trace)))
+      (is (empty? (an/changed-files))))))
+
+(deftest the-requires-of-a-file-are-read-off-the-disk-as-it-is-now
+  (let [a (written! "readns/a.cljc"
+                    ";; a comment, and then the ns form"
+                    "(ns readns.a"
+                    "  \"What it is for.\""
+                    "  {:author \"nobody\"}"
+                    "  (:require [readns.b :as b]"
+                    "            [readns [c :as c] [d]]"
+                    "            #?(:clj readns.e :cljs readns.f))"
+                    "  (:use [readns.g :only [x]])"
+                    "  (:import [java.util Date]))"
+                    "(def v (b/thing))")
+        b (written! "readns/b.clj" "(ns readns.b)")
+        c (written! "readns/c.clj" "(ns readns.c)")
+        d (written! "readns/d.cljc" "(ns readns.d)")
+        e (written! "readns/e.clj" "(ns readns.e)")
+        f (written! "readns/f.cljs" "(ns readns.f)")
+        g (written! "readns/g.clj" "(ns readns.g)")]
+    (testing "a docstring, an attribute map and an :import say nothing about
+              order; a :require and a :use do, prefix lists and all, and the
+              branch of a reader conditional this platform takes is the one read"
+      (is (= {a #{b c d e g}} (require-graph a b c d e f g))))
+    (testing "a require of something that is not being reloaded is no constraint
+              on the order of what is"
+      (is (= {} (require-graph a))))
+    (testing "and nothing here has been loaded - this is the disk, not the model"
+      (is (= {} (macro-graph)))
+      (is (empty? (an/file-forms a)))))
+  (testing "a file with no ns form is a target like any other and a source of
+            nothing, and one that will not read is not an error"
+    (let [x (written! "readns/x.clj" "(def not-an-ns 1)")
+          y (written! "readns/y.clj" "(ns readns.y (:require [readns.x]))")
+          z (written! "readns/z.clj" "(ns readns.z (:require [readns.x])")]
+      (is (= {y #{x}} (require-graph x y z))))))
+
+(deftest a-require-an-edit-adds-orders-the-reload-that-carries-it
+  ;; The case no model can answer: before the edit these two files have nothing to
+  ;; do with each other, so every graph built from what was loaded last time is
+  ;; empty, and the order is whatever the set gives up first. Loading the user
+  ;; first is silently wrong rather than loudly: its new `:require` finds the
+  ;; namespace already loaded and does nothing, so the compiler reads the new file
+  ;; against the OLD definitions and says `No such var`.
+  (let [d (written! "newreq/d.clj"
+                    "(ns newreq.d)"
+                    "(clojure.test-clojure.analysis/loaded! 'd)"
+                    "(def a 1)")
+        u (written! "newreq/u.clj"
+                    "(ns newreq.u)"
+                    "(clojure.test-clojure.analysis/loaded! 'u)"
+                    "(def b 2)")]
+    (analysed! d u)
+    (testing "nothing the model holds connects them, because nothing did"
+      (is (= {} (macro-graph)))
+      (is (= {} (class-graph)))
+      (is (= {} (var-graph d u)))
+      (is (= {} (require-graph d u))))
+    (written! "newreq/d.clj"
+              "(ns newreq.d)"
+              "(clojure.test-clojure.analysis/loaded! 'd)"
+              "(defn fresh [] :fresh)")
+    (written! "newreq/u.clj"
+              "(ns newreq.u (:require [newreq.d]))"
+              "(clojure.test-clojure.analysis/loaded! 'u)"
+              "(def v (newreq.d/fresh))")
+    (testing "the new source of the file that has come looking says where it went"
+      (is (= {u #{d}} (require-graph d u))))
+    (reset! trace [])
+    (testing "so the file that grew the definition is loaded first, in one pass"
+      (is (= [d u] (an/stale-reload!)))
+      (is (= '[d u] @trace)))
+    (testing "and the reference the edit introduced resolves"
+      (is (= :fresh @(resolve 'newreq.u/v))))))
+
+(deftest a-var-reference-does-not-put-a-file-in-a-reload
+  ;; The other half of the same rule: ordering by var references must not turn into
+  ;; reloading by them. A call re-resolves its var every time it runs, so a file that
+  ;; only calls into an edited file is already current and is not loaded again.
+  (let [d (written! "varcascade/d.clj"
+                    "(ns varcascade.d)"
+                    "(clojure.test-clojure.analysis/loaded! 'd)"
+                    "(defn answer [] 1)")
+        u (written! "varcascade/u.clj"
+                    "(ns varcascade.u (:require [varcascade.d]))"
+                    "(clojure.test-clojure.analysis/loaded! 'u)"
+                    "(defn ask [] (varcascade.d/answer))")]
+    (analysed! d u)
+    (written! "varcascade/d.clj"
+              "(ns varcascade.d)"
+              "(clojure.test-clojure.analysis/loaded! 'd)"
+              "(defn answer [] 2)")
+    (is (= #{d} (an/stale-files)))
+    (reset! trace [])
+    (is (= [d] (an/stale-reload!)))
+    (is (= '[d] @trace))
+    (testing "and the caller, never reloaded, calls the new definition anyway"
+      (is (= 2 ((resolve 'varcascade.u/ask)))))))
 
 (deftest a-stale-reload-stops-at-the-first-file-that-will-not-compile
   (let [m (written! "failfast/m.clj"

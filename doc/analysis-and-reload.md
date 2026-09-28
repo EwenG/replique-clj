@@ -72,7 +72,7 @@ Implementation progress (see §10 for the full sequence):
   space (runtime call dependents are excluded — the precision tools.namespace lacks; but any
   edit to a macro-defining file marks its macro-dependent files stale, without distinguishing
   which form changed). `stale-reload!` reloads the stale set in macro-dependency (topological)
-  order via `load-file!`, optionally pruning; `prune-file!` ns-unmaps vars whose defining form
+  order via `load-file!` (§9.2), optionally pruning; `prune-file!` ns-unmaps vars whose defining form
   vanished (across every namespace the file defines), warning (not blocking) on remaining usages.
   Proven end-to-end: editing a macro reloads its dependent *files* so they re-expand the new
   macro, reloading the macro's file *alone* does not update the dependent (the case a naive
@@ -503,8 +503,39 @@ set is the seed plus the transitive closure of its compile-time dependent *files
 Both are *conservative*: any edit to a macro-defining file marks that file's macro-dependent
 files stale, and any edit to a file that generates a class marks every file that names it,
 neither distinguishing which form changed. Runtime (function-call) dependents are excluded — a
-plain var re-resolves at runtime and needs no recompile. Reload the stale set in compile-
-dependency (topological) order.
+plain var re-resolves at runtime and needs no recompile.
+
+**What is stale and what order to load it in are different questions.** The cascade above is right
+to exclude runtime dependents: a call re-resolves its var every time it runs, so a file that only
+calls into an edited file needs no recompile. The *order* is another matter. A var that does not
+exist **yet** is not resolved at run time at all — the compiler resolves `alias/sym` when it
+compiles the form and throws `No such var` on the spot — so two files that are **both** in the
+stale set, one of which has just started using a definition the other has just grown, have to be
+loaded in that order. Switching branches does this wholesale.
+
+So the order comes from a wider graph than the cascade does, without loading anything the cascade
+did not choose. On top of the compile graph:
+
+- **var edges** (`file-var-graph`) — a form in F refers to a var that a def in D defines, both
+  files being among the ones reloaded. Derived from `:usages` and `:defs` and restricted to the
+  reload set, so it costs a lookup per def of those files rather than a walk of every usage in the
+  program.
+- **require edges** (`file-require-graph`) — the `ns` form of F's **new source on disk** requires
+  a namespace that another file being reloaded holds. This is the one edge that cannot come from
+  the model: every graph above is built from what the compiler recorded the *last* time these
+  files were loaded, so it holds the dependencies the old sources had and none the edit
+  introduces — and an edit that first reaches into a file it never touched before is exactly the
+  one whose order matters, since the definition it has come for was not there before. A namespace
+  is matched to a file the way `require` matches one (dashes to underscores, dots to slashes), and
+  also through the model, for a file whose namespace is not named after it. A file that will not
+  read contributes no edges rather than an error: it is about to be handed to the compiler, which
+  will complain about it in better words.
+
+Neither kind of edge widens the reload — they say which of the chosen files goes first and nothing
+else — and a cycle is broken by placing one file and carrying on, so only the cycle itself loses
+its order. Remaining gap: a dependency taken without a top-level `require` and absent from the old
+sources (a run-time `require`, a fully-qualified name in a file that never mentions the namespace
+at the top) is still not in the order.
 
 **Why generated classes need an edge of their own.** `deftype` is `clojure.core`'s macro, so the
 only macro edge a type-defining file has is to `clojure.core` — the file whose `defprotocol`
