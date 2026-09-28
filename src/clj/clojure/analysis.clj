@@ -35,7 +35,7 @@
   written on disk and never reflects an un-saved REPL eval.
 
   Drivers: run-analysis (cold), load-file! (single file, atomic), stale-reload!
-  (macro-aware cascade, §9), reload-files! (a given set, in macro order),
+  (the compile-time cascade, §9), reload-files! (a given set, in dependency order),
   retract-file!. changed-files / deleted-files are what the disk says about the
   files already analysed. Query with find-usages, definition,
   unused-*, file-namespaces, etc. - find-usages/definition take a Var or its
@@ -823,6 +823,21 @@
                   (str "find-usages/definition expect a Var or fully-qualified symbol, got: "
                        (pr-str var-or-sym))))))
 
+(defn- interned-var
+  "The var the qualified name `k` names in its OWN namespace, or nil - not a refer
+  of somebody else's var under that name, and not a class or anything else a
+  namespace can map a name to.
+
+  `(.getMapping)` rather than `ns-interns`, which answers the same question by
+  building a map of every intern in the namespace: this is asked once per recorded
+  def when the compile-time graph is built, and the graph is built over the whole
+  model."
+  [k]
+  (when-let [^clojure.lang.Namespace home (find-ns (symbol (namespace k)))]
+    (let [o (.getMapping home (symbol (name k)))]
+      (when (and (var? o) (identical? home (.ns ^clojure.lang.Var o)))
+        o))))
+
 (defn- protocol-value
   "The protocol `v` holds, or nil where it holds no protocol.
 
@@ -1113,6 +1128,105 @@
   [m]
   (cached-by-forms file-graph-cache (:forms m) #(build-file-macro-graph m)))
 
+(defn- generated-class
+  "The name of the class the def of var-key `k` generated, or nil.
+
+  Read out of the running process rather than guessed from the name, because the
+  name says nothing: `a/P` is the class `a.P` when a `defprotocol` made it and is no
+  class at all when a `def` did.
+
+  A PROTOCOL's var holds the interface it generated (`:on-interface`). A `deftype`'s
+  or a `defrecord`'s class is held by no var, but the form that made it also interned
+  a `->T` factory and imported `T` into the same namespace - so a `->T` whose
+  namespace imports a `T` of that namespace's own package is that form's class. An
+  import of somebody else's `T` is not, which is what the name check is for: a file
+  that imports a class does not define it, and a `->Date` written by hand over an
+  imported `java.util.Date` would otherwise make its file the owner of a class the
+  JDK ships."
+  [k]
+  (or (when-let [p (protocol-value (interned-var k))]
+        (.getName ^Class (:on-interface p)))
+      (let [n (name k)]
+        (when (.startsWith n "->")
+          (when-let [home (find-ns (symbol (namespace k)))]
+            (let [sym  (symbol (subs n 2))
+                  c    (get (ns-imports home) sym)
+                  made (str (.replace (str (ns-name home)) \- \_) "." sym)]
+              (when (and (class? c) (= made (.getName ^Class c)))
+                (.getName ^Class c))))))))
+
+(defn- class-owners
+  "{class-name -> the file whose def form generated it}, over every def the model
+  holds - the other half of `:class-usages`, which is keyed by class name and says
+  where each class is NAMED.
+
+  Only classes a def generated are in here, so a class from a jar, from `import`, or
+  from the JDK owns nothing and makes no edge: nothing in the model defines it and
+  no reload can change it."
+  [m]
+  (persistent!
+   (reduce-kv (fn [acc k e]
+                (if-let [c (generated-class k)]
+                  (assoc! acc c (:source (:span e)))
+                  acc))
+              (transient {}) (:defs (derived m)))))
+
+(defn- build-file-class-graph
+  "Forward compile-time dependency graph over FILES for generated classes: {source
+  #{dep-source}} where a form in `source` NAMES a class that a `defprotocol`, a
+  `deftype` or a `defrecord` in `dep-source` generated. Self-edges are dropped.
+
+  This is the compile-time coupling that is not a macro, and the reason it has to be
+  here is that the macro graph cannot see it: a `deftype` implementing a protocol
+  expands `clojure.core/deftype`, so the only macro edge it has is to `clojure.core`,
+  and the file that actually matters - the one whose `defprotocol` generated the
+  interface the type was compiled against - is not in it at all. Reloading the
+  protocol alone generates a NEW interface, and every type compiled against the old
+  one stops satisfying the protocol: the call fails at run time with no
+  implementation of a method of a protocol, and nothing has changed in the file that
+  implements it. Same for a `deftype`'s or a `defrecord`'s own class: recompiling the
+  file that defines it leaves two classes of one name, and whoever was compiled
+  against the first one no longer agrees with the rest of the program about what
+  `instance?` means.
+
+  A class NAMED is the whole test, and it is the right one: a type hint, an
+  `instance?`, a constructor call and an `implements` are all resolved when the file
+  is compiled, and the form holds the class it resolved to. Calls of the protocol's
+  METHODS are not here and need not be - a method is a var, resolved again every
+  time it runs."
+  [m]
+  (let [owner (class-owners m)]
+    (reduce-kv
+     (fn [g c spans]
+       (if-let [o (get owner c)]
+         (reduce (fn [g s]
+                   (let [src (:source s)]
+                     (if (or (nil? src) (= src o))
+                       g
+                       (update g src (fnil conj #{}) o))))
+                 g spans)
+         g))
+     {} (:class-usages (derived m)))))
+
+;; Cached like the macro graph, and beside it rather than folded into it: the two are
+;; built from different halves of the model and the tests of each want to see it
+;; alone. The class half also asks the running process what each def generated, which
+;; is why it is not built more often than the form log changes.
+(defonce ^:private compile-graph-cache (atom {:forms nil :value nil}))
+
+(defn- file-compile-graph
+  "The whole compile-time dependency graph over files: what a file expands
+  (`build-file-macro-graph`) and what it names (`build-file-class-graph`), merged.
+  Built once per form log.
+
+  This is the graph the stale cascade walks and the graph the reload order comes
+  from. Both halves are compile-time edges - a file holding an expansion of a macro
+  that changed, and a file holding a class that was generated again - and both are
+  repaired the same way, by compiling the file again after the file it depends on."
+  [m]
+  (cached-by-forms compile-graph-cache (:forms m)
+                   #(merge-with into (file-macro-graph m) (build-file-class-graph m))))
+
 (defn- reverse-file-graph
   "Invert a forward file graph {source #{dep-source}} to {dep-source #{dependent
   source}} - the direction the stale cascade walks (edit a file -> its dependents)."
@@ -1124,14 +1238,17 @@
 (defn stale-files
   "The set of files to reload: every file whose source was edited since last loaded
   (the seed - no arg = changed-files), plus every file that transitively compile-
-  time-depends on the seed through the file macro graph (design §9). Runtime-only
-  (function-call) dependents are excluded - a plain var re-resolves at runtime and
-  needs no recompile; only macro dependents do. Conservative: any edit to a
-  macro-defining file marks ALL its macro-dependent files stale (it does not
-  distinguish which form in the file changed)."
+  time-depends on the seed through the file compile graph (design §9): the files
+  that expanded one of its macros, and the files that named a class one of its def
+  forms generated - a `defprotocol`'s interface, a `deftype`'s or a `defrecord`'s
+  class. Runtime-only (function-call) dependents are excluded - a plain var
+  re-resolves at runtime and needs no recompile. Conservative in both halves: an
+  edit to a macro-defining file marks ALL its macro-dependent files stale, and an
+  edit to a file that generates a class marks every file that names it, neither one
+  distinguishing which form in the file changed."
   ([] (stale-files (changed-files)))
   ([seed]
-   (let [rev (reverse-file-graph (file-macro-graph @model))]
+   (let [rev (reverse-file-graph (file-compile-graph @model))]
      (loop [dirty (set seed), queue (vec seed)]
        (if-let [x (peek queue)]
          (let [fresh (remove dirty (get rev x))]
@@ -1139,7 +1256,8 @@
          dirty)))))
 
 (defn- topo-order
-  "Order files so each file's macro-dependency files come first. Cycles are broken
+  "Order files so each file's compile-dependency files come first - the files whose
+  macros it expands, and the files whose generated classes it names. Cycles are broken
   arbitrarily (remaining nodes appended). Deps outside `nodes` are ignored - they
   are not being reloaded, so they are already current."
   [files dep-fn]
@@ -1393,9 +1511,10 @@
             order)))
 
 (defn reload-files!
-  "Reload `files` (classpath-relative source paths) via load-file! in macro-
-  dependency (topological) order - macro-defining files before the files that
-  re-expand them - and optionally prune vanished vars (:prune true). Returns the
+  "Reload `files` (classpath-relative source paths) via load-file! in compile-
+  dependency (topological) order - a file before the files that re-expand its macros
+  or re-resolve the classes its defs generate - and optionally prune vanished vars
+  (:prune true). Returns the
   final reload order (a vector of source paths). stale-reload! is this over
   stale-files; clojure.cljs.analysis calls it over the macro files a ClojureScript
   compile depends on.
@@ -1407,16 +1526,17 @@
   failed file and any not yet reached stay stale (see changed-files) and are retried
   on the next stale-reload! call.
 
-  Two-pass, to handle a macro dependency introduced by the very edit being reloaded.
-  The first-pass order comes from the pre-reload macro graph, which cannot yet know
-  an edge only this edit adds (e.g. file A newly requires and expands a macro from
-  file B): A could be ordered before B and expand B's stale macro. Pass 1 reloads in
-  that best-guess order, which recompiles every edited file and so completes the
-  graph. We then recompute the order; if pass 1 already respected it (the common
-  case) we are done at no extra cost, otherwise a file expanded a stale macro and we
-  reload once more in the corrected order. Two passes always suffice: after pass 1
-  the on-disk source is fixed and every edited file analysed, so the recomputed
-  graph - and its order - is stable.
+  Two-pass, to handle a dependency introduced by the very edit being reloaded. The
+  first-pass order comes from the pre-reload graph, which cannot yet know an edge
+  only this edit adds (file A newly requires and expands a macro from file B, or
+  newly implements a protocol of B's): A could be ordered before B and expand B's
+  stale macro, or be compiled against the interface B is about to generate again.
+  Pass 1 reloads in that best-guess order, which recompiles every edited file and so
+  completes the graph. We then recompute the order; if pass 1 already respected it
+  (the common case) we are done at no extra cost, otherwise we reload once more in
+  the corrected order. Two passes always suffice: after pass 1 the on-disk source is
+  fixed and every edited file analysed, so the recomputed graph - and its order - is
+  stable.
 
   Limitation: this repairs *stale* expansion (the macro exists but is the old
   version). An edit that calls a macro which did not exist in the dependency's old
@@ -1433,10 +1553,10 @@
                       (load-file! source)
                       (when prune (prune-file! source prior)))))
         stale   (set files)
-        order1  (topo-order stale (dep-fn (file-macro-graph @model)))]
+        order1  (topo-order stale (dep-fn (file-compile-graph @model)))]
     (reload! order1)
     ;; Pass 1 completed the macro graph; re-derive the order from it.
-    (let [df (dep-fn (file-macro-graph @model))]
+    (let [df (dep-fn (file-compile-graph @model))]
       (if (topo-respected? order1 df)
         order1
         (let [order2 (topo-order stale df)]
@@ -1444,9 +1564,10 @@
           order2)))))
 
 (defn stale-reload!
-  "Macro-aware stale reload (design §9.2): reload-files! over the stale set
-  (stale-files - changed files + their transitive macro-dependent files), in
-  macro-dependency order, optionally pruning vanished vars (:prune true). Returns
+  "Stale reload (design §9.2): reload-files! over the stale set (stale-files -
+  changed files + their transitive compile-time dependents, the files that expand
+  their macros and the files that name the classes their defs generate), in
+  compile-dependency order, optionally pruning vanished vars (:prune true). Returns
   the final reload order (a vector of source paths). Fail-fast, two-pass - see
   reload-files!.
 

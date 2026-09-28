@@ -792,6 +792,12 @@
   []
   (#'an/file-macro-graph @@#'an/model))
 
+(defn- class-graph
+  "The forward file graph of generated classes for the current model - the other
+  half of what the reload walks, and private for `macro-graph`'s reason."
+  []
+  (#'an/build-file-class-graph @@#'an/model))
+
 (deftest an-edit-makes-the-files-that-expand-its-macros-stale-too
   (let [m (written! "cascade/m.clj"
                     "(ns cascade.m)"
@@ -995,6 +1001,124 @@
     (testing "and no staleness was lost: the failed file and the one never
               reached are still waiting, the one that succeeded is not"
       (is (= #{a b} (an/changed-files))))))
+
+(deftest an-edit-makes-what-implements-its-protocols-stale-too
+  (let [a (written! "iface/a.clj"
+                    "(ns iface.a)"
+                    "(defprotocol P"
+                    "  (greet [this]))")
+        b (written! "iface/b.clj"
+                    "(ns iface.b (:require [iface.a :as a]))"
+                    "(deftype T []"
+                    "  a/P"
+                    "  (greet [this] \"hello\"))"
+                    "(def t (T.))")
+        c (written! "iface/c.clj"
+                    "(ns iface.c (:require [iface.a :as a]))"
+                    "(defn ask [x] (a/greet x))")]
+    (analysed! a b c)
+    (is (= "hello" ((resolve 'iface.a/greet) @(resolve 'iface.b/t))))
+    (written! "iface/a.clj"
+              "(ns iface.a)"
+              "(defprotocol P"
+              "  (greet [this])"
+              "  (farewell [this]))")
+    (testing "the file that implements the protocol is stale, though nothing in it
+              changed and no macro of the edited file reaches it - `deftype` is
+              clojure.core's macro, so the only macro edge the type has is to
+              clojure.core, and the file whose `defprotocol` generated the
+              interface it was compiled against is not in that graph at all"
+      (is (= #{a} (an/changed-files)))
+      (is (= {b #{a}} (class-graph)))
+      (is (contains? (an/stale-files) b)))
+    (testing "while the file that only CALLS the protocol's methods is not: a
+              method is a var, resolved again every time it runs"
+      (is (not (contains? (an/stale-files) c))))
+    (testing "and the reload loads the protocol before the type, so the type ends
+              up implementing the interface the protocol has now"
+      (is (= [a b] (an/stale-reload! :prune true)))
+      (is (= "hello" ((resolve 'iface.a/greet) @(resolve 'iface.b/t))))
+      (is (= "hello" ((resolve 'iface.c/ask) @(resolve 'iface.b/t)))))))
+
+(deftest a-protocol-implemented-in-its-own-file-is-not-its-own-dependent
+  (let [a (written! "ownface/a.clj"
+                    "(ns ownface.a)"
+                    "(defprotocol P"
+                    "  (greet [this]))"
+                    "(deftype T []"
+                    "  P"
+                    "  (greet [this] \"hello\"))")]
+    (analysed! a)
+    (written! "ownface/a.clj"
+              "(ns ownface.a)"
+              "(defprotocol P"
+              "  (greet [this])"
+              "  (farewell [this]))"
+              "(deftype T []"
+              "  P"
+              "  (greet [this] \"hello\")"
+              "  (farewell [this] \"bye\"))")
+    (testing "a file compiles against its own classes in one pass, so it depends
+              on itself for nothing - and a self-edge would leave topo-order with
+              no file it could place first"
+      (is (= {} (class-graph)))
+      (is (= #{a} (an/stale-files)))
+      (is (= [a] (an/stale-reload! :prune true))))))
+
+(deftest a-file-that-imports-a-class-does-not-generate-it
+  (let [a (written! "imported/a.clj"
+                    "(ns imported.a (:import [java.util Date]))"
+                    "(defn ->Date [] (Date. 0))")
+        b (written! "imported/b.clj"
+                    "(ns imported.b (:import [java.util Date]))"
+                    "(defn epoch? [^Date d] (zero? (.getTime d)))")]
+    (analysed! a b)
+    (written! "imported/a.clj"
+              "(ns imported.a (:import [java.util Date]))"
+              "(defn ->Date [] (Date. 1))")
+    (testing "a ->X factory written by hand over an IMPORTED class does not make
+              its file the one that generates that class: the class a deftype here
+              would have made is called imported.a.Date, and this one is called
+              java.util.Date - so the file that names it is left alone"
+      (is (= {} (class-graph)))
+      (is (= #{a} (an/stale-files))))))
+
+(deftest an-edit-makes-what-names-its-generated-classes-stale-too
+  (let [a (written! "genclass/a.clj"
+                    "(ns genclass.a)"
+                    "(defrecord R [x])")
+        b (written! "genclass/b.clj"
+                    "(ns genclass.b (:require [genclass.a])"
+                    "  (:import [genclass.a R]))"
+                    "(defn mine? [x] (instance? R x))")]
+    (analysed! a b)
+    (is (true? ((resolve 'genclass.b/mine?) (eval '(genclass.a.R. 1)))))
+    (written! "genclass/a.clj"
+              "(ns genclass.a)"
+              "(defrecord R [x y])")
+    (testing "a defrecord recompiled is a NEW class of the same name, so the file
+              that names it holds a class the rest of the program has stopped
+              agreeing with - two classes called genclass.a.R, and an `instance?`
+              that answers no"
+      (is (contains? (an/stale-files) b)))
+    (testing "so it is loaded again, after the file that generates the class"
+      (is (= [a b] (an/stale-reload! :prune true)))
+      (is (true? ((resolve 'genclass.b/mine?) (eval '(genclass.a.R. 1 2))))))))
+
+(deftest a-class-nothing-in-the-model-defines-owns-no-file
+  (let [a (written! "noowner/a.clj"
+                    "(ns noowner.a)"
+                    "(def epoch (java.util.Date. 0))")
+        b (written! "noowner/b.clj"
+                    "(ns noowner.b)"
+                    "(defn now [] (java.util.Date.))")]
+    (analysed! a b)
+    (written! "noowner/a.clj"
+              "(ns noowner.a)"
+              "(def epoch (java.util.Date. 1))")
+    (testing "both files name java.util.Date, and neither one defines it - a class
+              no reload can generate again is a class nothing can go stale against"
+      (is (= #{a} (an/stale-files))))))
 
 ;; --- pruning vars whose def is gone ----------------------------------------
 

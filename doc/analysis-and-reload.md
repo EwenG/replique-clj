@@ -103,9 +103,10 @@ knows, rather than by writing a separate static analyzer:
    **per-file**. Consumed **in-process** by a tool (a REPL/nREPL-style server) that
    queries an in-memory model — not emitted to a file or database.
 
-2. **Macro-aware stale reload** — a new reload operation that recompiles the files that
+2. **Compile-time-aware stale reload** — a new reload operation that recompiles the files that
    are actually out of date, *including files that are stale only because a macro (or
-   `:inline` fn) they expand changed*, in dependency order — and can optionally prune
+   `:inline` fn) they expand changed, or because a class they name was generated again*,
+   in dependency order — and can optionally prune
    vars that no longer exist in the source. Clojure's existing single-file reload is
    **kept unchanged** alongside it.
 
@@ -486,15 +487,44 @@ Staleness inputs, recorded per file after each successful compile:
 
 1. source-file **modification time** (`:file-mtime`, keyed by the resource path — no ns→path munging),
 2. the **macro dependency edges** its forms expanded (`:macro-deps`, from the `macroexpand1` tap;
-   each edge carries the expanding form's fid, hence its file).
+   each edge carries the expanding form's fid, hence its file),
+3. the **classes its forms named** (`:class-usages`, keyed by class name), against the classes the
+   model's own def forms generated.
 
 A file is a **seed** if its mtime changed since last load (edited since last loaded). The stale
-set is the seed plus the transitive closure of its macro-dependent *files* over the macro graph
-(projected into file space via each form's `:source` and each macro's owning-namespace file) —
-the *conservative* macro-aware closure: any edit to a macro-defining file marks that file's
-macro-dependent files stale, without distinguishing which form changed. Runtime (function-call)
-dependents are excluded — a plain var re-resolves at runtime and needs no recompile. Reload the
-stale set in macro-dependency (topological) order.
+set is the seed plus the transitive closure of its compile-time dependent *files* over the
+**compile graph** (`file-compile-graph`), which has two kinds of edge:
+
+- **macro edges** — a form in F expanded a macro whose defining namespace lives in D
+  (projected into file space via each form's `:source` and each macro's owning-namespace file);
+- **generated-class edges** — a form in F named a class that a def form in D generated: a
+  `defprotocol`'s interface, or a `deftype`'s / `defrecord`'s class (`build-file-class-graph`).
+
+Both are *conservative*: any edit to a macro-defining file marks that file's macro-dependent
+files stale, and any edit to a file that generates a class marks every file that names it,
+neither distinguishing which form changed. Runtime (function-call) dependents are excluded — a
+plain var re-resolves at runtime and needs no recompile. Reload the stale set in compile-
+dependency (topological) order.
+
+**Why generated classes need an edge of their own.** `deftype` is `clojure.core`'s macro, so the
+only macro edge a type-defining file has is to `clojure.core` — the file whose `defprotocol`
+generated the interface the type was compiled against is not in the macro graph *at all*.
+Reloading a protocol generates a **new** interface, and every type compiled against the old one
+silently stops satisfying it: the call fails at run time with `No implementation of method: :m of
+protocol: #'a/P found for class: b.T`, which reads like a missing `extend-type` and is nothing of
+the sort. Recompiling a `deftype`/`defrecord` file has the same shape: two classes of one name,
+and whoever holds the first one no longer agrees with the rest of the program about `instance?`.
+This is the coupling `clojure.tools.namespace` handles by brute force (it reloads *all*
+transitive dependents, which is why it needs `remove-ns`); here the model already records where
+each class is named, so the edge is derived instead of assumed.
+
+Which class a def generated is read out of the **running process**, not guessed from the name: a
+protocol's var holds its `:on-interface`, and a `deftype`/`defrecord` is found from the `->T`
+factory it interned plus the `T` its own namespace imports, with a name check so that an
+*imported* class is never mistaken for a generated one. A class no def in the model generates —
+from a jar, from the JDK, from `import` — owns no file and makes no edge: nothing can generate it
+again, so nothing can go stale against it. Known gap: `definterface` and `gen-class` intern no
+var, so an interface defined by one of them is not owned by its file.
 
 (A precise variant — per-macro source-form versions, so only dependents of the specific changed
 macro reload — was built and reverted to this simpler scheme by request. `:inline`-fn edges are
