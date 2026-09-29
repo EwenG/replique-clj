@@ -330,6 +330,91 @@
         (is (= [4 6 8 9] (mapv :end-line uses)))
         (is (= #{"target"} (set (map text-at uses))))))))
 
+(deftest what-an-ns-form-names-is-where-the-name-is-written
+  (let [_ (written! "declared/lib.clj"
+                    "(ns declared.lib)"
+                    "(defn twice [x] (* 2 x))"
+                    "(defn thrice [x] x)"
+                    "(defn only-named [x] x)"
+                    "(defn renamed [x] x)"
+                    "(defn all-of-them [x] x)")
+        _ (written! "declared/deep.clj"
+                    "(ns declared.deep)"
+                    "(defn under-a-prefix [x] x)")
+        source (written! "declared/a.clj"
+                         "(ns declared.a"
+                         "  (:refer-clojure :exclude [second])"
+                         "  (:require [declared.lib :as lib :refer [twice thrice renamed]"
+                         "                          :rename {renamed local-name}]"
+                         "            [declared [deep :refer [under-a-prefix]]])"
+                         "  (:use [declared.lib :only [only-named]])"
+                         "  (:import [java.io File StringWriter]"
+                         "           java.util.Date))"
+                         "(defn run [] (+ (twice 1) (lib/thrice 2)))"
+                         "(def f (File. \"x\"))")
+        ;; on its own, because a :refer-clojure :only leaves the file without
+        ;; defn or +, so a file with a body cannot have one
+        only (written! "declared/b.clj"
+                       "(ns declared.b"
+                       "  (:refer-clojure :only [first]))")]
+    (analysed! source only)
+    (letfn [(declared [qsym]
+              (->> (an/find-usages qsym)
+                   (filter :declaration)
+                   (map (juxt :line :column :declaration text-at))
+                   (sort-by first)
+                   vec))
+            (imported [c]
+              (->> (an/find-class-usages c)
+                   (filter :declaration)
+                   (map (juxt :line :declaration text-at))
+                   (sort-by first)
+                   vec))]
+      (testing "a :refer names the var, and the span is the name in the spec -
+      which is what a rename has to replace and the one mention of it no analysis
+      of code can reach: the ns form hands its specs on quoted"
+        (is (= [[3 43 :refer "twice"]] (declared 'declared.lib/twice))))
+      (testing "and it is one list with the uses, so where-is-this-used answers
+      the ns form along with the call sites"
+        (is (= [[3 :refer] [9 nil]]
+               (sort-by first (map (juxt :line :declaration)
+                                   (an/find-usages 'declared.lib/thrice))))))
+      (testing "a :use's :only is the same fact written the other way"
+        (is (= [[6 30 :refer "only-named"]] (declared 'declared.lib/only-named))))
+      (testing "a :rename names the var by its key - the name being replaced -
+      and not by the value, which no var is called. Both places it is written are
+      places, and both have to be rewritten together"
+        (is (= [[3 56 :refer "renamed"] [4 36 :refer "renamed"]]
+               (declared 'declared.lib/renamed))))
+      (testing "a prefix list is walked the way a require walks it"
+        (is (= [[5 37 :refer "under-a-prefix"]] (declared 'declared.deep/under-a-prefix))))
+      (testing ":refer-clojure names vars of clojure.core, the one clause that
+      writes a namespace nowhere in itself"
+        (is (= [[2 26 :refer "first"]] (declared 'clojure.core/first))))
+      (testing "an :exclude is not one: it names what this namespace will NOT be
+      writing, which is the opposite of a place the name is written"
+        (is (= [] (declared 'clojure.core/second))))
+      (testing "a require that refers nothing names nothing: what it writes is the
+      namespace, and that is a different question"
+        (is (= [] (declared 'declared.lib/all-of-them))))
+      (testing "an :import names the class, at the short name under a package spec
+      and over the whole of a name written in full"
+        (is (= [[7 21 :import "File"] [10 9 nil nil]]
+               (sort-by first (map (juxt :line :column :declaration
+                                         #(when (:declaration %) (text-at %)))
+                                   (an/find-class-usages java.io.File)))))
+        (is (= [[7 :import "StringWriter"]] (imported java.io.StringWriter)))
+        (is (= [[8 :import "java.util.Date"]] (imported java.util.Date))))
+      (testing "and none of them is a USE, so the lints that ask what a namespace
+      does not need still answer - a refer kept alive by its own :refer would be a
+      refer nothing could ever report"
+        (is (= {'only-named (resolve 'declared.lib/only-named)
+                'under-a-prefix (resolve 'declared.deep/under-a-prefix)
+                'local-name (resolve 'declared.lib/renamed)}
+               (an/unused-refers 'declared.a)))
+        (is (= {'StringWriter java.io.StringWriter, 'Date java.util.Date}
+               (an/unused-imports 'declared.a)))))))
+
 (deftest a-type-that-implements-a-protocol-is-a-usage-of-it
   (let [a (written! "implements/a.clj"
                     "(ns implements.a)"
@@ -1606,11 +1691,17 @@
                     "(defn later [] 1)")]
     (analysed! "dead/a.clj")
     (testing "a use in a #_ and in a comment is found, marked as dead"
-      (let [uses (an/find-usages 'dead.lib/helper)]
+      (let [uses (remove :declaration (an/find-usages 'dead.lib/helper))]
         (is (= [[2 :discard] [3 nil] [5 :comment]]
                (sort-by first (map (juxt :line :dead) uses))))
         (is (every? #(= "lib/helper" (text-at %)) uses))
         (is (every? #(= 'dead.a (ns-name (:from-ns %))) uses))))
+    (testing "and the :refer that names it is there too, dead code or not: it is
+    what makes lib/helper mean that var and what a rename would have to rewrite"
+      (let [decl (filter :declaration (an/find-usages 'dead.lib/helper))]
+        (is (= [[1 :refer]] (map (juxt :line :declaration) decl)))
+        (is (= "helper" (text-at (first decl))))
+        (is (nil? (:dead (first decl))))))
     (testing "a macro in dead code is a macro use, and is not expanded"
       (is (= [[7 true :comment]]
              (map (juxt :line :macro :dead) (an/find-usages 'dead.lib/mac)))))

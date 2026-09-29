@@ -122,14 +122,84 @@
 
 ;; A usage/def span. The sink files one per var/keyword/class occurrence - by far
 ;; the most numerous fact - so its shape drives allocation during an analysed load.
+(defn- libspec?
+  "clojure.core/libspec?, and it has to be the same test: it is what tells one lib
+  and its options from a prefix and the specs under it, and a vector whose second
+  element is a keyword - or which has none - is the first of those."
+  [x]
+  (or (symbol? x)
+      (and (vector? x) (or (nil? (second x)) (keyword? (second x))))))
+
+(defn- opts-of
+  "The trailing key/value options of a libspec, as a map.
+
+  In pairs rather than through `apply hash-map', because this reads a form somebody
+  is still writing: an option with no value yet is an odd count, and a walk that
+  threw on one would fail the macroexpansion of the `ns' form it is looking at -
+  turning a half-typed require into a file that will not load."
+  [more]
+  (into {} (map vec) (partition 2 more)))
+
+(defn- spec-refers
+  "The [qualified-name written-symbol] pairs the libspec `spec' writes, under the
+  prefix `prefix' - what its :refer, its :only and the keys of its :rename name.
+
+  A :rename's keys are in because they are the var's name as this file writes it:
+  {twice t2} renames what `twice' means here, and a rename of the var itself has
+  to replace that key. Its values are not - they are the new name, and no var
+  anywhere is called that.
+
+  :refer :all names nothing in particular and is left alone, as a plain require is:
+  what it writes is the namespace, not any of the names in it."
+  [prefix spec]
+  (cond
+    (symbol? spec) nil
+
+    (libspec? spec)
+    (let [lib     (if prefix (symbol (str prefix \. (first spec))) (first spec))
+          opts    (opts-of (next spec))
+          named   (concat (when (sequential? (:refer opts)) (:refer opts))
+                          (when (sequential? (:only opts)) (:only opts))
+                          (when (map? (:rename opts)) (keys (:rename opts))))]
+      (for [written named :when (simple-symbol? written)]
+        [(symbol (name lib) (name written)) written]))
+
+    (sequential? spec)
+    (let [prefix (if prefix (symbol (str prefix \. (first spec))) (first spec))]
+      (mapcat #(spec-refers prefix %) (next spec)))))
+
+(defn- ns-form-refers
+  "The [qualified-name written-symbol] pairs an `ns' form writes in its clauses.
+
+  Nothing is resolved: the namespaces these name are not loaded yet - this form is
+  what loads them - so a name is qualified by the libspec it is written under and
+  by nothing else. Which is also why a name that turns out not to be there is
+  recorded all the same: the form is about to throw over it, and the file it is in
+  never commits.
+
+  :refer-clojure's :only and :rename name vars of clojure.core, which is the one
+  clause that writes a namespace nowhere in itself."
+  [form]
+  (let [more (->> (next form) next        ; past the name
+                  (drop-while string?)    ; past the docstring
+                  (drop-while map?))]     ; past the attribute map
+    (mapcat (fn [clause]
+              (when (sequential? clause)
+                (case (first clause)
+                  (:require :use) (mapcat #(spec-refers nil %) (next clause))
+                  :refer-clojure  (spec-refers nil (vec (cons 'clojure.core (next clause))))
+                  nil)))
+            more)))
+
 ;; A record with primitive int coordinates costs ~1/7th the bytes of the equivalent
 ;; array-map (measured), chiefly by not boxing the four coordinates into Integers.
 ;; The four coordinates are always ints at the sink boundary (IAnalysisSink passes
 ;; them as int); an absent end-line/end-column arrives non-nat and is stored as -1.
 ;; from-ns is the referencing namespace (nil for a def); macro is true for a
 ;; macro-call usage, else nil; dead is :discard or :comment for a usage in code the
-;; program does not run (see dead-facts), else nil. Locals use their own record
-;; (LocalSpan) below.
+;; program does not run (see dead-facts), else nil; declaration is :refer or :import
+;; for the name an ns form writes in a clause rather than a use of it (see
+;; referUsage), else nil. Locals use their own record (LocalSpan) below.
 ;;
 ;; `entity` is the thing this span is ABOUT - the var key for a usage/def, the Keyword
 ;; for a keyword usage, the class-name string for a class usage. Carrying it on the
@@ -137,7 +207,8 @@
 ;; there is no [op a b] tuple wrapper per fact (one fewer allocation each, and one
 ;; fewer object retained in the :forms log for the life of the code). span->map never
 ;; exposes it, so the public span shape is unchanged.
-(defrecord Span [entity source ^int line ^int column ^int end-line ^int end-column from-ns macro dead])
+(defrecord Span [entity source ^int line ^int column ^int end-line ^int end-column from-ns macro dead
+                 declaration])
 
 (defn- norm-end [x] (if (nat-int? x) (int x) -1))
 
@@ -146,8 +217,10 @@
   ([entity source line column el ec from-ns macro]
    (span entity source line column el ec from-ns macro nil))
   ([entity source line column el ec from-ns macro dead]
+   (span entity source line column el ec from-ns macro dead nil))
+  ([entity source line column el ec from-ns macro dead declaration]
    (->Span entity source (int line) (int column) (norm-end el) (norm-end ec)
-           from-ns (when macro true) dead)))
+           from-ns (when macro true) dead declaration)))
 
 ;; A local binding's def/use site. Locals are numerous too (every fn-arg and
 ;; let-binding), so they get the same lightweight-record treatment as Span rather
@@ -173,15 +246,16 @@
 (defn- span->map
   "Normalise a Span record to the documented plain-map span shape, for the public
   query API - so results carry no record type and compare = to map literals. Omits
-  an absent end-line/end-column (stored as -1) and a nil from-ns/macro/dead, exactly
-  reproducing the map the sink used to build."
+  an absent end-line/end-column (stored as -1) and a nil from-ns/macro/dead/
+  declaration, exactly reproducing the map the sink used to build."
   [s]
   (cond-> {:source (:source s) :line (:line s) :column (:column s)}
     (nat-int? (:end-line s))   (assoc :end-line (:end-line s))
     (nat-int? (:end-column s)) (assoc :end-column (:end-column s))
     (:from-ns s)               (assoc :from-ns (:from-ns s))
     (:macro s)                 (assoc :macro true)
-    (:dead s)                  (assoc :dead (:dead s))))
+    (:dead s)                  (assoc :dead (:dead s))
+    (:declaration s)           (assoc :declaration (:declaration s))))
 
 (defn- spans->maps [spans]
   (when spans (into #{} (map span->map) spans)))
@@ -889,6 +963,25 @@
     (when-let [of (current-form)]
       (add-fact! of CAT-CLASSES (span (class-key c) source line column el ec from-ns nil)))
     nil)
+  (nsForm [_ form nsym source]
+    ;; Filed with the uses, marked for what they are: one list of places the name is
+    ;; written, which is what a rename walks, and a mark on the ones that are the
+    ;; declaration - which is what counts-as-use? reads and what a client shows
+    ;; differently.
+    (when-let [of (current-form)]
+      (let [from-ns (create-ns nsym)]
+        (doseq [[qsym written] (ns-form-refers form)
+                :let [m (meta written)]
+                :when (:line m)]
+          (add-fact! of CAT-USAGES
+                     (span qsym source (:line m) (:column m) (:end-line m) (:end-column m)
+                           from-ns nil nil :refer)))))
+    nil)
+  (importUsage [_ c from-ns source line column el ec]
+    (when-let [of (current-form)]
+      (add-fact! of CAT-CLASSES
+                 (span (class-key c) source line column el ec from-ns nil nil :import)))
+    nil)
   (macroExpansion [_ macro from-ns source line column el ec record-usage?]
     (when-let [of (current-form)]
      (when-let [mk (var-key macro)]      ; skip a nil-ns macro var (see varUsage)
@@ -1278,11 +1371,19 @@
 (defn find-usages
   "Usage sites recorded for a var - pass the Var, or its fully-qualified name symbol
   (my.ns/foo). Returns a set of spans
-  {:from-ns :source :line :column :end-line :end-column [:macro] [:dead]}.
+  {:from-ns :source :line :column :end-line :end-column [:macro] [:dead]
+   [:declaration]}.
 
   Code the program does not run is included: a use in a #_ carries :dead :discard,
   one in a (comment ...) :dead :comment. It is resolved rather than compiled - see
   the dead code section - so it can name something the compiler would not have.
+
+  THE NS FORM'S OWN MENTION is included too, carrying :declaration :refer - the name
+  as it is written in a :refer, a :use's :only or a :refer-clojure's :only. It is not
+  a use of the var and does not count as one (counts-as-use?), but it is a place the
+  name is written, and a rename that skipped it would leave the ns form naming
+  something gone. See IAnalysisSink.referUsage; an :as alias is not this - it names a
+  namespace, and ns-referenced-namespaces is the question about those.
 
   A PROTOCOL answers the places that implement it as well. A `deftype`, a `defrecord`
   or a `reify` naming a protocol names the interface it generated by the time the
@@ -1321,7 +1422,12 @@
 (defn find-class-usages
   "Occurrence sites recorded for class c - a java.lang.Class, or its fully-qualified
   name as a string/symbol. Usages are keyed by class name, so a reloaded class's
-  occurrences unify with the original's and no stale Class/loader is pinned."
+  occurrences unify with the original's and no stale Class/loader is pinned.
+
+  The name an :import writes is among them, carrying :declaration :import, for the
+  reason find-usages keeps a :refer: it is where the name is written and what a
+  rename replaces. It is not a use and does not count as one - an import used
+  nowhere else is still an unused import."
   [c]
   (spans->maps (get (:class-usages (derived @model)) (if (class? c) (.getName ^Class c) (str c)))))
 
@@ -1388,9 +1494,15 @@
   A usage in a #_ does not: the code is gone, and a require kept alive by it is a
   require nothing needs. A usage in a (comment ...) does: a rich comment block is
   code meant to be run at the REPL, and dropping the require it uses breaks it -
-  which is also how clj-kondo counts it."
+  which is also how clj-kondo counts it.
+
+  A DECLARATION does not, and cannot: what `:refer [f]' and `:import [p C]' name is
+  the very thing these lints ask about, so counting them would answer \"is this
+  refer used\" with the refer itself and no unused refer or import could ever be
+  reported again. They are in find-usages because a rename has to rewrite them; they
+  are not uses."
   [s]
-  (not= :discard (:dead s)))
+  (and (not= :discard (:dead s)) (nil? (:declaration s))))
 
 (defn ns-referenced-namespaces
   "Namespace-name symbols whose vars or namespaced keywords are referenced from

@@ -239,7 +239,28 @@ Few and centralized:
 | Java interop (class / field / method) | `StaticFieldExpr` / `QualifiedMethodExpr` branches in `analyzeSymbol`; host-method parsers |
 | macro **usage** + compile-time edge | `macroexpand1` (`Compiler.java:7566`): always record the compile-time edge "this file depends on M"; record the "macro M used here" usage only for a source-written call (the macro name is textually present) |
 | keyword usage | in the **reader**, at `::` resolution (`matchSymbol`) — see §6 |
-| require / refer / alias / import | do **not** parse `ns` forms; let them run, then read `Namespace` alias/mapping/refer state (authoritative; handles `ns`, bare `require`, `use`, dynamic requires uniformly) |
+| require / refer / alias / import | do **not** parse `ns` forms for what a namespace *has*; let them run, then read `Namespace` alias/mapping/refer state (authoritative; handles `ns`, bare `require`, `use`, dynamic requires uniformly). What a clause *writes* is another matter — see below |
+
+**The names an `ns` form writes.** Reading the namespace's state says which vars it
+refers and which classes it imports; it does not say where in the file those names are
+written, and a `:refer [helper]` is a place `helper` is written — the place that makes the
+short name mean that var, and one a rename has to rewrite along with the call sites. Neither
+half reaches the capture points above: the specs are handed on QUOTED, so nothing in them is
+ever resolved as a reference, and a quoted symbol loses its reader position when the form is
+compiled, so by the time `refer` runs there is nothing left to say where the name was. So
+both are captured while the form is EXPANDING, the last moment at which they exist:
+`clojure.core/ns` hands the whole form to `IAnalysisSink.nsForm` and `clojure.core/import`
+hands its specs to `Compiler.sinkImportSpecs`, each from its own macro body. `import` is
+separate because it is also written on its own, and because its expansion has each class as
+a string.
+
+Nothing is resolved at that point — the target namespaces are not loaded yet, the `ns` form
+is what loads them — so `clojure.analysis` qualifies each name by the libspec it is written
+under and records it with `:declaration :refer` or `:declaration :import`. They join the
+usages, because "where is this name written" is one list and a rename walks all of it; they
+are marked, because a declaration is not a use; and `counts-as-use?` leaves them out, because
+a refer or an import kept alive by its own mention is one the unused-* lints could never
+report. `:exclude` is not among them: it names what the namespace will not be writing.
 
 One rule cleans up after the last of those. A macro that DEFINES a name often
 writes that same symbol again in its expansion - `defmacro` hands the name to

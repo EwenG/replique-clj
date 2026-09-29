@@ -3462,6 +3462,10 @@
   [& import-symbols-or-lists]
   (let [specs (map #(if (and (seq? %) (= 'quote (first %))) (second %) %) 
                    import-symbols-or-lists)]
+    ;; where each class is named, for analysis, while the names are still symbols
+    ;; the reader positioned - the expansion below has only their full names as
+    ;; strings. A no-op unless a sink is installed. See Compiler.sinkImportSpecs.
+    (clojure.lang.Compiler/sinkImportSpecs specs)
     `(do ~@(map #(list 'clojure.core/import* %)
                 (reduce1 (fn [v spec] 
                           (if (symbol? spec)
@@ -5863,6 +5867,12 @@
         references (remove #(= :gen-class (first %)) references)
         ;ns-effect (clojure.core/in-ns name)
         name-metadata (meta name)]
+    ;; the form as it was written, for analysis - a no-op unless a sink is
+    ;; installed. Here rather than in the expansion because what a sink wants from
+    ;; it are the names the clauses write, and those are about to be quoted: a
+    ;; quoted symbol keeps no reader position once the form is compiled. See
+    ;; Compiler.sinkNsForm.
+    (clojure.lang.Compiler/sinkNsForm &form name)
     `(do
        (clojure.core/in-ns '~name)
        ~@(when name-metadata

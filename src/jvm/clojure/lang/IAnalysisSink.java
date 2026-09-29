@@ -129,6 +129,54 @@ void macroExpansion(Var macro, Namespace fromNs, String source,
                     int line, int column, int endLine, int endColumn,
                     boolean recordUsage);
 
+/**
+ * An {@code ns} form, handed over whole as it was written, while it is expanding.
+ * {@code name} is the namespace it declares.
+ *
+ * What a sink wants from it is the names its {@code :require} / {@code :use} /
+ * {@code :refer-clojure} clauses write in a {@code :refer}, an {@code :only} or a
+ * {@code :rename} - the mentions that make a short name mean a var. They are the
+ * one place a var's name is written that no analysis of code can reach, and they
+ * are unreachable twice over: the specs are handed on as quoted data, so nothing
+ * in them is ever resolved as a reference, and a quoted symbol loses its reader
+ * position when the form is compiled, so by the time {@code refer} runs there is
+ * nothing left to say where the name was written. Expanding is the last moment
+ * both facts exist, which is why this is the form rather than a resolved event.
+ *
+ * Nothing is resolved here: the target namespaces are not loaded yet - the {@code
+ * ns} form is what loads them - so a sink reads the names the clauses write and
+ * qualifies them itself. Nothing is compiled from the specs either, so no other
+ * event reports what they name; {@link #deadForm} hands a form over for the same
+ * reason.
+ *
+ * A sink that records these should mark them for what they are - {@code
+ * clojure.analysis} marks the span {@code :declaration :refer} - and leave them out
+ * of the unused-* lints: a refer kept alive by its own {@code :refer} would be a
+ * refer nothing could ever report.
+ *
+ * A default method, so a sink with no use for declarations need not implement it.
+ */
+default void nsForm(Object form, Symbol name, String source){
+}
+
+/**
+ * A class an {@code ns} form names in an {@code :import} - {@link #referUsage}'s
+ * fact about a class, and unreachable for one more reason besides: {@code
+ * clojure.core/import} turns each spec into the class's full name as a STRING
+ * before {@code import*} is ever analysed, so the written name's position exists
+ * only while the macro is expanding.
+ *
+ * The span is the name the spec writes, which under a package spec is the short
+ * one: {@code (:import [java.io File])} is positioned at {@code File}, and {@code
+ * (:import java.io.File)} over the whole of it. Either way it is what a rename
+ * replaces, and {@code c} says which class it named.
+ *
+ * A default method, for {@link #referUsage}'s reason.
+ */
+default void importUsage(Class c, Namespace fromNs, String source,
+                         int line, int column, int endLine, int endColumn){
+}
+
 /** The {@code kind} of dead code a {@code #_} discard is. */
 Keyword DISCARD = Keyword.intern(null, "discard");
 

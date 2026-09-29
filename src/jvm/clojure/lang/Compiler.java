@@ -439,6 +439,63 @@ static void sinkClassUsage(Class c, Symbol sym){
 		}
 }
 
+// The ns form, handed to the sink as it was written. clojure.core/ns calls this
+// from its own body, i.e. while it is expanding, because that is the last moment
+// the names its clauses write still carry the reader's position: the expansion
+// passes every spec on QUOTED, and a quoted symbol's metadata does not survive the
+// form being compiled - by the time refer runs, the symbol it is handed is a bare
+// Symbol.intern with nothing to say where it was written. See
+// IAnalysisSink.nsForm.
+public static void sinkNsForm(Object form, Object name){
+	IAnalysisSink sink = analysisSink();
+	if(sink != null && name instanceof Symbol)
+		sink.nsForm(form, (Symbol) name, (String) SOURCE_PATH.deref());
+}
+
+// The classes an (import ...) names. clojure.core/import calls this from its own
+// body, i.e. while it is being macroexpanded, because that is the last moment the
+// written names exist: the expansion it returns carries each class as its full
+// name in a STRING, and a string remembers no position. Expanding happens inside
+// the form the sink has open, so the facts land on the ns form like every other.
+//
+// specs are the shapes import takes: a symbol naming a class in full, or a
+// package symbol followed by the short names under it.
+public static void sinkImportSpecs(Object specs){
+	if(analysisSink() == null)
+		return;
+	for(ISeq s = RT.seq(specs); s != null; s = s.next())
+		{
+		Object spec = s.first();
+		if(spec instanceof Symbol)
+			sinkImportUsage((Symbol) spec, ((Symbol) spec).getName());
+		else
+			{
+			ISeq parts = RT.seq(spec);
+			if(parts == null)
+				continue;
+			Object pkg = parts.first();
+			for(ISeq c = parts.next(); c != null; c = c.next())
+				if(c.first() instanceof Symbol)
+					sinkImportUsage((Symbol) c.first(), pkg + "." + c.first());
+			}
+		}
+}
+
+// One name of an :import, positioned at the name as the spec writes it. The class
+// is looked up without loading, the way every other class reference here is, and a
+// name that reaches none is skipped: what an import of a class that is not there
+// does is throw a moment later, and there is nothing to key a usage by until then.
+private static void sinkImportUsage(Symbol sym, String className){
+	if(!isSourceSymbol(sym))
+		return;
+	Class c = maybeClassNonLoading(className);
+	if(c == null)
+		return;
+	int[] pos = symbolPosition(sym);
+	analysisSink().importUsage(c, currentNS(), (String) SOURCE_PATH.deref(),
+	                           pos[0], pos[1], pos[2], pos[3]);
+}
+
 // [line, column, endLine, endColumn] for a source symbol. Prefers the precise
 // span the reader attached (Layer 1); falls back to the enclosing form's
 // line/column with -1 ends when the symbol carries no reader position.
