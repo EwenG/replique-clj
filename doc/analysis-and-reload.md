@@ -337,6 +337,42 @@ Split: **referenceable** (has identity → find-usages / jump-to-def) vs **ancho
 
 - **Literals** — no identity, no find-usages; skip until a specific lint asks.
 
+### 6.1 Code the program does not run: `#_` and `(comment ...)`
+
+Nothing here is compiled, so no capture point above sees it. It is still code someone
+wrote and runs at the REPL, so find-usages and rename have to see it. It is **resolved,
+not compiled**:
+
+- **Getting the form.** The sink's `deadForm(form, kind, ns, source)` (a default method)
+  receives it from two places. `LispReader.DiscardReader` sends the discarded form
+  (`:discard`), except under `*suppress-read*`: the branch of a reader conditional that
+  this platform does not take is another platform's code, the same rule `keywordUsage`
+  follows. `Compiler.macroexpand1` sends the whole form when the macro is
+  `clojure.core/comment` (`:comment`), nested ones included.
+- **Resolving it.** The sink keeps the forms on the file frame. When the file ends,
+  `walk-dead-code` resolves every symbol the reader wrote (one with `:line`) in the
+  namespace current where the form is written. Resolving at the end of the file means
+  that defs and requires written after a rich comment block are found. There is no
+  macroexpansion, no eval, no interning and no class initialisation, and code that no
+  longer compiles raises no error.
+- **Locals.** Without macroexpansion, locals are found by knowing the binding forms of
+  `clojure.core` and destructuring (`let`, `fn`, `loop`, `for`, `doseq`, `letfn`,
+  `deftype`, `reify`, `catch`, ...). This is exact for those forms and a guess for any
+  other macro that binds a name. The locals of the live code around a dead form (a `#_`
+  inside a `defn`) come from the top-level form's own local facts: a name bound earlier
+  in the same form is taken to be that local.
+- **Facts.** The walk produces var usages and class usages marked `:dead :discard` or
+  `:dead :comment`, and files them on one extra form per file. It produces no defs (a def
+  in a comment must not keep a deleted var from being pruned), no local facts and no
+  macro edges. Dead usages play no part in the compile graphs, the reload order or
+  prune's warnings.
+- **Who counts them.** find-usages returns them, with `:dead`. The `unused-*` lints count
+  a use in a `comment` (a rich comment block is REPL code, and dropping its require
+  breaks it; clj-kondo counts it too) but not one in a `#_` (`counts-as-use?`).
+
+`clojure.cljs.analysis` uses the same walk with its own resolution (a ClojureScript var,
+or a macro for a call head).
+
 ## 7. The shared mechanism: provenance + generation
 
 Single-ns reload, stale recompile, and prune are all "namespace **N** is being recompiled;
@@ -696,6 +732,10 @@ the explicit operation that removes vars whose defining form vanished from the s
 - **keyword jump-to-def** is convention-based at best (no true def site).
 - `defmethod` removal, direct-linking caller staleness (if enabled), and reflective var usage
   are all partial — documented above where they bite.
+- **Dead code (§6.1) is resolved by name, not compiled**: a name bound by a macro the walk
+  does not know is recorded as a use of the var or class it also names, and a local of the
+  live code around a `#_` is recognised only by having been bound earlier in the same
+  top-level form. A syntax-quote inside a `#_` is still resolved by the reader, as live.
 - **Syntax-quote refs resolve at read time**, so a var referenced inside a macro body *before*
   it is defined in the same file (a bare forward reference, no `declare`) doesn't resolve and
   is skipped. Cross-namespace refs and `declare`d forwards are unaffected.

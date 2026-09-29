@@ -1582,3 +1582,90 @@
     (is (= (.getCanonicalFile (io/file @root a))
            (.getCanonicalFile (an/source->file a))))
     (is (nil? (an/source->file "onfile/nothing.clj")))))
+
+;; --- code the program does not run: #_ and (comment ...) -------------------
+
+(deftest dead-code-is-resolved-for-find-usages
+  (let [_ (written! "dead/lib.clj"
+                    "(ns dead.lib)"
+                    "(defn helper [x] x)"
+                    "(defmacro mac [x] x)")
+        _ (written! "dead/a.clj"
+                    "(ns dead.a (:require [dead.lib :as lib :refer [helper]]))"
+                    "#_(lib/helper 1)"
+                    "(defn f [helper] #_(helper 2) (lib/helper helper))"
+                    "(comment"
+                    "  (lib/helper 3)"
+                    "  (let [helper 4] (helper))"
+                    "  (lib/mac (later))"
+                    "  (fn [{:keys [later]}] later)"
+                    "  (java.util.ArrayList.)"
+                    "  (defn ghost [] 1)"
+                    "  undefined-thing"
+                    "  (quote (later)))"
+                    "(defn later [] 1)")]
+    (analysed! "dead/a.clj")
+    (testing "a use in a #_ and in a comment is found, marked as dead"
+      (let [uses (an/find-usages 'dead.lib/helper)]
+        (is (= [[2 :discard] [3 nil] [5 :comment]]
+               (sort-by first (map (juxt :line :dead) uses))))
+        (is (every? #(= "lib/helper" (text-at %)) uses))
+        (is (every? #(= 'dead.a (ns-name (:from-ns %))) uses))))
+    (testing "a macro in dead code is a macro use, and is not expanded"
+      (is (= [[7 true :comment]]
+             (map (juxt :line :macro :dead) (an/find-usages 'dead.lib/mac)))))
+    (testing "resolved at the end of the file: a def after the comment is found"
+      (is (= [7] (map :line (an/find-usages 'dead.a/later)))))
+    (testing "a local is not a use: bound in the dead code, or in the live code around it"
+      (is (not-any? #(and (:dead %) (#{3 6} (:line %))) (an/find-usages 'dead.lib/helper)))
+      (is (not-any? #(#{8 12} (:line %)) (an/find-usages 'dead.a/later))))
+    (testing "a class it names, the way the compiler records one"
+      (let [uses (an/find-class-usages java.util.ArrayList)]
+        (is (= [[9 :comment]] (map (juxt :line :dead) uses)))
+        (is (= "java.util.ArrayList" (text-at (first uses))))))
+    (testing "nothing in it is defined, nor recorded as a def"
+      (is (nil? (an/definition 'dead.a/ghost)))
+      (is (nil? (ns-resolve 'dead.a 'ghost))))))
+
+(deftest dead-code-and-the-lints
+  (let [_ (written! "deadl/lib.clj"
+                    "(ns deadl.lib)"
+                    "(defn one [] 1)")
+        _ (written! "deadl/other.clj"
+                    "(ns deadl.other)"
+                    "(defn two [] 2)")
+        _ (written! "deadl/a.clj"
+                    "(ns deadl.a"
+                    "  (:require [deadl.lib :as lib] [deadl.other :as other])"
+                    "  (:import [java.util Date UUID]))"
+                    "#_(other/two)"
+                    "#_(Date.)"
+                    "(comment (lib/one) (UUID/randomUUID))")]
+    (analysed! "deadl/a.clj")
+    (testing "a use in a comment keeps a require; one in a #_ does not"
+      (is (= '{other deadl.other} (an/unused-aliases 'deadl.a)))
+      (is (= {'Date java.util.Date} (an/unused-imports 'deadl.a))))))
+
+(deftest dead-code-in-the-branch-not-taken-is-not-this-programs
+  (let [_ (written! "deadr/a.cljc"
+                    "(ns deadr.a)"
+                    "(defn f [] 1)"
+                    "#?(:cljs [#_(f)] :clj nil)"
+                    "#?(:cljs (comment (f)))"
+                    "#?(:clj [#_(f)])")]
+    (an/run-analysis #(load "/deadr/a"))
+    (is (= [[5 :discard]] (map (juxt :line :dead) (an/find-usages 'deadr.a/f))))))
+
+(deftest dead-code-is-not-a-compile-time-dependency
+  (let [_ (written! "deadg/lib.clj"
+                    "(ns deadg.lib)"
+                    "(defmacro m [] 1)"
+                    "(defprotocol P (p [x]))")
+        a (written! "deadg/a.clj"
+                    "(ns deadg.a (:require [deadg.lib :as lib]))"
+                    "(comment (lib/m) (deftype T [] lib/P (p [_] 1)) deadg.lib.P)")]
+    (analysed! a)
+    (is (seq (an/find-usages 'deadg.lib/m)))
+    (is (empty? (get (class-graph) a)))
+    (is (empty? (get (macro-graph) a)))
+    (is (empty? (var-graph a "deadg/lib.clj")))))

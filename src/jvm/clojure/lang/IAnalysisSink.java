@@ -129,4 +129,24 @@ void macroExpansion(Var macro, Namespace fromNs, String source,
                     int line, int column, int endLine, int endColumn,
                     boolean recordUsage);
 
+/** The {@code kind} of dead code a {@code #_} discard is. */
+Keyword DISCARD = Keyword.intern(null, "discard");
+
+/** The {@code kind} of dead code a {@code (comment ...)} call is. */
+Keyword COMMENT = Keyword.intern(null, "comment");
+
+/**
+ * Code written in the file that the program does not run, handed over whole:
+ * the form a {@code #_} discards ({@code kind} {@link #DISCARD}, from the reader,
+ * except in the branch of a reader conditional this platform does not take), and
+ * a call of {@code clojure.core/comment} ({@link #COMMENT}, from the compiler, as
+ * it expands it). Nothing is compiled from it, so no other event reports what it
+ * names; a sink that wants to know resolves the symbols in it itself. {@code ns}
+ * is the namespace current where the form is written.
+ *
+ * A default method, so a sink with no use for dead code need not implement it.
+ */
+default void deadForm(Object form, Keyword kind, Namespace ns, String source){
+}
+
 }

@@ -37,7 +37,8 @@
   Drivers: run-analysis (cold), load-file! (single file, atomic), stale-reload!
   (the compile-time cascade, §9), reload-files! (a given set, in dependency order),
   retract-file!. changed-files / deleted-files are what the disk says about the
-  files already analysed. Query with find-usages, definition,
+  files already analysed. Query with find-usages (which includes the code in #_ and
+  (comment ...), resolved without compiling it), definition,
   unused-*, file-namespaces, etc. - find-usages/definition take a Var or its
   fully-qualified name symbol.
 
@@ -126,7 +127,9 @@
 ;; The four coordinates are always ints at the sink boundary (IAnalysisSink passes
 ;; them as int); an absent end-line/end-column arrives non-nat and is stored as -1.
 ;; from-ns is the referencing namespace (nil for a def); macro is true for a
-;; macro-call usage, else nil. Locals use their own record (LocalSpan) below.
+;; macro-call usage, else nil; dead is :discard or :comment for a usage in code the
+;; program does not run (see dead-facts), else nil. Locals use their own record
+;; (LocalSpan) below.
 ;;
 ;; `entity` is the thing this span is ABOUT - the var key for a usage/def, the Keyword
 ;; for a keyword usage, the class-name string for a class usage. Carrying it on the
@@ -134,15 +137,17 @@
 ;; there is no [op a b] tuple wrapper per fact (one fewer allocation each, and one
 ;; fewer object retained in the :forms log for the life of the code). span->map never
 ;; exposes it, so the public span shape is unchanged.
-(defrecord Span [entity source ^int line ^int column ^int end-line ^int end-column from-ns macro])
+(defrecord Span [entity source ^int line ^int column ^int end-line ^int end-column from-ns macro dead])
 
 (defn- norm-end [x] (if (nat-int? x) (int x) -1))
 
 (defn- span
   ([entity source line column el ec] (span entity source line column el ec nil nil))
   ([entity source line column el ec from-ns macro]
+   (span entity source line column el ec from-ns macro nil))
+  ([entity source line column el ec from-ns macro dead]
    (->Span entity source (int line) (int column) (norm-end el) (norm-end ec)
-           from-ns (when macro true))))
+           from-ns (when macro true) dead)))
 
 ;; A local binding's def/use site. Locals are numerous too (every fn-arg and
 ;; let-binding), so they get the same lightweight-record treatment as Span rather
@@ -168,14 +173,15 @@
 (defn- span->map
   "Normalise a Span record to the documented plain-map span shape, for the public
   query API - so results carry no record type and compare = to map literals. Omits
-  an absent end-line/end-column (stored as -1) and a nil from-ns/macro, exactly
+  an absent end-line/end-column (stored as -1) and a nil from-ns/macro/dead, exactly
   reproducing the map the sink used to build."
   [s]
   (cond-> {:source (:source s) :line (:line s) :column (:column s)}
     (nat-int? (:end-line s))   (assoc :end-line (:end-line s))
     (nat-int? (:end-column s)) (assoc :end-column (:end-column s))
     (:from-ns s)               (assoc :from-ns (:from-ns s))
-    (:macro s)                 (assoc :macro true)))
+    (:macro s)                 (assoc :macro true)
+    (:dead s)                  (assoc :dead (:dead s))))
 
 (defn- spans->maps [spans]
   (when spans (into #{} (map span->map) spans)))
@@ -219,8 +225,10 @@
 ;; rank (= count of forms begun in this file). Both are thread-local and touched only
 ;; by the loading thread, so no synchronisation. The frame commits its buffer to the
 ;; model in one swap! at endFile (commit-frame!): fids = base + :seq off the model's
-;; current :next-fid.
-(deftype FileFrame [source ^java.util.ArrayList buffer ^longs counter])
+;; current :next-fid. `dead` collects the file's dead code (deadForm) until endFile
+;; resolves it - see dead-facts.
+(deftype FileFrame [source ^java.util.ArrayList buffer ^longs counter
+                    ^java.util.ArrayList dead])
 
 ;; Fact categories. Facts are stored in one list PER CATEGORY rather than in a single
 ;; list of [op a b] tuples, so the category is implied by which list a fact is in and
@@ -285,6 +293,344 @@
         (-> m (update-in [:source->forms src] disj fid) (drop-empty :source->forms src))
         m))
     m))
+
+;; --- dead code: #_ and (comment ...) ---------------------------------------
+
+;; Code written in a file that the program does not run: the form a #_ discards, and
+;; the body of a (comment ...). The compiler never compiles it, so none of the events
+;; above report what it names - but it is still code somebody wrote, reads, and runs
+;; at a REPL, so find-usages and a rename have to see it.
+;;
+;; It is RESOLVED, not compiled. The sink is handed the form whole (deadForm), and at
+;; the end of the file each symbol the reader wrote in it is looked up in the
+;; namespace it was written in - the first thing the compiler would do, without the
+;; rest: no macroexpansion, no eval, nothing interned, no class initialised, and no
+;; error from code that no longer compiles, which dead code often is. At the END of
+;; the file, because a rich comment block uses what its file defines and requires,
+;; and much of that is written after it.
+;;
+;; Macros are not expanded, so which symbols are locals is decided by knowing the
+;; binding forms of clojure.core by name (let, fn, loop, for, letfn, deftype, ...)
+;; and destructuring. That is exact for them and a guess for any other macro that
+;; binds a name: a name it binds that also names a var or a class is recorded as a
+;; use of it. The locals of the LIVE code around a dead form - a #_ or a comment
+;; inside a defn - are taken from the top-level form's own local facts: a name the
+;; form bound before the dead symbol is taken to be that local.
+;;
+;; What comes out is var and class usages, marked :dead :discard or :dead :comment,
+;; filed on one extra form per file. Nothing else: no defs (a def in a comment defines
+;; nothing, and must not keep a deleted var from being pruned), no locals, no macro
+;; edges, no part in the compile graphs or the reload order. Whether a query counts
+;; them is up to it - see counts-as-use?.
+
+(defn- pattern-locals
+  "What binding pattern `pat` binds, as [names code]: the local names it introduces,
+  and the forms inside it that are code - the defaults of an :or."
+  [pat]
+  (let [names (volatile! #{})
+        code  (volatile! [])]
+    (letfn [(walk [p]
+              (cond
+                (symbol? p) (when-not (= '& p) (vswap! names conj (name p)))
+                (vector? p) (run! walk p)
+                (map? p)
+                (doseq [[k v] p]
+                  (cond
+                    (= :as k) (walk v)
+                    (= :or k) (when (map? v) (vswap! code into (vals v)))
+                    (and (keyword? k) (#{"keys" "syms" "strs"} (name k)))
+                    (doseq [x v :when (or (symbol? x) (keyword? x))]
+                      (vswap! names conj (name x)))
+                    :else (walk k)))))]
+      (walk pat))
+    [@names @code]))
+
+(declare walk-dead)
+
+(defn- walk-all [forms env]
+  (doseq [f forms] (walk-dead f env)))
+
+(defn- with-locals [env names]
+  (update env :locals into names))
+
+(defn- bind-pairs
+  "Walk a binding vector, each init seeing the names bound before it; the env its
+  body sees. `comprehension?` for the :let / :when / :while of a for or a doseq."
+  [bvec env comprehension?]
+  (reduce (fn [env [pat init]]
+            (cond
+              (and comprehension? (= :let pat) (vector? init)) (bind-pairs init env false)
+              (and comprehension? (keyword? pat))              (do (walk-dead init env) env)
+              :else (let [[names code] (pattern-locals pat)
+                          _   (walk-dead init env)
+                          env (with-locals env names)]
+                      (walk-all code env)
+                      env)))
+          env (partition 2 bvec)))
+
+(defn- walk-let [args env comprehension?]
+  (let [[bvec & body] args]
+    (if (vector? bvec)
+      (walk-all body (bind-pairs bvec env comprehension?))
+      (walk-all args env))))
+
+(defn- walk-method
+  "([params] body...) - one arity of a fn, or a method of a deftype or a reify."
+  [[params & body] env]
+  (let [[names code] (pattern-locals params)
+        env          (with-locals env names)]
+    (walk-all code env)
+    (walk-all body env)))
+
+(defn- walk-fn-tail
+  "What follows a fn's name: one arity, or several in lists."
+  [tail env]
+  (if (vector? (first tail))
+    (walk-method tail env)
+    (doseq [m tail]
+      (if (and (seq? m) (vector? (first m)))
+        (walk-method m env)
+        (walk-dead m env)))))
+
+(defn- walk-named-fn-tail
+  "A fn tail that may start with the fn's own name, which is a local in it."
+  [tail env]
+  (if (symbol? (first tail))
+    (walk-fn-tail (rest tail) (with-locals env [(name (first tail))]))
+    (walk-fn-tail tail env)))
+
+(defn- walk-impls
+  "The specs of a deftype, a reify, an extend-type... A method - (name [params]
+  body), or (name ([params] body)...) - binds its params, and its name is the method
+  it implements rather than a reference. Anything else is walked."
+  [specs env]
+  (doseq [x specs]
+    (if (and (seq? x) (symbol? (first x))
+             (let [y (second x)] (or (vector? y) (and (seq? y) (vector? (first y))))))
+      (walk-fn-tail (rest x) env)
+      (walk-dead x env))))
+
+(defn- class-non-loading
+  "The class named `n`, or nil - loaded if it must be, never initialised."
+  [^String n]
+  (try (RT/classForNameNonLoading n) (catch Throwable _ nil)))
+
+(defn- dead-class
+  "The class unqualified symbol `sym` names in `ns`: imported, or fully qualified."
+  [^clojure.lang.Namespace ns sym]
+  (let [o (.getMapping ns sym)]
+    (cond (class? o)                   o
+          (.contains (name sym) ".")   (class-non-loading (name sym))
+          :else                        nil)))
+
+(defn- dead-target
+  "What `sym` names in `ns` - a Var, a Class, or nil - the way the compiler would
+  resolve it, but touching nothing: no var interned, no class initialised, and no
+  answer rather than an error for a name that resolves to nothing.
+
+  `alias/name` and `ns.name/name` are vars; `Class/member` is the class, as the
+  compiler records it; `Foo.` is the class it constructs; `.method` is nothing."
+  [^clojure.lang.Namespace ns sym]
+  (let [n (name sym)]
+    (if-let [q (namespace sym)]
+      (let [qs (symbol q)]
+        (if-let [^clojure.lang.Namespace target (or (.lookupAlias ns qs) (find-ns qs))]
+          (.findInternedVar target (symbol n))
+          (dead-class ns qs)))
+      (let [o (.getMapping ns sym)]
+        (cond
+          (or (var? o) (class? o)) o
+          (.startsWith n ".")      nil
+          (.endsWith n ".")        (dead-class ns (symbol (subs n 0 (dec (count n)))))
+          (.contains n ".")        (class-non-loading n)
+          :else                    nil)))))
+
+(defn- jvm-target
+  "dead-target in namespace `ns`, as the walk's :target - a head is resolved no
+  differently from any other symbol on the JVM."
+  [ns]
+  (fn [sym _head?] (dead-target ns sym)))
+
+(defn- jvm-op
+  "The walk's :op on the JVM: the var-key of the macro or function a head names."
+  [ns]
+  (fn [sym] (let [t (dead-target ns sym)] (when (var? t) (var-key t)))))
+
+(defn- local?
+  "Is `sym` a local where it is written: bound in the dead code around it, or -
+  going by the top-level form's own local facts - by the live code before it."
+  [env sym]
+  (and (nil? (namespace sym))
+       (let [n (name sym)]
+         (or (contains? (:locals env) n)
+             (when-let [[l c] (get (:outer env) n)]
+               (let [m (meta sym) sl (:line m) sc (:column m)]
+                 (and sl sc (or (> sl l) (and (= sl l) (> sc c))))))))))
+
+(defn- dead-symbol! [sym env head?]
+  (when (and (:line (meta sym)) (not (local? env sym)))
+    (when-let [t ((:target env) sym head?)]
+      ((:emit env) t sym))))
+
+(defn- walk-dead-call [form env]
+  (let [[head & args] form
+        op (when (and (symbol? head) (not (local? env head)))
+             (if (special-symbol? head)
+               head
+               ((:op env) head)))]
+    (if (symbol? head)
+      (when-not (special-symbol? head) (dead-symbol! head env true))
+      (walk-dead head env))
+    (case op
+      (quote clojure.core/ns clojure.core/defprotocol clojure.core/definterface
+             clojure.core/gen-class clojure.core/gen-interface) nil
+      (let* loop* clojure.core/let clojure.core/loop clojure.core/when-let
+            clojure.core/if-let clojure.core/when-some clojure.core/if-some
+            clojure.core/when-first clojure.core/with-open clojure.core/dotimes
+            clojure.core/with-local-vars)
+      (walk-let args env false)
+      (clojure.core/for clojure.core/doseq) (walk-let args env true)
+      (fn* clojure.core/fn) (walk-named-fn-tail args env)
+      (clojure.core/defn clojure.core/defn- clojure.core/defmacro)
+      (walk-fn-tail (drop-while #(or (string? %) (map? %)) (rest args)) env)
+      def (walk-all (rest args) env)
+      clojure.core/defmethod (do (walk-dead (first args) env)
+                                 (walk-dead (second args) env)
+                                 (walk-named-fn-tail (drop 2 args) env))
+      (letfn* clojure.core/letfn)
+      (let [[specs & body] args]
+        (if (vector? specs)
+          (let [star? (= 'letfn* op)
+                names (map #(name (if (seq? %) (first %) %))
+                           (if star? (take-nth 2 specs) specs))
+                env   (with-locals env names)]
+            (if star?
+              (walk-all (take-nth 2 (rest specs)) env)
+              (doseq [s specs :when (seq? s)] (walk-fn-tail (rest s) env)))
+            (walk-all body env))
+          (walk-all args env)))
+      catch (let [[c e & body] args]
+              (walk-dead c env)
+              (walk-all body (cond-> env (symbol? e) (with-locals [(name e)]))))
+      . (let [[target member & more] args]
+          (walk-dead target env)
+          (if (seq? member) (walk-all (rest member) env) (walk-all more env)))
+      clojure.core/case (let [[e & clauses] args]
+                          (walk-dead e env)
+                          (doseq [[test then :as clause] (partition-all 2 clauses)]
+                            (if (= 1 (count clause))
+                              (walk-dead test env)
+                              (walk-dead then env))))
+      (clojure.core/deftype clojure.core/defrecord)
+      (let [[_ fields & specs] args]
+        (walk-impls specs (with-locals env (first (pattern-locals fields)))))
+      (clojure.core/reify clojure.core/extend-type clojure.core/extend-protocol)
+      (walk-impls args env)
+      clojure.core/proxy (walk-impls args (with-locals env ["this"]))
+      (walk-all args env))))
+
+(defn- walk-dead
+  "Walk dead `form`, calling (:emit env) with what each symbol in it names."
+  [form env]
+  (cond
+    (symbol? form)                  (dead-symbol! form env false)
+    (seq? form)                     (when (seq form) (walk-dead-call form env))
+    (map? form)                     (doseq [[k v] form] (walk-dead k env) (walk-dead v env))
+    (or (vector? form) (set? form)) (walk-all form env)
+    :else                           nil))
+
+(defn walk-dead-code
+  "Walk `form`, code the program does not run, calling (emit target sym) for each
+  symbol written in it that names something - see the dead code section.
+
+  The walk is this namespace's; what a name means is the caller's, so that
+  clojure.cljs.analysis walks ClojureScript with it, resolving in its own world:
+
+    :target  (fn [sym head?] ...) what `sym` names, or nil. head? when it is the
+             head of a call, where ClojureScript prefers a macro to a var
+    :op      (fn [sym] ...) the name of the macro or function a head names, as a
+             symbol - clojure.core/let for the binding forms this walk knows - or
+             nil
+    :outer   {name [line column]}, the locals the live code around `form` binds,
+             each where it is first bound (locals-at), or nil
+
+  A form that cannot be walked throws; the caller skips it."
+  [form {:keys [target op emit outer]}]
+  (walk-dead form {:locals #{} :outer outer :target target :op op :emit emit}))
+
+(defn locals-at
+  "{name [line column]} of the named locals among `local-spans` - LocalSpan-shaped:
+  :lname (a string or a symbol) :line :column - each at the first place it is
+  bound. What the walk reads the live code's scope off (walk-dead-code's :outer)."
+  [local-spans]
+  (reduce (fn [acc s]
+            (let [n (some-> (:lname s) name) p [(:line s) (:column s)]]
+              (if (and n (neg? (compare p (get acc n [Long/MAX_VALUE 0]))))
+                (assoc acc n p)
+                acc)))
+          {} local-spans))
+
+(defn- outer-locals
+  "locals-at of the locals open form `of` binds in its live code."
+  [^OpenForm of]
+  (locals-at (aget ^objects (.cats of) CAT-LOCALS)))
+
+(defn- close-dead!
+  "Open form `of` has ended: give the dead code written in it the locals it bound.
+  Its local facts are complete only now - a #_ is read before the form around it is
+  compiled."
+  [^OpenForm of]
+  (let [^java.util.ArrayList dead (.dead ^FileFrame (.frame of))
+        outer (delay (outer-locals of))]
+    (dotimes [i (.size dead)]
+      (let [d (.get dead i)]
+        (when (identical? of (:of d))
+          (.set dead i (-> d (dissoc :of) (assoc :outer @outer)))))))
+  nil)
+
+(defn- commit-dead!
+  "Resolve the dead code of the file frame `fr` - it has loaded to the end, so
+  everything it defines and requires is there - and add what it names to the frame's
+  buffer, as one more form. A dead form that cannot be walked is skipped: it is the
+  program's to be wrong, never the load's."
+  [^FileFrame fr]
+  (let [^java.util.ArrayList dead (.dead fr)]
+    (when-not (.isEmpty dead)
+      (let [source  (.source fr)
+            uses    (java.util.ArrayList.)
+            classes (java.util.ArrayList.)]
+        (doseq [{:keys [form kind ns outer]} dead]
+          (let [emit (fn [t sym]
+                       (let [m  (meta sym) line (:line m) col (:column m)
+                             el (:end-line m -1) ec (:end-column m -1)]
+                         (when col
+                           (if (var? t)
+                             (when-let [k (var-key t)]
+                               (.add uses (span k source line col el ec ns
+                                                (:macro (meta t)) kind)))
+                             ;; Foo. records Foo, as the compiler does
+                             (let [ec (if (and (nil? (namespace sym))
+                                               (.endsWith (name sym) ".")
+                                               (pos? (long ec)))
+                                        (dec (long ec))
+                                        ec)]
+                               (.add classes (span (class-key t) source line col el ec
+                                                   ns nil kind)))))))]
+            (try
+              (walk-dead-code form {:target (jvm-target ns) :op (jvm-op ns)
+                                    :outer outer :emit emit})
+              (catch Exception _ nil))))
+        (when-not (and (.isEmpty uses) (.isEmpty classes))
+          (let [^longs c (.counter fr)
+                seq      (aget c 0)
+                ^Span s1 (first (concat uses classes))]
+            (aset c 0 (inc seq))
+            (.add ^java.util.ArrayList (.buffer fr)
+                  (cond-> {:seq seq :source source :line (.line s1) :column (.column s1)
+                           :ns nil}
+                    (not (.isEmpty uses))    (assoc :usages (vec uses))
+                    (not (.isEmpty classes)) (assoc :class-usages (vec classes))))))))
+    nil))
 
 ;; --- model mutators (called by the sink and by drivers) --------------------
 
@@ -364,6 +710,7 @@
     ;; `(ns ...)` form files under the ns it established). :seq is the begin-order rank;
     ;; commit-frame! turns it into the fid. Filed under the frame's :source (the file).
     (when of
+      (close-dead! of)
       (let [^objects cats (.cats of)]
         (drop-def-echoes! cats)
         (when (some #(let [^java.util.ArrayList l (aget cats (long %))]
@@ -421,7 +768,8 @@
   ;; A new file's load began (Compiler.load re-entered): push a fresh frame. No model
   ;; touch - the file commits only when it finishes (end-file!).
   (when *file-stack*
-    (swap! *file-stack* conj (FileFrame. source (java.util.ArrayList.) (long-array [0]))))
+    (swap! *file-stack* conj (FileFrame. source (java.util.ArrayList.) (long-array [0])
+                                         (java.util.ArrayList.))))
   nil)
 
 (defn- end-file! [_source]
@@ -431,6 +779,7 @@
   ;; the model, and the file keeps whatever it had before.
   (when-let [fr (current-frame)]
     (swap! *file-stack* pop)
+    (commit-dead! fr)
     (commit-frame! fr))
   nil)
 
@@ -454,6 +803,13 @@
   (beginForm [_ source line column] (begin-form! source line column))
   (formStart [_ line column] (form-start! line column))
   (endForm [_] (end-form!))
+  (deadForm [_ form kind ns _source]
+    ;; Kept on the file frame, not the open form: it is resolved when the file ends
+    ;; (commit-dead!). The open form is remembered so that, when it ends, the dead
+    ;; code can be given the locals it binds (close-dead!).
+    (when-let [^FileFrame fr (current-frame)]
+      (.add ^java.util.ArrayList (.dead fr) {:form form :kind kind :ns ns :of (current-form)}))
+    nil)
   (varUsage [_ target from-ns source line column el ec]
     ;; when-let on the key, not let: var-key is nil only for a nil-ns var, which the
     ;; compiler should never resolve to here - but if one slips through, skip it
@@ -875,7 +1231,11 @@
 (defn find-usages
   "Usage sites recorded for a var - pass the Var, or its fully-qualified name symbol
   (my.ns/foo). Returns a set of spans
-  {:from-ns :source :line :column :end-line :end-column [:macro]}.
+  {:from-ns :source :line :column :end-line :end-column [:macro] [:dead]}.
+
+  Code the program does not run is included: a use in a #_ carries :dead :discard,
+  one in a (comment ...) :dead :comment. It is resolved rather than compiled - see
+  the dead code section - so it can name something the compiler would not have.
 
   A PROTOCOL answers the places that implement it as well. A `deftype`, a `defrecord`
   or a `reify` naming a protocol names the interface it generated by the time the
@@ -975,12 +1335,25 @@
       (try (set (vals (ns-imports (create-ns n))))
            (finally (remove-ns n))))))
 
+(defn- counts-as-use?
+  "Does usage span `s` count as a use for the unused-* lints?
+
+  A usage in a #_ does not: the code is gone, and a require kept alive by it is a
+  require nothing needs. A usage in a (comment ...) does: a rich comment block is
+  code meant to be run at the REPL, and dropping the require it uses breaks it -
+  which is also how clj-kondo counts it."
+  [s]
+  (not= :discard (:dead s)))
+
 (defn ns-referenced-namespaces
   "Namespace-name symbols whose vars or namespaced keywords are referenced from
-  ns-sym, per the model."
+  ns-sym, per the model. A var used only in a #_ does not count; one used in a
+  (comment ...) does - see counts-as-use?."
   [ns-sym]
   (let [m (derived @model)
-        from? (fn [uses] (some #(= ns-sym (some-> (:from-ns %) ns-name)) uses))]
+        from? (fn [uses] (some #(and (counts-as-use? %)
+                                     (= ns-sym (some-> (:from-ns %) ns-name)))
+                               uses))]
     (into #{}
           (concat
            (for [[qsym uses] (:usages m)
@@ -992,7 +1365,8 @@
 
 (defn unused-aliases
   "Aliases in ns-sym whose target namespace has no var or namespaced-keyword
-  reference from ns-sym. Returns {alias ns-sym}."
+  reference from ns-sym. Returns {alias ns-sym}. A use in a (comment ...) counts, one
+  in a #_ does not (counts-as-use?)."
   [ns-sym]
   (let [used (ns-referenced-namespaces ns-sym)]
     (into {} (for [[a ns] (ns-aliases ns-sym)
@@ -1001,21 +1375,27 @@
 
 (defn unused-refers
   "Non-core vars referred into ns-sym that are never used from it.
-  Returns {referred-sym var}. clojure.core auto-refers are excluded."
+  Returns {referred-sym var}. clojure.core auto-refers are excluded. A use in a
+  (comment ...) counts, one in a #_ does not (counts-as-use?)."
   [ns-sym]
   (let [uses (:usages (derived @model))
         core (the-ns 'clojure.core)
-        used? (fn [^Var v] (some #(= ns-sym (some-> (:from-ns %) ns-name)) (get uses (var-key v))))]
+        used? (fn [^Var v] (some #(and (counts-as-use? %)
+                                       (= ns-sym (some-> (:from-ns %) ns-name)))
+                                 (get uses (var-key v))))]
     (into {} (for [[sym ^Var v] (ns-refers ns-sym)
                    :when (and (not (identical? core (.ns v))) (not (used? v)))]
                [sym v]))))
 
 (defn unused-imports
   "User-imported classes in ns-sym that are never referenced from it.
-  Returns {imported-sym class}. java.lang.* auto-imports are excluded."
+  Returns {imported-sym class}. java.lang.* auto-imports are excluded. A use in a
+  (comment ...) counts, one in a #_ does not (counts-as-use?)."
   [ns-sym]
   (let [defaults @default-imports
-        used? (fn [c] (some #(= ns-sym (some-> (:from-ns %) ns-name)) (find-class-usages c)))]
+        used? (fn [c] (some #(and (counts-as-use? %)
+                                  (= ns-sym (some-> (:from-ns %) ns-name)))
+                            (find-class-usages c)))]
     (into {} (for [[sym c] (ns-imports ns-sym)
                    :when (and (not (contains? defaults c)) (not (used? c)))]
                [sym c]))))
@@ -1216,7 +1596,7 @@
        (if-let [o (get owner c)]
          (reduce (fn [g s]
                    (let [src (:source s)]
-                     (if (or (nil? src) (= src o))
+                     (if (or (nil? src) (= src o) (:dead s))
                        g
                        (update g src (fnil conj #{}) o))))
                  g spans)
@@ -1303,7 +1683,7 @@
      (fn [g k home]
        (reduce (fn [g span]
                  (let [src (:source span)]
-                   (if (and (nodes src) (not= src home))
+                   (if (and (nodes src) (not= src home) (not (:dead span)))
                      (update g src (fnil conj #{}) home)
                      g)))
                g (get usages k)))
@@ -1541,7 +1921,7 @@
         ;; rest of its mappings are.
         vars     (into #{} (keep interned) pruned)]
     (doseq [k pruned]
-      (when-let [us (seq (get (:usages idx) k))]
+      (when-let [us (seq (remove :dead (get (:usages idx) k)))]
         (binding [*out* *err*]
           (println "WARN: pruning" (str k) "still referenced at"
                    (vec (for [s us] [(some-> (:from-ns s) ns-name)

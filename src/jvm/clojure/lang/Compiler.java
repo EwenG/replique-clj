@@ -7845,6 +7845,11 @@ public static Object macroexpand1(Object x) {
 					                : new int[]{lineDeref(), columnDeref(), -1, -1};
 					sink.macroExpansion(v, currentNS(), (String) SOURCE_PATH.deref(),
 					                    pos[0], pos[1], pos[2], pos[3], src);
+					// A comment's body is never compiled, so this is the one place
+					// that sees it: hand it to the sink whole (see deadForm).
+					if(v.sym.name.equals("comment") && v.ns.name.name.equals("clojure.core"))
+						sink.deadForm(form, IAnalysisSink.COMMENT, currentNS(),
+						              (String) SOURCE_PATH.deref());
 					}
 
 				checkSpecs(v, form);

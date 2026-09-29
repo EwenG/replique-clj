@@ -762,7 +762,15 @@ public static class CommentReader extends AFn{
 public static class DiscardReader extends AFn{
 	public Object invoke(Object reader, Object underscore, Object opts, Object pendingForms) {
 		PushbackReader r = (PushbackReader) reader;
-		read(r, true, null, true, opts, ensurePending(pendingForms));
+		Object form = read(r, true, null, true, opts, ensurePending(pendingForms));
+		// Under analysis, hand the discarded form to the sink: it is still written in
+		// the file, and find-usages should see what it names. Not in the branch of a
+		// reader conditional this platform does not take - that is another
+		// platform's code (keywordUsage draws the same line).
+		IAnalysisSink sink = Compiler.analysisSink();
+		if(sink != null && !RT.suppressRead())
+			sink.deadForm(form, IAnalysisSink.DISCARD, Compiler.currentNS(),
+			              (String) Compiler.SOURCE_PATH.deref());
 		return r;
 	}
 }
