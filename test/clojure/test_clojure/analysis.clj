@@ -608,9 +608,64 @@
                          "(ns cachehit.a)"
                          "(def x 1)")]
     (analysed! source)
-    (let [idx (#'an/derived @@#'an/model)]
-      (is (seq (:defs idx)))
-      (is (identical? idx (#'an/derived @@#'an/model))))))
+    (let [m @@#'an/model]
+      (doseq [k @#'an/index-keys]
+        (is (identical? (#'an/index m k) (#'an/index m k))
+            (str "second ask for " k " rebuilt it"))))
+    (is (seq (:defs (#'an/derived @@#'an/model))))))
+
+(deftest asking-one-index-does-not-build-the-others
+  ;; What having a cache EACH is for. They are not wanted at the same times - a
+  ;; reload reads `:defs` while it prunes and reads nothing else, and `:usages` and
+  ;; `:locals` are the large ones - so one index built is one index built, and the
+  ;; rest are still unbuilt behind their own caches. Held as one index they were all
+  ;; rebuilt whenever any of them was, and a reload of K files paid for the whole
+  ;; model K times.
+  ;;
+  ;; Read off the caches rather than off a clock, since what is being tested is
+  ;; that work did NOT happen and a fast answer is not a claim that it did not.
+  (let [source (written! "cacheeach/a.clj"
+                         "(ns cacheeach.a)"
+                         "(def x (let [y 1] y))")]
+    (analysed! source)
+    (let [m     @@#'an/model
+          built (fn [] (set (for [[k c] @#'an/index-caches
+                                  :when (identical? (:forms m) (:forms @c))]
+                              k)))]
+      ;; a fresh log, so nothing is built for it yet
+      (is (empty? (built)))
+      (#'an/index m :defs)
+      (is (= #{:defs} (built)))
+      (#'an/index m :locals)
+      (is (= #{:defs :locals} (built)))
+      ;; while `derived` is all of them, which is why it is not what a reload asks
+      (#'an/derived m)
+      (is (= (set @#'an/index-keys) (built))))))
+
+(deftest file-def-vars-answers-what-a-walk-of-the-defs-answered
+  ;; `file-def-vars` reads the file's own forms instead of walking every def in the
+  ;; model. Same answer, and the case where it could differ is the one pinned here: a
+  ;; var two files define belongs to the file whose def WON - the later one - in both
+  ;; readings, and is not in the earlier file's answer.
+  (let [a (written! "bysource/a.clj"
+                    "(ns bysource.a)"
+                    "(def only-a 1)"
+                    "(def shared 1)")
+        b (written! "bysource/b.clj"
+                    "(in-ns 'bysource.a)"
+                    "(def shared 2)")]
+    (analysed! a)
+    (is (= '#{bysource.a/only-a bysource.a/shared} (an/file-def-vars @@#'an/model a)))
+    (analysed! b)
+    (let [m @@#'an/model
+          walked (fn [source]
+                   (set (for [[k e] (#'an/index m :defs)
+                              :when (= source (:source (:span e)))]
+                          k)))]
+      (is (= '#{bysource.a/only-a} (an/file-def-vars m a)))
+      (is (= '#{bysource.a/shared} (an/file-def-vars m b)))
+      (doseq [source [a b]]
+        (is (= (walked source) (an/file-def-vars m source)))))))
 
 (deftest nothing-is-recorded-without-the-sink
   (let [source (written! "nosink/a.clj"

@@ -16,7 +16,8 @@
   produced it, so re-analysing one file drops exactly its prior forms and installs
   the new ones, without disturbing the rest of the model (design §7). The stored
   model is just this form log; the by-entity query indexes are derived from it on
-  demand and cached (build-index / derived), so the sink does no index maintenance.
+  demand and cached, one cache each (index / derived), so the sink does no index
+  maintenance.
 
   The reload/staleness unit is the FILE, keyed by the classpath-relative source
   path the compiler records (e.g. \"app/util.clj\"). This is deliberate:
@@ -59,9 +60,9 @@
 ;; The model has two layers. The STORED layer is the compiler's write side - an
 ;; append log of top-level forms, each carrying the facts it produced; it is all the
 ;; sink ever mutates. The DERIVED layer is the query side - the by-entity indexes,
-;; rebuilt from the forms by build-index and cached (see derived). The sink does no
-;; index maintenance and no retract-on-redefine: a redefinition is just a later form,
-;; and build-index resolves "which form defines each var" by replaying forms in fid
+;; rebuilt from the forms and cached, one cache per index (see `index`). The sink
+;; does no index maintenance and no retract-on-redefine: a redefinition is just a later
+;; form, and build-defs resolves "which form defines each var" by replaying forms in fid
 ;; (definition) order, so the highest-fid def wins. A var referenced but not defined
 ;; by any live form simply has no :defs entry - definition returns nil for it, which
 ;; is what the old incremental tombstone yielded.
@@ -84,7 +85,7 @@
 ;;   :non-files       #{source}     the sources a jar answers to, so changed-files can
 ;;                                  skip resolving them (§9); dropped by
 ;;                                  classpath-changed!, refilled as they are resolved
-;; derived (built by build-index from :forms, cached keyed by :forms identity):
+;; derived (built from :forms by `index`, each cached keyed by :forms identity):
 ;;   :usages          {qsym  #{span}}       qsym = fully-qualified var name (my.ns/foo)
 ;;                                          span = a Span record (compact, primitive
 ;;                                          int coords); the public queries normalise
@@ -229,7 +230,7 @@
 ;; entity key, carried on the span for the same one-object-per-fact reason as Span).
 ;; `lns` is the owning namespace; `lname` the binding's source name (present for a def,
 ;; nil for a use). Fields are named to avoid shadowing clojure.core/ns and /name;
-;; build-index (local->map) projects them to the public :ns/:name keys, so the query
+;; build-locals (local->map) projects them to the public :ns/:name keys, so the query
 ;; surface stays plain maps.
 (defrecord LocalSpan [binding source ^int line ^int column ^int end-line ^int end-column lns lname])
 
@@ -261,7 +262,7 @@
   (when spans (into #{} (map span->map) spans)))
 
 (defn- local->map
-  "Normalise a LocalSpan record to the plain-map local shape build-index files in the
+  "Normalise a LocalSpan record to the plain-map local shape build-locals files in the
   :locals index - {:source :line :column :ns [:name] [:end-line :end-column]} - so the
   public locals surface (unused-locals, snapshot) carries no record type. :name is
   omitted for a use (lname nil), matching the map the sink used to build."
@@ -329,7 +330,7 @@
 ;; finished form is handed to its file `frame`'s buffer. So the sink never touches the
 ;; shared atom - not per fact, not per form. `pos` is [line column]; `seq` is the form's
 ;; begin-order rank within its file, used to assign a fid = base + seq at commit, so
-;; build-index still replays a file's forms in begin order.
+;; build-defs still replays a file's forms in begin order.
 (deftype OpenForm [^long seq ^FileFrame frame ^longs pos ^objects cats])
 
 (defn- current-frame ^FileFrame [] (when-let [s *file-stack*] (peek @s)))
@@ -339,7 +340,7 @@
 ;; for category `cat`, creating that list on first use. The fact is a single object that
 ;; carries its own entity key (Span/LocalSpan/MacroDep), so there is no tuple wrapper.
 ;; No model touch, no index maintenance - the by-entity indexes are derived on read
-;; (build-index). nil holder (no form open) is a no-op; see the sink for why.
+;; (see `index`). nil holder (no form open) is a no-op; see the sink for why.
 (defn- add-fact! [^OpenForm of ^long cat fact]
   (when of
     (let [^objects cats (.cats of)]
@@ -357,7 +358,7 @@
 
 ;; Retracting a form is now purely structural: remove it from :forms and from its
 ;; file's :source->forms. There is no index surgery and no tombstone bookkeeping -
-;; the query indexes are a pure function of the surviving forms (build-index), so a
+;; the query indexes are a pure function of the surviving forms (see `index`), so a
 ;; var whose last defining form is gone stops appearing in :defs automatically, and
 ;; one still referenced elsewhere keeps its usages because those live on other forms.
 (defn- retract-form [m fid]
@@ -908,11 +909,12 @@
 ;; would land here, and that was never retractable anyway.
 ;;
 ;; Each method builds ONE self-contained fact object and appends it to its category -
-;; no index is touched here. build-index replays the categories (in fid order) into the
-;; query indexes on read, so the fact must carry everything the index needs, INCLUDING
-;; its own entity key: a usage/def its var key, a keyword usage its keyword, a local its
-;; binding token plus full info (ns/name/span). That is what lets a fact be a single
-;; object with no [op a b] tuple around it.
+;; no index is touched here. The builders replay the categories (in fid order for
+;; `:defs`, which is the one that needs it) into the query indexes on read, so the
+;; fact must carry everything the index needs, INCLUDING its own entity key: a
+;; usage/def its var key, a keyword usage its keyword, a local its binding token plus
+;; full info (ns/name/span). That is what lets a fact be a single object with no
+;; [op a b] tuple around it.
 (deftype AnalysisSink []
   IAnalysisSink
   (beginFile [_ source] (begin-file! source))
@@ -989,7 +991,7 @@
         ;; Always record the compile-time edge (stale reload needs it even for
         ;; expansion-introduced calls); record the macro *usage* only for a
         ;; source-written call. The edge's fid (the form's own, filled in by
-        ;; build-index) carries the expanding form's file, which the §9 cascade reads.
+        ;; the frame) carries the expanding form's file, which the §9 cascade reads.
         (add-fact! of CAT-MACRODEP (MacroDep. ns-sym mk))
         (when record-usage?
           (add-fact! of CAT-USAGES (span mk source line column el ec from-ns true))))))
@@ -1222,88 +1224,144 @@
         (reset! cache {:forms forms :value built})
         built))))
 
-(defonce ^:private index-cache (atom {:forms nil :value nil}))
+;; ONE CACHE PER SUB-INDEX, and not one cache for all of them. Every one of them is
+;; a pure function of the same form log, so they all go stale by the same rule - but
+;; they are not wanted at the same moments, and that is the difference worth having.
+;; A reload asks what `:defs` says while it prunes; the file graphs ask `:macro-deps`
+;; and `:class-usages`; `:usages` and `:locals` - much the largest, and the dearest
+;; to fold - answer an editor's questions and nothing the reload does. Held as one
+;; index they were all rebuilt whenever any of them was, and since every file load
+;; is a new form log, a reload of K files rebuilt the whole model K times: on a
+;; 400-file model, reloading 40 files spent 1.9 of 3.0 seconds replaying facts no
+;; part of the reload reads. Each index cached on its own, the reload touches only
+;; the small one it uses and the rest are built again when somebody asks.
+(defonce ^:private index-caches
+  (into {} (for [k [:usages :defs :keyword-usages :class-usages :locals :macro-deps]]
+             [k (atom {:forms nil :value nil})])))
 
-(defn- build-index
-  "Replay the per-form fact log into the by-entity query indexes. Forms are replayed
-  in ascending fid (definition) order, so a redefinition - a later form defining the
-  same var - naturally overwrites the earlier :defs entry: highest fid wins, which is
-  what the old eager retract-on-redefine achieved. A var referenced but defined by no
-  live form gets usages but no :defs entry, so `definition` returns nil for it (what
-  the old incremental tombstone yielded). Pure function of `forms`.
+(defn- sorted-fids
+  "The live form ids, ascending, in a primitive array.
 
-  Returns {:usages :defs :keyword-usages :class-usages :locals :macro-deps}, each
-  shaped exactly as the eagerly-maintained index was, so the queries are unchanged.
+  `:defs` is the one index that depends on the order the log is replayed in, so it
+  is the one place this is needed - and it is worth not doing in boxed Longs:
+  `(sort (keys forms))` over an 18000-form log is 6 ms, and this is 2.4."
+  ^longs [forms]
+  (let [^longs a (long-array (keys forms))]
+    (java.util.Arrays/sort a)
+    a))
 
-  The six by-entity sub-indexes are accumulated as TRANSIENT maps: on a large log a
-  single entity map grows to thousands of keys, and a persistent update-in would
-  rebuild its spine on every one of the (many) facts touching it. Transient assoc!
-  mutates in place, so replaying the log is close to allocation-free apart from the
-  entity values themselves (the persistent sets / entry maps that are the actual
-  data). The transient must be threaded (assoc! may promote and return a new object),
-  so each sub-index is re-stored into the (also transient) idx via its return value.
-  The result is frozen with persistent! - a plain, fully persistent index.
+(defn- build-spans
+  "{entity #{Span}} over one fact category - `:usages`, `:keyword-usages` or
+  `:class-usages`, which differ in nothing but which category they fold. No replay
+  order to respect: each fact joins the set under its own entity key, and a set does
+  not care when it was joined.
 
-  Facts are stored per CATEGORY on the form (no [op a b] tuples), so there is no tag to
-  dispatch on: each category list is folded straight into its sub-index, and every fact
-  carries its own entity key. Locals are folded before local-uses, so a form's binding
-  defs are all registered before any of its uses are attached (a local is lexically
-  scoped to its form, so this is exactly the right scope)."
+  The index is accumulated as a TRANSIENT map: on a large log one of these grows to
+  thousands of keys, and a persistent assoc would rebuild its spine on every one of
+  the (many) facts touching it. The transient must be threaded, since assoc! may
+  promote and return a new object."
+  [forms cat]
+  (persistent!
+   (reduce-kv (fn [idx _ fe]
+                (reduce (fn [idx ^Span s]
+                          (let [e (.entity s)]
+                            (assoc! idx e (conj (get idx e #{}) s))))
+                        idx (get fe cat)))
+              (transient {}) forms)))
+
+(defn- build-defs
+  "{qsym {:span span}} - the one index replayed in fid (definition) order, because
+  it is the one where a later fact has to beat an earlier one: a redefinition is
+  just a later form defining the same var, and replaying in order lets it overwrite
+  the earlier entry, so the highest fid wins. That is what the old eager
+  retract-on-redefine achieved. A var referenced but defined by no live form gets no
+  entry at all, so `definition` returns nil for it - what the old incremental
+  tombstone yielded."
   [forms]
-  (let [add-span (fn [idx k ^Span s]
-                   (let [sub (get idx k)
-                         e   (.entity s)]
-                     (assoc! idx k (assoc! sub e (conj (get sub e #{}) s)))))
-        idx (reduce
-             (fn [idx fid]
-               (let [fe (get forms fid)]
-                 (as-> idx idx
-                   (reduce (fn [idx s] (add-span idx :usages s)) idx (:usages fe))
-                   (reduce (fn [idx s] (add-span idx :keyword-usages s)) idx (:keyword-usages fe))
-                   (reduce (fn [idx s] (add-span idx :class-usages s)) idx (:class-usages fe))
-                   (reduce (fn [idx ^Span s]
-                             (let [sub (get idx :defs)]
-                               (assoc! idx :defs (assoc! sub (.entity s) {:span s}))))
-                           idx (:defs fe))
-                   ;; A local's def carries its full info (a LocalSpan); project it to the
-                   ;; plain-map index entry, keeping any :uses already gathered.
-                   (reduce (fn [idx ^LocalSpan l]
-                             (let [sub (get idx :locals)
-                                   b   (.binding l)]
-                               (assoc! idx :locals
-                                       (assoc! sub b (assoc (local->map l)
-                                                            :uses (get (get sub b) :uses #{}))))))
-                           idx (:locals fe))
-                   (reduce (fn [idx ^LocalSpan l]
-                             (let [sub (get idx :locals)
-                                   b   (.binding l)
-                                   cur (get sub b)]
-                               (if cur
-                                 (assoc! idx :locals
-                                         (assoc! sub b (update cur :uses (fnil conj #{}) (local->map l))))
-                                 idx)))
-                           idx (:local-uses fe))
-                   ;; The edge is stamped with fid (the expanding form), so the §9 file
-                   ;; cascade can find the expanding file.
-                   (reduce (fn [idx ^MacroDep d]
-                             (let [sub (get idx :macro-deps)
-                                   n   (.mns d)]
-                               (assoc! idx :macro-deps
-                                       (assoc! sub n (update (get sub n {}) (.mvar d)
-                                                             (fnil conj #{}) fid)))))
-                           idx (:macro-deps fe)))))
-             (transient {:usages (transient {}) :defs (transient {}) :keyword-usages (transient {})
-                         :class-usages (transient {}) :locals (transient {}) :macro-deps (transient {})})
-             (sort (keys forms)))]
-    (reduce-kv (fn [m k v] (assoc m k (persistent! v))) {} (persistent! idx))))
+  (let [^longs fids (sorted-fids forms)
+        n           (alength fids)]
+    (loop [i 0, idx (transient {})]
+      (if (< i n)
+        (recur (inc i)
+               (reduce (fn [idx ^Span s] (assoc! idx (.entity s) {:span s}))
+                       idx (:defs (get forms (aget fids i)))))
+        (persistent! idx)))))
+
+(defn- build-locals
+  "{binding {:ns :name ...span :uses #{use}}} - two fact categories in one index,
+  since a local's uses belong to its entry. A form's bindings are folded before its
+  uses, so every binding is registered before a use can attach to it; a local is
+  lexically scoped to its own form, so that is exactly the right scope and the order
+  between forms does not come into it."
+  [forms]
+  (persistent!
+   (reduce-kv
+    (fn [idx _ fe]
+      (as-> idx idx
+        ;; A local's def carries its full info (a LocalSpan); project it to the plain-
+        ;; map index entry, keeping any :uses already gathered.
+        (reduce (fn [idx ^LocalSpan l]
+                  (let [b (.binding l)]
+                    (assoc! idx b (assoc (local->map l)
+                                         :uses (get (get idx b) :uses #{})))))
+                idx (:locals fe))
+        (reduce (fn [idx ^LocalSpan l]
+                  (let [b   (.binding l)
+                        cur (get idx b)]
+                    (if cur
+                      (assoc! idx b (update cur :uses (fnil conj #{}) (local->map l)))
+                      idx)))
+                idx (:local-uses fe))))
+    (transient {}) forms)))
+
+(defn- build-macro-deps
+  "{ns-sym {macro-qsym #{fid}}} - the compile-time edges (§9). Each edge is stamped
+  with the fid of the form that expanded it, which is how the file cascade finds the
+  expanding file."
+  [forms]
+  (persistent!
+   (reduce-kv (fn [idx fid fe]
+                (reduce (fn [idx ^MacroDep d]
+                          (let [n (.mns d)]
+                            (assoc! idx n (update (get idx n {}) (.mvar d)
+                                                  (fnil conj #{}) fid))))
+                        idx (:macro-deps fe)))
+              (transient {}) forms)))
+
+(def ^:private index-keys
+  "The indexes `derived` is all of, which is what `snapshot` shows."
+  [:usages :defs :keyword-usages :class-usages :locals :macro-deps])
+
+(defn- index
+  "One derived index of model value `m`, built from its form log and cached until
+  that log changes (`cached-by-forms`). `k` is one of :usages, :defs,
+  :keyword-usages, :class-usages, :locals, :macro-deps.
+
+  Ask for the one that answers the question at hand: nothing here forces any of the
+  others, which is the whole of why there is a cache each."
+  [m k]
+  (let [forms (:forms m)]
+    (cached-by-forms
+     (get index-caches k) forms
+     (fn []
+       (case k
+         :usages         (build-spans forms :usages)
+         :keyword-usages (build-spans forms :keyword-usages)
+         :class-usages   (build-spans forms :class-usages)
+         :defs           (build-defs forms)
+         :locals         (build-locals forms)
+         :macro-deps     (build-macro-deps forms))))))
 
 (defn- derived
-  "The cached by-entity indexes for model value `m` (deref the model once and pass
-  it, so a query reads a single consistent snapshot). Rebuilt only when `m`'s :forms
-  differ from the ones the cached indexes were built from."
+  "Every by-entity index for model value `m` as one map, shaped as the one index
+  these replace was: {:usages :defs :keyword-usages :class-usages :locals
+  :macro-deps}. What `snapshot` shows, and what a caller wanting several of them off
+  one consistent log should take (deref the model once and pass it).
+
+  It forces all of them, so prefer `index` with the key actually needed - a caller
+  that wants `:defs` and takes this pays for `:usages` and `:locals` as well."
   [m]
-  (let [forms (:forms m)]
-    (cached-by-forms index-cache forms #(build-index forms))))
+  (into {} (for [k index-keys] [k (index m k)])))
 
 ;; --- queries ---------------------------------------------------------------
 
@@ -1400,24 +1458,24 @@
   could, and answering a method with its protocol's implementations would be
   answering a question nobody asked."
   [var-or-sym]
-  (let [k   (->var-key var-or-sym)
-        idx (derived @model)]
-    (into (spans->maps (get (:usages idx) k))
+  (let [k (->var-key var-or-sym)
+        m @model]
+    (into (spans->maps (get (index m :usages) k))
           (when-let [interface (protocol-interface k)]
-            (spans->maps (get (:class-usages idx) interface))))))
+            (spans->maps (get (index m :class-usages) interface))))))
 
 (defn definition
   "Definition site recorded for a var - pass the Var or its fully-qualified name
   symbol. Returns a span, or nil. A var referenced but defined by no live form (its
   def deleted from source, or never analysed) is treated as undefined - returns nil."
   [var-or-sym]
-  (some-> (:span (get (:defs (derived @model)) (->var-key var-or-sym))) span->map))
+  (some-> (:span (get (index @model :defs) (->var-key var-or-sym))) span->map))
 
 (defn find-keyword-usages
   "Occurrence sites recorded for keyword kw. Auto-resolved keywords are indexed
   fully-qualified, so pass e.g. (keyword \"my.ns\" \"x\")."
   [kw]
-  (spans->maps (get (:keyword-usages (derived @model)) kw)))
+  (spans->maps (get (index @model :keyword-usages) kw)))
 
 (defn find-class-usages
   "Occurrence sites recorded for class c - a java.lang.Class, or its fully-qualified
@@ -1429,21 +1487,21 @@
   rename replaces. It is not a use and does not count as one - an import used
   nowhere else is still an unused import."
   [c]
-  (spans->maps (get (:class-usages (derived @model)) (if (class? c) (.getName ^Class c) (str c)))))
+  (spans->maps (get (index @model :class-usages) (if (class? c) (.getName ^Class c) (str c)))))
 
 (defn macro-deps
   "Compile-time macro dependency edges. No arg: {ns-sym #{macro-qsym}}. With a
   namespace symbol: the set of macro var names (qualified symbols) it expanded
   (design §9)."
-  ([] (reduce-kv (fn [acc ns mm] (assoc acc ns (set (keys mm)))) {} (:macro-deps (derived @model))))
-  ([ns-sym] (set (keys (get-in (derived @model) [:macro-deps ns-sym])))))
+  ([] (reduce-kv (fn [acc ns mm] (assoc acc ns (set (keys mm)))) {} (index @model :macro-deps)))
+  ([ns-sym] (set (keys (get (index @model :macro-deps) ns-sym)))))
 
 (defn unused-locals
   "Source-written local bindings with no recorded reference. Optionally restrict
   to a namespace. Each result is the binding's def site plus :name and :ns."
   ([] (unused-locals nil))
   ([ns-sym]
-   (for [[_ info] (:locals (derived @model))
+   (for [[_ info] (index @model :locals)
          :when (empty? (:uses info))
          :when (or (nil? ns-sym) (= ns-sym (ns-name (:ns info))))]
      (dissoc info :uses))))
@@ -1509,16 +1567,16 @@
   ns-sym, per the model. A var used only in a #_ does not count; one used in a
   (comment ...) does - see counts-as-use?."
   [ns-sym]
-  (let [m (derived @model)
+  (let [m @model
         from? (fn [uses] (some #(and (counts-as-use? %)
                                      (= ns-sym (some-> (:from-ns %) ns-name)))
                                uses))]
     (into #{}
           (concat
-           (for [[qsym uses] (:usages m)
+           (for [[qsym uses] (index m :usages)
                  :when (and (namespace qsym) (from? uses))]
              (symbol (namespace qsym)))
-           (for [[kw uses] (:keyword-usages m)
+           (for [[kw uses] (index m :keyword-usages)
                  :when (and (namespace kw) (from? uses))]
              (symbol (namespace kw)))))))
 
@@ -1537,7 +1595,7 @@
   Returns {referred-sym var}. clojure.core auto-refers are excluded. A use in a
   (comment ...) counts, one in a #_ does not (counts-as-use?)."
   [ns-sym]
-  (let [uses (:usages (derived @model))
+  (let [uses (index @model :usages)
         core (the-ns 'clojure.core)
         used? (fn [^Var v] (some #(and (counts-as-use? %)
                                        (= ns-sym (some-> (:from-ns %) ns-name)))
@@ -1657,7 +1715,7 @@
         (fn [g mk fids]
           (let [owner-srcs (get ns->srcs (macro-owner mk))]
             (reduce (fn [g fid]
-                      ;; :macro-deps fids are the forms build-index replayed, so each
+                      ;; :macro-deps fids are the forms the index replayed, so each
                       ;; is a live form and s is normally non-nil; guard anyway so any
                       ;; future drift injects no nil-source edge.
                       (if-let [s (:source (get forms fid))]
@@ -1666,7 +1724,7 @@
                         g))
                     g fids)))
         g mm))
-     {} (:macro-deps (derived m)))))
+     {} (index m :macro-deps))))
 
 ;; Cached exactly as the query indexes it is built from are, and for the same reason:
 ;; the graph is a pure function of the form log, and building it walks every macro-dep
@@ -1723,7 +1781,7 @@
                 (if-let [c (generated-class k)]
                   (assoc! acc c (:source (:span e)))
                   acc))
-              (transient {}) (:defs (derived m)))))
+              (transient {}) (index m :defs))))
 
 (defn- build-file-class-graph
   "Forward compile-time dependency graph over FILES for generated classes: {source
@@ -1760,7 +1818,7 @@
                        (update g src (fnil conj #{}) o))))
                  g spans)
          g))
-     {} (:class-usages (derived m)))))
+     {} (index m :class-usages))))
 
 ;; Cached like the macro graph, and beside it rather than folded into it: the two are
 ;; built from different halves of the model and the tests of each want to see it
@@ -1831,13 +1889,12 @@
   one pass over the defs to find those the reloaded files own, and then a lookup of
   each one's recorded usages, rather than a walk of every usage in the program."
   [m files]
-  (let [idx    (derived m)
-        nodes  (set files)
-        usages (:usages idx)
+  (let [nodes  (set files)
+        usages (index m :usages)
         owner  (reduce-kv (fn [acc k e]
                             (let [src (:source (:span e))]
                               (if (nodes src) (assoc acc k src) acc)))
-                          {} (:defs idx))]
+                          {} (index m :defs))]
     (reduce-kv
      (fn [g k home]
        (reduce (fn [g span]
@@ -1964,20 +2021,34 @@
           (recur (into order ready) (into placed ready) (reduce disj remaining ready)))))))
 
 (defn- healthy-def?
-  "True when the derived index `idx` records a def for var-key k. (There is no longer
+  "True when the `:defs` index `defs` records a def for var-key k. (There is no longer
   a tombstone flag: a var no live form defines simply has no :defs entry.)"
-  [idx k]
-  (some? (get (:defs idx) k)))
+  [defs k]
+  (some? (get defs k)))
 
 (defn file-def-vars
-  "The fully-qualified name symbols the derived index `idx` records a `def` form for
-  IN file `source`, keyed off each def's span :source. Exactly the population
-  prune-file! may consider: only vars the compiler saw defined by a top-level def can
-  be judged 'deleted' by disappearance. Pass (derived @model) as `idx`."
-  [idx source]
-  (set (for [[k e] (:defs idx)
-             :when (= source (:source (:span e)))]
-         k)))
+  "The fully-qualified name symbols model value `m` records a `def` form for IN file
+  `source`, keyed off each def's span :source. Exactly the population prune-file! may
+  consider: only vars the compiler saw defined by a top-level def can be judged
+  'deleted' by disappearance.
+
+  READ OFF THE FILE'S OWN FORMS and not by walking every def in the model, which is
+  what it did and what cost 346 ms of a 40-file reload over a 400-file model: it is
+  asked once per file reloaded and again per file pruned, and the model it walked
+  grows with the project while the file does not.
+
+  The same answer, though, and the `:defs` lookup is what keeps it so: a name two
+  files define belongs to the one whose def WON - the highest fid - so a file's own
+  def form is in its answer only while `:defs` still names it as that def's file.
+  Which is what filtering the whole index by span source said."
+  [m source]
+  (let [defs  (index m :defs)
+        forms (:forms m)]
+    (into #{} (for [fid     (get (:source->forms m) source)
+                    ^Span s (:defs (get forms fid))
+                    :let    [k (.entity s)]
+                    :when   (= source (:source (:span (get defs k))))]
+                k))))
 
 (defn file-def-var-snapshot
   "Capture {qsym -> the currently-interned Var object} for the defs in file `source`.
@@ -1986,7 +2057,7 @@
   SAME Var object survives a reload) from one the reloaded source deleted and
   re-created under a fresh identity (which must be preserved)."
   [m source]
-  (into {} (for [k (file-def-vars (derived m) source)
+  (into {} (for [k (file-def-vars m source)
                  :let [home (find-ns (symbol (namespace k)))
                        v    (when home (get (ns-interns home) (symbol (name k))))]]
              [k v])))
@@ -2051,14 +2122,18 @@
   more, and every protocol the file defined is a deleted one."
   [source prior]
   (let [m        @model
-        idx      (derived m)
+        ;; `:defs` and nothing else, because that is all it takes to say whether a
+        ;; def has gone. The usage index is what the warning below reads, and it is
+        ;; forced only once something has actually been pruned - which is every
+        ;; reload but one that followed somebody deleting a definition.
+        defs     (index m :defs)
         interned (fn [k]
                    (when-let [home (find-ns (symbol (namespace k)))]
                      (get (ns-interns home) (symbol (name k)))))
         gone     (vec (for [[k old-var] prior
                             :let [cur (interned k)]
                             :when (and old-var (identical? cur old-var)
-                                       (not (healthy-def? idx k)))]
+                                       (not (healthy-def? defs k)))]
                         k))
         ;; and then the protocol methods, which no snapshot could have held: the
         ;; protocols this file no longer defines lose all of theirs, and the ones it
@@ -2067,7 +2142,7 @@
                                :let [v (get prior k)]
                                :when (protocol-value v)]
                            [v true])
-        live-protocols   (for [k (file-def-vars idx source)
+        live-protocols   (for [k (file-def-vars m source)
                                :let [v (interned k)]
                                :when (protocol-value v)]
                            [v false])
@@ -2079,12 +2154,14 @@
         ;; unmapping one of them as we went would take away the answer to where the
         ;; rest of its mappings are.
         vars     (into #{} (keep interned) pruned)]
-    (doseq [k pruned]
-      (when-let [us (seq (remove :dead (get (:usages idx) k)))]
-        (binding [*out* *err*]
-          (println "WARN: pruning" (str k) "still referenced at"
-                   (vec (for [s us] [(some-> (:from-ns s) ns-name)
-                                     (:line s) (:column s)]))))))
+    (when (seq pruned)
+      (let [usages (index m :usages)]
+        (doseq [k pruned]
+          (when-let [us (seq (remove :dead (get usages k)))]
+            (binding [*out* *err*]
+              (println "WARN: pruning" (str k) "still referenced at"
+                       (vec (for [s us] [(some-> (:from-ns s) ns-name)
+                                         (:line s) (:column s)]))))))))
     (unmap-everywhere! vars)
     pruned))
 
