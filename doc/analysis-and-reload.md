@@ -366,6 +366,13 @@ not compiled**:
   in a comment must not keep a deleted var from being pruned), no local facts and no
   macro edges. Dead usages play no part in the compile graphs, the reload order or
   prune's warnings.
+- **What the reader reports inside.** A keyword or a syntax-quoted reference inside dead
+  code is reported by the reader while it reads it, as live. `deadForm` also carries the
+  dead span. For `#_` the span is taken off the reader, because a discarded syntax-quote
+  arrives as its expansion and a keyword holds no metadata. For a comment it starts after
+  the `comment` symbol, which is a live call. When the top-level form ends, `close-dead!`
+  marks the form's usages, class usages and keyword usages that lie inside a span as
+  `:dead`; the innermost span wins.
 - **Who counts them.** find-usages returns them, with `:dead`. The `unused-*` lints count
   a use in a `comment` (a rich comment block is REPL code, and dropping its require
   breaks it; clj-kondo counts it too) but not one in a `#_` (`counts-as-use?`).
@@ -735,7 +742,7 @@ the explicit operation that removes vars whose defining form vanished from the s
 - **Dead code (§6.1) is resolved by name, not compiled**: a name bound by a macro the walk
   does not know is recorded as a use of the var or class it also names, and a local of the
   live code around a `#_` is recognised only by having been bound earlier in the same
-  top-level form. A syntax-quote inside a `#_` is still resolved by the reader, as live.
+  top-level form.
 - **Syntax-quote refs resolve at read time**, so a var referenced inside a macro body *before*
   it is defined in the same file (a bare forward reference, no `declare`) doesn't resolve and
   is skipped. Cross-namespace refs and `declare`d forwards are unaffected.

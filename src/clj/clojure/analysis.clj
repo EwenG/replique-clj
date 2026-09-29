@@ -558,6 +558,13 @@
   [form {:keys [target op emit outer]}]
   (walk-dead form {:locals #{} :outer outer :target target :op op :emit emit}))
 
+(defn dead-body
+  "What of dead `form` of `kind` is dead: all of a #_, and the arguments of a
+  (comment ...) - the comment call itself is live code, compiled and recorded as
+  such. As one form walk-dead-code can take."
+  [form kind]
+  (if (and (= :comment kind) (seq? form)) (vec (rest form)) form))
+
 (defn locals-at
   "{name [line column]} of the named locals among `local-spans` - LocalSpan-shaped:
   :lname (a string or a symbol) :line :column - each at the first place it is
@@ -575,17 +582,51 @@
   [^OpenForm of]
   (locals-at (aget ^objects (.cats of) CAT-LOCALS)))
 
+(defn- dead-kind-at
+  "The kind of the innermost of `spans` - [kind [line column end-line end-column]]
+  - that holds position line:column, or nil. The end is exclusive."
+  [spans line column]
+  (let [at [line column]]
+    (some->> spans
+             (filter (fn [[_ [l c el ec]]]
+                       (and (not (neg? (compare at [l c])))
+                            (neg? (compare at [el ec])))))
+             seq
+             (apply max-key (fn [[_ [l c]]] (+ (* 100000 (long l)) (long c))))
+             first)))
+
+(defn mark-dead!
+  "Mark the facts in `facts` - an ArrayList of Span-shaped records, with :line
+  :column and a :dead field - that lie inside one of `spans` as dead code of that
+  span's kind (dead-kind-at). For what the READER reports inside a #_ or a comment
+  while it reads it: a keyword, a syntax-quoted reference. The compiler reports
+  nothing from dead code, so everything inside a dead span is one of those."
+  [^java.util.ArrayList facts spans]
+  (when (and facts (seq spans))
+    (dotimes [i (.size facts)]
+      (let [f (.get facts i)]
+        (when-let [kind (dead-kind-at spans (:line f) (:column f))]
+          (.set facts i (assoc f :dead kind))))))
+  nil)
+
 (defn- close-dead!
-  "Open form `of` has ended: give the dead code written in it the locals it bound.
-  Its local facts are complete only now - a #_ is read before the form around it is
-  compiled."
+  "Open form `of` has ended: give the dead code written in it the locals it bound -
+  its local facts are complete only now, as a #_ is read before the form around it
+  is compiled - and mark dead what the reader reported inside it (mark-dead!)."
   [^OpenForm of]
   (let [^java.util.ArrayList dead (.dead ^FileFrame (.frame of))
-        outer (delay (outer-locals of))]
+        outer (delay (outer-locals of))
+        spans (java.util.ArrayList.)]
     (dotimes [i (.size dead)]
       (let [d (.get dead i)]
         (when (identical? of (:of d))
-          (.set dead i (-> d (dissoc :of) (assoc :outer @outer)))))))
+          (when-let [sp (:span d)] (.add spans [(:kind d) sp]))
+          (.set dead i (-> d (dissoc :of) (assoc :outer @outer))))))
+    (when-not (.isEmpty spans)
+      (let [^objects cats (.cats of)
+            spans (vec spans)]
+        (doseq [cat [CAT-USAGES CAT-CLASSES CAT-KEYWORDS]]
+          (mark-dead! (aget cats cat) spans)))))
   nil)
 
 (defn- commit-dead!
@@ -617,8 +658,10 @@
                                (.add classes (span (class-key t) source line col el ec
                                                    ns nil kind)))))))]
             (try
-              (walk-dead-code form {:target (jvm-target ns) :op (jvm-op ns)
-                                    :outer outer :emit emit})
+              ;; a comment's body: the comment call itself is live, and recorded
+              (walk-dead-code (dead-body form kind)
+                              {:target (jvm-target ns) :op (jvm-op ns)
+                               :outer outer :emit emit})
               (catch Exception _ nil))))
         (when-not (and (.isEmpty uses) (.isEmpty classes))
           (let [^longs c (.counter fr)
@@ -803,12 +846,15 @@
   (beginForm [_ source line column] (begin-form! source line column))
   (formStart [_ line column] (form-start! line column))
   (endForm [_] (end-form!))
-  (deadForm [_ form kind ns _source]
+  (deadForm [_ form kind ns _source line column el ec]
     ;; Kept on the file frame, not the open form: it is resolved when the file ends
     ;; (commit-dead!). The open form is remembered so that, when it ends, the dead
-    ;; code can be given the locals it binds (close-dead!).
+    ;; code can be given the locals it binds, and what the reader reported inside
+    ;; its span can be marked dead (close-dead!).
     (when-let [^FileFrame fr (current-frame)]
-      (.add ^java.util.ArrayList (.dead fr) {:form form :kind kind :ns ns :of (current-form)}))
+      (.add ^java.util.ArrayList (.dead fr)
+            {:form form :kind kind :ns ns :of (current-form)
+             :span (when (and (nat-int? line) (nat-int? el)) [line column el ec])}))
     nil)
   (varUsage [_ target from-ns source line column el ec]
     ;; when-let on the key, not let: var-key is nil only for a nil-ns var, which the
@@ -834,7 +880,8 @@
   (keywordUsage [_ kw from-ns source line column el ec]
     ;; The branch of a reader conditional this platform does not take is read with
     ;; *suppress-read* on: it is another platform's code, not this program's. A #_
-    ;; discard is read normally and IS recorded - it is still written in the file.
+    ;; discard is read normally and IS recorded - it is still written in the file -
+    ;; and close-dead! marks it :dead, as it does one in a comment.
     (when-let [of (when-not (RT/suppressRead) (current-form))]
       (add-fact! of CAT-KEYWORDS (span kw source line column el ec from-ns nil)))
     nil)

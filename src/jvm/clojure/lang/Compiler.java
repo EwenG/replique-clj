@@ -489,6 +489,12 @@ static Class maybeClassNonLoading(String name){
 static void sinkSyntaxQuoteRef(Object orig, Symbol resolved){
 	if(analysisSink() == null || !(orig instanceof Symbol) || !isSourceSymbol((Symbol) orig))
 		return;
+	// The branch of a reader conditional this platform does not take is read
+	// with *suppress-read* on: it is another platform's code, and resolving its
+	// names here would resolve them in the wrong world. keywordUsage and
+	// deadForm draw the same line.
+	if(RT.suppressRead())
+		return;
 	Symbol origSym = (Symbol) orig;
 	if(resolved.ns != null)
 		{
@@ -7847,9 +7853,22 @@ public static Object macroexpand1(Object x) {
 					                    pos[0], pos[1], pos[2], pos[3], src);
 					// A comment's body is never compiled, so this is the one place
 					// that sees it: hand it to the sink whole (see deadForm).
+					// The dead span runs from the end of the comment symbol, a live
+					// call, to the end of the form - when the reader gave both.
 					if(v.sym.name.equals("comment") && v.ns.name.name.equals("clojure.core"))
+						{
+						IPersistentMap m = RT.meta(form) instanceof IPersistentMap
+						                   ? (IPersistentMap) RT.meta(form) : null;
+						Object el = m != null ? m.valAt(LispReader.END_LINE_KEY) : null;
+						Object ec = m != null ? m.valAt(LispReader.END_COLUMN_KEY) : null;
+						boolean known = src && pos[2] >= 0 && el instanceof Number
+						                && ec instanceof Number;
 						sink.deadForm(form, IAnalysisSink.COMMENT, currentNS(),
-						              (String) SOURCE_PATH.deref());
+						              (String) SOURCE_PATH.deref(),
+						              known ? pos[2] : -1, known ? pos[3] : -1,
+						              known ? ((Number) el).intValue() : -1,
+						              known ? ((Number) ec).intValue() : -1);
+						}
 					}
 
 				checkSpecs(v, form);

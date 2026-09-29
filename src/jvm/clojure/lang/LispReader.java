@@ -762,6 +762,13 @@ public static class CommentReader extends AFn{
 public static class DiscardReader extends AFn{
 	public Object invoke(Object reader, Object underscore, Object opts, Object pendingForms) {
 		PushbackReader r = (PushbackReader) reader;
+		// Where the discarded text starts and ends, taken off the reader itself: the
+		// form cannot always say (a syntax-quote reads as its expansion, and a
+		// keyword or a string holds no metadata). Starts just past the #_.
+		LineNumberingPushbackReader lr = r instanceof LineNumberingPushbackReader
+		                                 ? (LineNumberingPushbackReader) r : null;
+		int line = lr != null ? lr.getLineNumber() : -1;
+		int column = lr != null ? lr.getColumnNumber() : -1;
 		Object form = read(r, true, null, true, opts, ensurePending(pendingForms));
 		// Under analysis, hand the discarded form to the sink: it is still written in
 		// the file, and find-usages should see what it names. Not in the branch of a
@@ -770,7 +777,9 @@ public static class DiscardReader extends AFn{
 		IAnalysisSink sink = Compiler.analysisSink();
 		if(sink != null && !RT.suppressRead())
 			sink.deadForm(form, IAnalysisSink.DISCARD, Compiler.currentNS(),
-			              (String) Compiler.SOURCE_PATH.deref());
+			              (String) Compiler.SOURCE_PATH.deref(), line, column,
+			              lr != null ? lr.getEndLineNumber() : -1,
+			              lr != null ? lr.getEndColumnNumber() : -1);
 		return r;
 	}
 }

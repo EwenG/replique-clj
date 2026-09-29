@@ -1669,3 +1669,36 @@
     (is (empty? (get (class-graph) a)))
     (is (empty? (get (macro-graph) a)))
     (is (empty? (var-graph a "deadg/lib.clj")))))
+
+(deftest a-syntax-quote-in-the-branch-not-taken-is-not-this-programs
+  (let [_ (written! "sqr/a.cljc"
+                    "(ns sqr.a)"
+                    "(defn f [] 1)"
+                    "(defmacro m [] #?(:cljs `(f) :clj `(f)))")]
+    (an/run-analysis #(load "/sqr/a"))
+    (testing "only the :clj branch's f - the :cljs one is read, and not recorded"
+      (is (= [[3 37]] (map (juxt :line :column) (an/find-usages 'sqr.a/f)))))))
+
+(deftest what-the-reader-reports-inside-dead-code-is-dead
+  (let [_ (written! "deadq/lib.clj"
+                    "(ns deadq.lib)"
+                    "(defn g [] 1)")
+        _ (written! "deadq/a.clj"
+                    "(ns deadq.a (:require [deadq.lib :as lib]))"
+                    "(defn f [] 1)"
+                    "#_`(f)"
+                    "#_ `f"
+                    "(comment `(f) #_`(f))"
+                    "#_::lib/k"
+                    "(def live `f)")]
+    (analysed! "deadq/a.clj")
+    (testing "a syntax-quote in a #_ or a comment, whose form holds no position"
+      (is (= [[3 nil :discard] [4 nil :discard] [5 12 :comment] [5 19 :discard] [7 nil nil]]
+             (sort (map (juxt :line #(when (= 5 (:line %)) (:column %)) :dead)
+                        (an/find-usages 'deadq.a/f))))))
+    (testing "the comment call itself is live code"
+      (is (= [nil] (map :dead (an/find-usages 'clojure.core/comment)))))
+    (testing "a keyword in a #_ is dead too, and keeps no alias in use"
+      (is (= [[6 :discard]] (map (juxt :line :dead)
+                                 (an/find-keyword-usages :deadq.lib/k))))
+      (is (= '{lib deadq.lib} (an/unused-aliases 'deadq.a))))))

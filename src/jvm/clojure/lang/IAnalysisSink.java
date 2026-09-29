@@ -144,9 +144,18 @@ Keyword COMMENT = Keyword.intern(null, "comment");
  * names; a sink that wants to know resolves the symbols in it itself. {@code ns}
  * is the namespace current where the form is written.
  *
+ * The span is the stretch of the file that is dead - {@code line}/{@code column}
+ * up to, not including, {@code endLine}/{@code endColumn}; all four are -1 when
+ * it is not known. It is given apart from the form because the form cannot always
+ * carry it: a discarded syntax-quote arrives as its expansion, and a discarded
+ * keyword or string holds no metadata. What the reader reports inside the span
+ * while reading it (a keyword, a syntax-quoted reference) is dead code too. For a
+ * comment the span starts after the {@code comment} symbol, which is a live call.
+ *
  * A default method, so a sink with no use for dead code need not implement it.
  */
-default void deadForm(Object form, Keyword kind, Namespace ns, String source){
+default void deadForm(Object form, Keyword kind, Namespace ns, String source,
+                      int line, int column, int endLine, int endColumn){
 }
 
 }
