@@ -1889,3 +1889,103 @@
       (is (= [[6 :discard]] (map (juxt :line :dead)
                                  (an/find-keyword-usages :deadq.lib/k))))
       (is (= '{lib deadq.lib} (an/unused-aliases 'deadq.a))))))
+
+;; --- what the compiler says it has defined ---------------------------------
+
+(defn- defining!
+  "Run `thunk` under `defining*` and answer the events it reported, in order."
+  [thunk]
+  (let [seen (atom [])]
+    (an/defining* #(swap! seen conj %) thunk)
+    @seen))
+
+(defn- defines
+  "The vars `events` say were defined, in order."
+  [events]
+  (mapv :var (filter #(= :define (:op %)) events)))
+
+(deftest a-def-typed-at-a-prompt-is-reported
+  (testing "the case no model can answer: there is no file, so nothing is
+            analysed, and a var was defined all the same - which is what somebody
+            fixing one function at a prompt does"
+    (let [events (binding [*ns* (create-ns 'defd.prompt)]
+                   ;; a namespace made by hand refers nothing, and what is being
+                   ;; tested is a def and not what resolves in it
+                   (refer-clojure)
+                   (defining! #(eval '(do (def x 1) (defn f [] 2)))))]
+      (try
+        (is (= '[defd.prompt/x defd.prompt/f] (defines events)))
+        (is (= [{:dialect :clj :op :define :ns 'defd.prompt}]
+               (distinct (map #(dissoc % :var :source) events))))
+        (testing "and the model is left alone, which is what it is for"
+          (is (empty? (:forms (an/snapshot)))))
+        (finally (remove-ns 'defd.prompt))))))
+
+(deftest a-file-loaded-reports-every-var-it-defines
+  (let [source (written! "defd/a.clj"
+                         "(ns defd.a)"
+                         "(def x 1)"
+                         "(defn f [] 2)")
+        events (defining! #(an/load-file! source))]
+    (is (= '[defd.a/x defd.a/f] (defines events)))
+    (is (= #{'defd.a} (set (map :ns events))))
+    (is (= #{source} (set (map :source events))))
+    (testing "and the model was filled as it always is: the sink load-file! installs
+              is the one that stayed installed, so nothing was analysed twice and
+              nothing was analysed less"
+      (is (some? (an/definition 'defd.a/x))))))
+
+(deftest a-require-typed-at-a-prompt-reports-without-analysing
+  (let [source (written! "defdr/a.clj"
+                         "(ns defdr.a)"
+                         "(def x 1)")
+        events (defining! #(eval '(require 'defdr.a)))]
+    (is (= '[defdr.a/x] (defines events)))
+    (testing "the sink installed for the reporting has no file and no form stack,
+              so the model stays what it is - what was analysed, not the session"
+      (is (empty? (:forms (an/snapshot))))
+      (is (nil? (an/definition 'defdr.a/x))))
+    (testing "and the file is still there to be analysed properly afterwards"
+      (analysed! source)
+      (is (some? (an/definition 'defdr.a/x))))))
+
+(deftest one-binding-collects-a-whole-evaluation
+  (let [_ (written! "defdc/lib.clj"
+                    "(ns defdc.lib)"
+                    "(def y 1)")
+        _ (written! "defdc/a.clj"
+                    "(ns defdc.a (:require defdc.lib))"
+                    "(def x 1)")
+        events (defining! #(an/load-file! "defdc/a.clj"))]
+    (testing "a file loaded on the way in is inside the same evaluation and reports
+              into the same place, which is what lets one binding round one form
+              answer for everything that form turned out to load"
+      (is (= '[defdc.lib/y defdc.a/x] (defines events))))))
+
+(deftest nothing-is-reported-where-nothing-is-listening
+  (let [source (written! "defdn/a.clj"
+                         "(ns defdn.a)"
+                         "(def x 1)")]
+    (is (nil? an/*defined*) "and the default is to be listening nowhere")
+    (testing "an analysis with nothing bound records what it always did"
+      (analysed! source)
+      (is (some? (an/definition 'defdn.a/x))))))
+
+(deftest a-reload-says-what-it-took-away
+  (let [source (written! "defdp/a.clj"
+                         "(ns defdp.a)"
+                         "(def x 1)"
+                         "(def gone 2)")]
+    (analysed! source)
+    (written! "defdp/a.clj"
+              "(ns defdp.a)"
+              "(def x 1)")
+    (let [events (defining! #(an/stale-reload! :prune true))]
+      (testing "the def that is still written is defined again"
+        (is (= '[defdp.a/x] (defines events))))
+      (testing "and the one that is not is removed - a definition taken away by
+                something nobody typed, which is the one a watcher cannot guess"
+        (is (= [{:dialect :clj :op :remove :ns 'defdp.a :var 'defdp.a/gone}]
+               (filterv #(= :remove (:op %)) events))))
+      (testing "and it is said after it has gone, not before"
+        (is (nil? (resolve 'defdp.a/gone)))))))

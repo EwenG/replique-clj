@@ -901,12 +901,60 @@
     (commit-frame! fr))
   nil)
 
+(def ^:dynamic *defined*
+  "Where the compiler says what it has just defined, or nil.
+
+  A function of one map. The sink calls it for every `def` the compiler analyses,
+  and `prune-vars!` for every var a reload takes away:
+
+    {:dialect :clj :op :define :ns my.app :var my.app/render :source \"my/app.clj\"}
+    {:dialect :clj :op :remove :ns my.app :var my.app/gone}
+
+  WHAT IT IS FOR is somebody who has to be told when the code under them was
+  replaced - a program whose top level built a tree that now has to be rebuilt out
+  of the new definitions. Nothing else in a REPL protocol knows that on anyone's
+  behalf, and everything that tried to work it out from the outside got a worse
+  answer: watching every var's root reports `alter-var-root`, which is a value
+  changing and no new code, and comparing what a namespace maps before and after
+  misses a redefinition that lands on the same names. The compiler is the only
+  thing that KNOWS, and it costs it a deref per def to say so.
+
+  INDEPENDENT OF THE MODEL, which is the whole of why this is a separate channel
+  and not a query over what was analysed. The model is disk-only on purpose - a
+  form typed at a prompt is compiled inside no file and the sink drops it - and a
+  `def` typed at a prompt is exactly what a person fixing one function does. So
+  this is told BEFORE the invariant below applies, and `defining*' can install a
+  sink with no file and no form stack: every other method is then a no-op and this
+  one still reports.
+
+  Its sibling is `*reload-progress*', and the two answer different halves of the
+  same want: that one says what is being loaded while it loads, this one says what
+  came out of it. `clojure.cljs.analysis' reports through this var too, adding
+  :dialect :cljs, for the reason it shares the other one - a ClojureScript reload
+  loads Clojure macro files on this JVM, so a watcher that bound two vars would
+  see half of one reload in each.
+
+  Nil by default and called for its effect. Dynamic, so the binding belongs to the
+  thread evaluating: two REPLs evaluating at once are two threads, each reporting
+  into its own connection. Exceptions out of it are not caught, for
+  `*reload-progress*'s reason."
+  nil)
+
+(defn- defined!
+  "Tell *defined* about `event`, if anything is listening."
+  [event]
+  (when-let [f *defined*] (f event))
+  nil)
+
 ;; Invariant: a fact is recorded ONLY when a form is open (current-form non-nil).
 ;; Without a form there is nowhere to file it (no fid to attribute it to, and it
 ;; could never be dropped on reload - a ghost), so every sink method is a no-op when
 ;; no form is open. This never drops anything real: load / require always open a
 ;; form; only a bare eval outside a form window (an unsupported use of run-analysis)
 ;; would land here, and that was never retractable anyway.
+;;
+;; `*defined*' IS THE ONE EXCEPTION and is told outside the invariant, because what
+;; it answers is about the program and not about the model - see it.
 ;;
 ;; Each method builds ONE self-contained fact object and appends it to its category -
 ;; no index is touched here. The builders replay the categories (in fid order for
@@ -941,6 +989,13 @@
         (add-fact! of CAT-USAGES (span k source line column el ec from-ns nil))))
     nil)
   (varDef [_ v source line column el ec]
+    ;; OUTSIDE THE FORM WINDOW, and the only thing here that is: a def typed at a
+    ;; prompt is inside no file, so there is no form to file it under and nothing
+    ;; for the model to hold - and it is still a definition somebody has to be
+    ;; told about. See `*defined*'.
+    (when-let [k (var-key v)]
+      (defined! {:dialect :clj :op :define
+                 :ns (symbol (namespace k)) :var k :source source}))
     (when-let [of (current-form)]
       (when-let [k (var-key v)]
         (add-fact! of CAT-DEFS (span k source line column el ec))))
@@ -1043,6 +1098,33 @@
             :when (not= (get before source) (get-in @model [:source->forms source]))]
       (record-file-mtime! source))
     result))
+
+(defn defining*
+  "Invoke `thunk` with `report` told every var it defines, and answer what it
+  answers. See `*defined*' for the events.
+
+  A SINK IS INSTALLED ONLY WHERE THERE IS NONE, which is what makes this usable
+  around an arbitrary evaluation. The compiler reports a def to whatever sink is
+  bound and to nothing otherwise, so something has to be bound - and the stacks
+  are deliberately left unbound, which makes every other sink method a no-op
+  (they are each gated on `current-frame' / `current-form', both nil-safe). So a
+  `(require 'foo)` typed at a prompt reports the vars it defines WITHOUT quietly
+  starting to populate a model that is disk-only by design.
+
+  And where a sink IS installed - inside `load-file!', inside `stale-reload!',
+  inside anything under `run-analysis' - this adds the reporting and leaves that
+  sink alone, so the model goes on being filled exactly as it was. Replacing it
+  with a stackless one would be a load that analysed nothing.
+
+  Nesting is the caller's to make sense of: the innermost `report' wins, as a
+  thread binding does, and one binding around a whole evaluation is what collects
+  everything that evaluation defined - however many files it turned out to load."
+  [report thunk]
+  (if (.deref Compiler/ANALYSIS_SINK)
+    (push-thread-bindings {#'*defined* report})
+    (push-thread-bindings {Compiler/ANALYSIS_SINK (->AnalysisSink)
+                           #'*defined*            report}))
+  (try (thunk) (finally (pop-thread-bindings))))
 
 (defn- retract-source*
   "Remove every form produced by `source` from the model, preserving all other
@@ -2190,6 +2272,12 @@
                        (vec (for [s us] [(some-> (:from-ns s) ns-name)
                                          (:line s) (:column s)]))))))))
     (unmap-everywhere! vars)
+    ;; AFTER the unmapping and not before it: what this says is that the name has
+    ;; gone, and it has not gone until it is gone. A reload is the one thing that
+    ;; takes a definition away without anybody having typed anything, so it is the
+    ;; one that has to say so - see `*defined*'.
+    (doseq [k pruned]
+      (defined! {:dialect :clj :op :remove :ns (symbol (namespace k)) :var k}))
     pruned))
 
 (defn prune-file!

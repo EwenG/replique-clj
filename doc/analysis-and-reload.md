@@ -525,6 +525,49 @@ the model (cold `require`, or an editor `load-file!`), its key is the same and r
 - **Stale-files load → stale-files analysis.** Compute the macro-aware stale set (§9), reload it
   in topological order, each file a single-file load.
 
+### 8.1 Saying what was defined — the `*defined*` channel
+
+A tool on top of this wants a second question answered, and it is not a question about
+the model: **which code did that evaluation replace?** A program whose top level built
+something — a UI tree, a websocket, a timer — has to be told when the definitions under
+it were replaced, and no query over the model can say so, because the model is a picture
+of what is on disk rather than a log of what just happened.
+
+`*defined*` is that channel, and it is a function var like `*reload-progress*`. The sink
+calls it for every `def` the compiler analyses; `prune-vars!` calls it for every var a
+reload takes away:
+
+```clojure
+{:dialect :clj :op :define :ns my.app :var my.app/render :source "my/app.clj"}
+{:dialect :clj :op :remove :ns my.app :var my.app/gone}
+```
+
+Three things make it worth stating separately from everything above.
+
+**It is told outside the §7.4 invariant.** Every other sink method is a no-op when no form
+is open, because a fact with no form to belong to could never be retracted. `*defined*`
+reports nothing to the model and has nothing to retract, so it is told first and
+unconditionally — which is exactly what makes a `def` typed at a REPL, inside no file,
+reportable at all. That case is the whole point: fixing one function without reloading
+its file is what a REPL is for.
+
+**`defining*` installs a sink only when there is none**, with `*file-stack*` and
+`*form-stack*` left unbound. Every model-writing method is then a no-op (each is gated on
+a nil-safe `current-frame` / `current-form`), so wrapping an arbitrary evaluation in it
+reports what that evaluation defined **without** quietly starting to populate a model that
+is disk-only by design — and wrapping one that is already under `run-analysis` adds the
+reporting and leaves that sink, and the model it is filling, exactly alone.
+
+**It answers a better question than watching does.** The two ways to work this out from
+outside the compiler both get it wrong: watching var roots reports `alter-var-root`, which
+is a value changing and no new code, and comparing what a namespace maps before and after
+misses a redefinition that lands on the same names. The compiler knows, and it costs it one
+deref per `def` to say so.
+
+`clojure.cljs.analysis` reports through this same var with `:dialect :cljs`, for the reason
+it shares `*reload-progress*`: half of a ClojureScript reload is Clojure macro files loaded
+on this JVM, so a watcher that bound two vars would see half of one reload in each.
+
 ## 9. Reload workflows
 
 Two coexisting workflows. The distinction is purely *what gets recompiled* — the model is kept
