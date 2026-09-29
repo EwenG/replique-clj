@@ -825,6 +825,47 @@
       (is (= [a] (an/stale-reload! :prune true)))
       (is (= 7 @(resolve 'notgone.a/x))))))
 
+(deftest a-file-that-is-gone-is-not-reloaded-because-a-macro-file-it-expands-changed
+  ;; ONE EVENT - a checkout that takes a file away and edits a macro file it expands
+  ;; from - and the two halves of it meet in `stale-files`. A gone file cannot SEED
+  ;; the cascade, and it could be reached by it, which is what a branch switch does;
+  ;; what came of that was `load` handed a resource path nothing answers to.
+  (let [m (written! "switched/mac.clj"
+                    "(ns switched.mac)"
+                    "(defmacro two [] 2)")
+        u (written! "switched/use.clj"
+                    "(ns switched.use"
+                    "  (:require [switched.mac :refer [two]]))"
+                    "(def y (two))")]
+    (analysed! m u)
+    (is (= 2 @(resolve 'switched.use/y)))
+    (deleted! u)
+    (written! "switched/mac.clj"
+              "(ns switched.mac)"
+              "(defmacro two [] 3)")
+    (is (= #{m} (an/changed-files)))
+    (is (= #{u} (an/deleted-files)))
+    (testing "the gone file expands a macro of the file that changed, and is taken
+              back out of what would be loaded all the same: there is nothing to
+              load it from"
+      (is (= #{m} (an/stale-files))))
+    (is (= [m] (an/stale-reload! :prune true)))
+    (is (empty? (an/file-forms u)))))
+
+(deftest load-file!-tells-a-path-of-the-wrong-shape-from-a-file-that-is-gone
+  (let [a (written! "shape/a.clj" "(ns shape.a)" "(def x 1)")]
+    (analysed! a)
+    (testing "an absolute path is the editor's to translate, and saying so is the
+              whole point of catching it here"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"classpath-relative"
+                            (an/load-file! (str (io/file @root a))))))
+    (deleted! a)
+    (testing "and a path whose shape is the one thing right about it is the other
+              refusal: sending the caller to look at their path would send them
+              where the answer is not"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"nothing on the classpath"
+                            (an/load-file! a))))))
+
 (deftest a-reload-that-drops-a-file-leaves-what-it-does-not-speak-for
   (let [a (written! "keeps/a.clj"
                     "(ns keeps.a)"

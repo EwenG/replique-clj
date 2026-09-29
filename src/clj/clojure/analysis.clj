@@ -1155,22 +1155,33 @@
   (load (str "/" (strip-ext source))))
 
 (defn- check-resource-source!
-  "Reject a `source` that is not a loadable classpath-relative resource path - the
-  key the compiler records (e.g. \"app/util.clj\"). An editor deals in ABSOLUTE
-  paths and must translate to the resource path (strip the classpath root) before
-  calling load-file!; catching that here turns it into a clear error instead of a
-  cryptic FileNotFoundException from `load`, or a silent no-op when the key matches
-  nothing in the model. A nil `io/resource` (deleted / moved / behind a jar) is
-  rejected the same way, since load would fail anyway."
+  "Reject a `source` load cannot be given: one that is not a classpath-relative
+  resource path - the key the compiler records (e.g. \"app/util.clj\") - and one
+  that is spelled right and that nothing on the classpath answers to.
+
+  TWO REFUSALS AND NOT ONE, because they are two different things to do about it.
+  An editor deals in ABSOLUTE paths and must translate to the resource path (strip
+  the classpath root) before calling load-file!, and catching that here turns it
+  into a clear error instead of a cryptic FileNotFoundException from `load` or a
+  silent no-op when the key matches nothing in the model. A source nothing answers
+  to is the other one - deleted, renamed, moved off the classpath - and telling the
+  caller that its path is the wrong shape when the shape is the one thing right
+  about it sends them looking where the answer is not. `deleted-files` is what names
+  these, and a reload drops them rather than loading them."
   [source]
-  (when (or (not (string? source))
-            (.startsWith ^String source "/")
-            (nil? (io/resource source)))
+  (when (or (not (string? source)) (.startsWith ^String source "/"))
     (throw (ex-info (str "load-file! expects a classpath-relative source path, the key the "
                          "compiler records (e.g. \"app/util.clj\") - not " (pr-str source)
                          ". An editor must translate an absolute file path to its resource "
                          "path (strip the classpath root) before calling load-file!.")
                     {:source source})))
+  (when (nil? (io/resource source))
+    (throw (ex-info (str "load-file! cannot load " (pr-str source)
+                         ": nothing on the classpath answers to it. The file has been"
+                         " deleted, renamed or moved off the classpath - see"
+                         " deleted-files, which names these, and stale-reload!, which"
+                         " drops them from the model instead of loading them.")
+                    {:source source :deleted true})))
   source)
 
 (defn load-file!
@@ -1857,15 +1868,31 @@
   re-resolves at runtime and needs no recompile. Conservative in both halves: an
   edit to a macro-defining file marks ALL its macro-dependent files stale, and an
   edit to a file that generates a class marks every file that names it, neither one
-  distinguishing which form in the file changed."
+  distinguishing which form in the file changed.
+
+  NEVER A FILE THAT IS GONE. The seed cannot be one - `changed-files` asks the disk
+  and skips a file nothing answers to - but a DEPENDENT can, and a branch switch is
+  where that happens: the file that expands a changed macro was deleted by the same
+  checkout that changed the macro. Handing one to `reload-files!` is handing `load`
+  a resource path nothing answers to, so they are dropped from the answer here.
+  Dropped from the ANSWER and not from the walk, which leaves the cascade the shape
+  it had: a file behind a gone one is reached as it always was, and reloading it
+  costs a reload rather than an error. What has no file to be read is
+  `deleted-files`, which is a different answer and a different thing to do about it.
+
+  `gone` is that set, and it is an argument because asking the classpath about every
+  analysed file is a thing to do once per reload: `stale-reload!` needs the same set
+  to drop those files, and `clojure.cljs.analysis/macro-closure` asks this question
+  once per file it tests."
   ([] (stale-files (changed-files)))
-  ([seed]
+  ([seed] (stale-files seed (deleted-files)))
+  ([seed gone]
    (let [rev (reverse-file-graph (file-compile-graph @model))]
      (loop [dirty (set seed), queue (vec seed)]
        (if-let [x (peek queue)]
          (let [fresh (remove dirty (get rev x))]
            (recur (into dirty fresh) (into (pop queue) fresh)))
-         dirty)))))
+         (into #{} (remove gone) dirty))))))
 
 (defn- file-var-graph
   "Forward dependency graph over `files` only: {source #{dep-source}} where a form
@@ -2426,18 +2453,22 @@
   reload-files!.
 
   And the files that are gone are dropped first (deleted-files, drop-deleted-file!).
-  A deleted file cannot be reloaded, so it is not in the answer and never seeds the
-  cascade: the files that expanded its macros are left holding an expansion of a
-  macro nothing defines, which is what their source now says and what they will say
-  the next time anything compiles them. What a gone file defined stops resolving
+  A deleted file cannot be reloaded, so it is in neither the answer nor the set that
+  is loaded - it never seeds the cascade, and `stale-files` takes it back out when
+  another file's edit reaches it as a dependent, which is what a branch switch does:
+  the files that expanded its macros are left holding an expansion of a macro
+  nothing defines, which is what their source now says and what they will say the
+  next time anything compiles them. What a gone file defined stops resolving
   with :prune, before the stale files are loaded, so one of them still using it
   fails where it uses it rather than compiling clean against a file nobody can open.
 
   Both sets are read before anything is dropped or loaded, since dropping a file
   changes the macro graph the order comes from."
   [& {:keys [prune]}]
-  (let [stale   (stale-files)
-        deleted (deleted-files)]
+  (let [deleted (deleted-files)
+        ;; The one reading of the disk both answers come from: what is gone is what
+        ;; is dropped, and it is also what must not be in what is loaded.
+        stale   (stale-files (changed-files) deleted)]
     (when (seq deleted) (told! {:event :deleted :files (vec (sort deleted))}))
     (doseq [source (sort deleted)] (drop-deleted-file! source prune))
     (reload-files! stale :prune prune)))
