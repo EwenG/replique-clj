@@ -97,6 +97,7 @@ static final String COMPILE_STUB_PREFIX = "compile__stub";
 static final Keyword protocolKey = Keyword.intern(null, "protocol");
 static final Keyword onKey = Keyword.intern(null, "on");
 static Keyword dynamicKey = Keyword.intern("dynamic");
+static Keyword declaredKey = Keyword.intern("declared");
 static final Keyword redefKey = Keyword.intern(null, "redef");
 
 static final Symbol NS = Symbol.intern("ns");
@@ -352,6 +353,54 @@ static IAnalysisSink analysisSink(){
 
 static final public Var RECORD_POSITIONS = Var.create(null).setDynamic();
 
+// The kinds of warning the compiler prints while it analyses a form, as the sink is
+// told them (IAnalysisSink.warning).
+static final Keyword REFLECTION_WARNING = Keyword.intern(null, "reflection");
+static final Keyword BOXED_MATH_WARNING = Keyword.intern(null, "boxed-math");
+static final Keyword PERFORMANCE_WARNING = Keyword.intern(null, "performance");
+static final Keyword EARMUFFED_WARNING = Keyword.intern(null, "earmuffed-var-not-dynamic");
+
+// Print a warning about the form being compiled, the way the compiler always has -
+// "Reflection warning, app/core.clj:12:3 - call to method ..." - and tell the sink,
+// which files it under the form being analysed so that it is retracted with it.
+// Printed exactly as before: the callers decide whether to warn at all
+// (*warn-on-reflection*, *unchecked-math* :warn-on-boxed), so the sink hears of the
+// warnings a developer asked to see and of no others.
+static void compilerWarning(Keyword kind, int line, int column, String format, Object... args){
+	String message = String.format(format, args);
+	String label = kind == BOXED_MATH_WARNING ? "Boxed math warning"
+	               : kind == PERFORMANCE_WARNING ? "Performance warning"
+	               : "Reflection warning";
+	RT.errPrintWriter().format("%s, %s:%d:%d - %s\n", label, SOURCE_PATH.deref(), line, column, message);
+	IAnalysisSink sink = analysisSink();
+	if(sink != null)
+		sink.warning(kind, message, currentNS(), (String) SOURCE_PATH.deref(), line, column, -1, -1);
+}
+
+// Tell the sink that the var the source wrote at the head of FORM is called with
+// the arguments FORM gives it - which is what an arity check reads, against the
+// var's :arglists at the time it is asked. Only a call the source wrote: the var's
+// symbol must carry a reader position. The span is the call's, the list the reader
+// read, when it has one - a threading macro rebuilds the list with the metadata of
+// the one written, so the count is the expansion's and the place is the source's.
+static void sinkInvoke(Var v, ISeq form){
+	IAnalysisSink sink = analysisSink();
+	if(sink == null || !(form.first() instanceof Symbol) || !isSourceSymbol((Symbol) form.first()))
+		return;
+	int[] pos = symbolPosition((Symbol) form.first());
+	IPersistentMap m = RT.meta(form);
+	if(m != null && m.containsKey(RT.LINE_KEY) && m.containsKey(RT.COLUMN_KEY))
+		{
+		Object el = m.valAt(LispReader.END_LINE_KEY), ec = m.valAt(LispReader.END_COLUMN_KEY);
+		pos = new int[]{((Number) m.valAt(RT.LINE_KEY)).intValue(),
+		                ((Number) m.valAt(RT.COLUMN_KEY)).intValue(),
+		                el instanceof Number ? ((Number) el).intValue() : -1,
+		                ec instanceof Number ? ((Number) ec).intValue() : -1};
+		}
+	sink.invokeUsage(v, RT.count(form.next()), currentNS(), (String) SOURCE_PATH.deref(),
+	                 pos[0], pos[1], pos[2], pos[3]);
+}
+
 // True when positions should be recorded: either explicitly requested, or implied
 // by an installed sink (which needs them for every event it reports).
 static boolean recordPositions(){
@@ -560,7 +609,7 @@ static void sinkSyntaxQuoteRef(Object orig, Symbol resolved){
 		if(v != null)
 			{
 			int[] pos = symbolPosition(origSym);
-			analysisSink().varUsage(v, currentNS(), (String) SOURCE_PATH.deref(),
+			analysisSink().varUsage(v, origSym, false, currentNS(), (String) SOURCE_PATH.deref(),
 			                        pos[0], pos[1], pos[2], pos[3]);
 			}
 		else
@@ -810,6 +859,13 @@ static class DefExpr implements Expr{
                 RT.errPrintWriter().format("Warning: %1$s not declared dynamic and thus is not dynamically rebindable, "
                                           +"but its name suggests otherwise. Please either indicate ^:dynamic %1$s or change the name. (%2$s:%3$d)\n",
                                            sym, SOURCE_PATH.get(), LINE.get());
+                IAnalysisSink sink = analysisSink();
+                if(sink != null && isSourceSymbol(sym))
+                    {
+                    int[] pos = symbolPosition(sym);
+                    sink.warning(EARMUFFED_WARNING, sym.name, currentNS(), (String) SOURCE_PATH.deref(),
+                                 pos[0], pos[1], pos[2], pos[3]);
+                    }
                 }
 			if(RT.booleanCast(RT.get(mm, arglistsKey)))
 				{
@@ -826,7 +882,8 @@ static class DefExpr implements Expr{
             if(sink != null)
                 {
                 int[] pos = symbolPosition(sym);
-                sink.varDef(v, (String) source_path, pos[0], pos[1], pos[2], pos[3]);
+                sink.varDef(v, RT.booleanCast(RT.get(mm, declaredKey)), (String) source_path,
+                            pos[0], pos[1], pos[2], pos[3]);
                 }
 			if (docstring != null)
 			  mm = (IPersistentMap) RT.assoc(mm, RT.DOC_KEY, docstring);
@@ -982,7 +1039,7 @@ public static class TheVarExpr implements Expr{
 				if(sink != null && isSourceSymbol(sym))
 					{
 					int[] pos = symbolPosition(sym);
-					sink.varUsage(v, currentNS(), (String) SOURCE_PATH.deref(),
+					sink.varUsage(v, sym, true, currentNS(), (String) SOURCE_PATH.deref(),
 					              pos[0], pos[1], pos[2], pos[3]);
 					}
 				return new TheVarExpr(v);
@@ -1725,15 +1782,11 @@ static class InstanceFieldExpr extends FieldExpr implements AssignableExpr{
 			{
 			if(targetClass == null)
 				{
-				RT.errPrintWriter()
-					.format("Reflection warning, %s:%d:%d - reference to field %s can't be resolved.\n",
-									SOURCE_PATH.deref(), line, column, fieldName);
+				compilerWarning(REFLECTION_WARNING, line, column, "reference to field %s can't be resolved.", fieldName);
 				}
 			else
 				{
-				RT.errPrintWriter()
-					.format("Reflection warning, %s:%d:%d - reference to field %s on %s can't be resolved.\n",
-									SOURCE_PATH.deref(), line, column, fieldName, targetClass.getName());
+				compilerWarning(REFLECTION_WARNING, line, column, "reference to field %s on %s can't be resolved.", fieldName, targetClass.getName());
 				}
 			}
 	}
@@ -2236,9 +2289,7 @@ static class InstanceMethodExpr extends MethodExpr{
 				method = null;
 				if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
 					{
-					RT.errPrintWriter()
-						.format("Reflection warning, %s:%d:%d - call to method %s on %s can't be resolved (no such method).\n",
-							SOURCE_PATH.deref(), line, column, methodName, contextClass.getName());
+					compilerWarning(REFLECTION_WARNING, line, column, "call to method %s on %s can't be resolved (no such method).", methodName, contextClass.getName());
 					}
 				}
 			else
@@ -2266,9 +2317,7 @@ static class InstanceMethodExpr extends MethodExpr{
 				method = m;
 				if(method == null && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
 					{
-					RT.errPrintWriter()
-						.format("Reflection warning, %s:%d:%d - call to method %s on %s can't be resolved (argument types: %s).\n",
-							SOURCE_PATH.deref(), line, column, methodName, contextClass.getName(), getTypeStringForArgs(args));
+					compilerWarning(REFLECTION_WARNING, line, column, "call to method %s on %s can't be resolved (argument types: %s).", methodName, contextClass.getName(), getTypeStringForArgs(args));
 					}
 				}
 			}
@@ -2277,9 +2326,7 @@ static class InstanceMethodExpr extends MethodExpr{
 			method = null;
 			if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
 				{
-				RT.errPrintWriter()
-					.format("Reflection warning, %s:%d:%d - call to method %s can't be resolved (target class is unknown).\n",
-						SOURCE_PATH.deref(), line, column, methodName);
+				compilerWarning(REFLECTION_WARNING, line, column, "call to method %s can't be resolved (target class is unknown).", methodName);
 				}
 			}
 	}
@@ -2437,9 +2484,7 @@ static class StaticMethodExpr extends MethodExpr{
 
 		if(method != null && warnOnBoxedKeyword.equals(RT.UNCHECKED_MATH.deref()) && isBoxedMath(method))
 		{
-			RT.errPrintWriter()
-					.format("Boxed math warning, %s:%d:%d - call: %s.\n",
-							SOURCE_PATH.deref(), line, column, method.toString());
+			compilerWarning(BOXED_MATH_WARNING, line, column, "call: %s.", method.toString());
 		}
 	}
 
@@ -2476,15 +2521,11 @@ static class StaticMethodExpr extends MethodExpr{
 		method = (java.lang.reflect.Method) (methodidx >= 0 ? methods.get(methodidx) : null);
 		if(method == null && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
 			{
-			RT.errPrintWriter()
-				.format("Reflection warning, %s:%d:%d - call to static method %s on %s can't be resolved (argument types: %s).\n",
-					SOURCE_PATH.deref(), line, column, methodName, c.getName(), getTypeStringForArgs(args));
+			compilerWarning(REFLECTION_WARNING, line, column, "call to static method %s on %s can't be resolved (argument types: %s).", methodName, c.getName(), getTypeStringForArgs(args));
 			}
 		if(method != null && warnOnBoxedKeyword.equals(RT.UNCHECKED_MATH.deref()) && isBoxedMath(method))
 			{
-			RT.errPrintWriter()
-				.format("Boxed math warning, %s:%d:%d - call: %s.\n",
-						SOURCE_PATH.deref(), line, column, method.toString());
+			compilerWarning(BOXED_MATH_WARNING, line, column, "call: %s.", method.toString());
 			}
 	}
 
@@ -3391,9 +3432,7 @@ public static class NewExpr implements Expr{
 		this.ctor = ctoridx >= 0 ? (Constructor) ctors.get(ctoridx) : null;
 		if(ctor == null && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
 			{
-			RT.errPrintWriter()
-              .format("Reflection warning, %s:%d:%d - call to %s ctor can't be resolved.\n",
-                      SOURCE_PATH.deref(), line, column, c.getName());
+			compilerWarning(REFLECTION_WARNING, line, column, "call to %s ctor can't be resolved.", c.getName());
 			}
 	}
 
@@ -4620,6 +4659,8 @@ static class InvokeExpr implements Expr{
 		if(context != C.EVAL)
 			context = C.EXPRESSION;
 		Expr fexpr = analyze(context, form.first());
+		if(fexpr instanceof VarExpr)
+			sinkInvoke(((VarExpr) fexpr).var, form);
 		if(fexpr instanceof VarExpr && ((VarExpr)fexpr).var.equals(INSTANCE) && RT.count(form) == 3)
 			{
 			Expr sexpr = analyze(C.EXPRESSION, RT.second(form));
@@ -8267,20 +8308,23 @@ private static Expr analyzeSymbol(Symbol sym) {
 		Var v = (Var) o;
 		if(isMacro(v) != null)
 			throw Util.runtimeException("Can't take value of a macro: " + v);
-		if(RT.booleanCast(RT.get(v.meta(),RT.CONST_KEY)))
-			return analyze(C.EXPRESSION, RT.list(QUOTE, v.get()));
-		registerVar(v);
 		// Only record references textually present in source (carrying a reader
 		// position). Symbols conjured by macroexpansion have no position; a
 		// syntax-quoted reference in a macro's *body* is captured at read time
 		// (sinkSyntaxQuoteRef) instead, so it isn't double-counted here.
+		//
+		// Before the ^:const branch: a const is compiled as its value, and the
+		// source that names it still names it.
 		IAnalysisSink sink = analysisSink();
 		if(sink != null && isSourceSymbol(sym))
 			{
 			int[] pos = symbolPosition(sym);
-			sink.varUsage(v, currentNS(), (String) SOURCE_PATH.deref(),
+			sink.varUsage(v, sym, false, currentNS(), (String) SOURCE_PATH.deref(),
 			              pos[0], pos[1], pos[2], pos[3]);
 			}
+		if(RT.booleanCast(RT.get(v.meta(),RT.CONST_KEY)))
+			return analyze(C.EXPRESSION, RT.list(QUOTE, v.get()));
+		registerVar(v);
 		return new VarExpr(v, tag);
 		}
 	else if(o instanceof Class)
@@ -9841,9 +9885,8 @@ public static class CaseExpr implements Expr, MaybePrimitiveExpr{
 		this.returnType = maybeJavaClass(returns);
         if(RT.count(skipCheck) > 0 && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
             {
-            RT.errPrintWriter()
-              .format("Performance warning, %s:%d:%d - hash collision of some case test constants; if selected, those entries will be tested sequentially.\n",
-                      SOURCE_PATH.deref(), line, column);
+            compilerWarning(PERFORMANCE_WARNING, line, column,
+                            "hash collision of some case test constants; if selected, those entries will be tested sequentially.");
             }
 	}
 
@@ -9946,9 +9989,8 @@ public static class CaseExpr implements Expr, MaybePrimitiveExpr{
             {
             if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
                 {
-                RT.errPrintWriter()
-                  .format("Performance warning, %s:%d:%d - case has int tests, but tested expression is not primitive.\n",
-                          SOURCE_PATH.deref(), line, column);
+                compilerWarning(PERFORMANCE_WARNING, line, column,
+                                "case has int tests, but tested expression is not primitive.");
                 }
             expr.emit(C.EXPRESSION, objx, gen);
             gen.instanceOf(NUMBER_TYPE);

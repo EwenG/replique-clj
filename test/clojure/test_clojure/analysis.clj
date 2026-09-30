@@ -1755,6 +1755,51 @@
     (is (= {'trim (resolve 'clojure.string/trim)} (an/unused-refers 'lints.a)))
     (is (= {'Date java.util.Date} (an/unused-imports 'lints.a)))))
 
+(deftest a-local-a-macro-binds-twice-is-used-where-either-is
+  ;; `loop` destructures in a let outside the loop and again inside it, and only
+  ;; the inner binding is read; a macro may do the same with a symbol it was given
+  (let [a (written! "twice/a.clj"
+                    "(ns twice.a)"
+                    "(defn f [xs] (loop [[a & b] xs] (if a (recur b) 0)))"
+                    "(defmacro wrap [sym val & body] `(let [~sym nil ~sym ~val] ~@body))"
+                    "(defn g [] (wrap v 1 v))"
+                    "(defn h [] (loop [[c d] [1 2]] c))")]
+    (analysed! a)
+    (is (= #{"d"} (set (map :name (an/unused-locals 'twice.a)))))))
+
+(deftest a-protocol-implemented-is-a-protocol-used
+  ;; a deftype, a defrecord or a reify names the protocol's interface by the time
+  ;; the compiler sees it, and the source still wrote the alias and the refer
+  (let [p (written! "impl/p.clj"
+                    "(ns impl.p)"
+                    "(defprotocol P (m [this]))"
+                    "(defprotocol Q (q [this]))"
+                    "(defprotocol R (r [this]))")
+        a (written! "impl/a.clj"
+                    "(ns impl.a (:require [impl.p :as p]))"
+                    "(defrecord T [] p/P (m [_] 1))")
+        b (written! "impl/b.clj"
+                    "(ns impl.b (:require [impl.p :refer [Q R]]))"
+                    "(defn f [] (reify Q (q [_] 1)))")]
+    (analysed! p a b)
+    (is (= {} (an/unused-aliases 'impl.a)))
+    (is (= '[R] (keys (an/unused-refers 'impl.b))))))
+
+(deftest a-const-is-used-where-it-is-written
+  ;; compiled as its value, which is no reason to forget the source named it
+  (let [a (written! "konst/a.clj"
+                    "(ns konst.a)"
+                    "(def ^:const k 42)"
+                    "(def ^:private ^:const c 1)"
+                    "(defn f [] (+ c 1))")
+        b (written! "konst/b.clj"
+                    "(ns konst.b (:require [konst.a :as a]))"
+                    "(defn g [] a/k)")]
+    (analysed! a b)
+    (is (= 1 (count (an/find-usages 'konst.a/c))))
+    (is (= 1 (count (an/find-usages 'konst.a/k))))
+    (is (= {} (an/unused-aliases 'konst.b)))))
+
 (deftest the-file-a-source-names
   (let [a (written! "onfile/a.clj"
                     "(ns onfile.a)"
@@ -1989,3 +2034,115 @@
                (filterv #(= :remove (:op %)) events))))
       (testing "and it is said after it has gone, not before"
         (is (nil? (resolve 'defdp.a/gone)))))))
+
+;; --- what a lint is made of ----------------------------------------------------
+
+(deftest a-call-is-recorded-with-how-many-arguments-it-was-given
+  (let [source (written! "calls/a.clj"
+                         "(ns calls.a)"
+                         "(defn f [x] x)"
+                         "(defn g [y] (f 1 2) (-> y (f 3)) (map f [y]))")]
+    (analysed! source)
+    (let [calls (:invokes (an/file-facts source))]
+      (testing "a call the source wrote, at the list it wrote, after macroexpansion -
+      so the -> call has the argument the macro gave it"
+        (is (= [['calls.a/f 2 3 13 "(f 1 2)"]
+                ['calls.a/f 2 3 27 "(f 3)"]
+                ['clojure.core/map 2 3 34 "(map f [y])"]]
+               (mapv (juxt :var :argc :line :column text-at) calls))))
+      (testing "and f passed to map is not a call of f"
+        (is (= 3 (count calls)))))))
+
+(deftest a-use-says-how-it-was-written
+  (let [_ (written! "spelt/u.clj"
+                    "(ns spelt.u)"
+                    "(defn- secret [] 1)"
+                    "(def ^:private ^:dynamic *p* 1)"
+                    "(defn join [] 1)")
+        source (written! "spelt/a.clj"
+                         "(ns spelt.a (:require [spelt.u :as u :refer [join] :rename {join j}]))"
+                         "(declare later)"
+                         "(defn f [] (u/join) (j) #'u/secret (binding [u/*p* 2] (later)))"
+                         "(defn later [] 1)")]
+    (analysed! source)
+    (let [{:keys [usages defs]} (an/file-facts source)
+          uses (filterv #(and (= 3 (:line %)) (not (:macro %))) usages)]
+      (testing "the spelling, where it is not the var's own name unqualified"
+        (is (= [['spelt.u/join 'u/join] ['spelt.u/join 'j] ['spelt.u/secret 'u/secret]
+                ['spelt.u/*p* 'u/*p*] ['spelt.a/later nil]]
+               (mapv (juxt :var :written) (sort-by :column uses)))))
+      (testing "a #' and a var-ized symbol are through the var special form"
+        (is (= '#{spelt.u/secret spelt.u/*p*}
+               (set (map :var (filter :var-form uses))))))
+      (testing "a declare is a declaration, and the definition is not"
+        (is (= [[2 :declare] [4 nil]]
+               (mapv (juxt :line :declaration) (filter #(= 'spelt.a/later (:var %)) defs))))))))
+
+(deftest an-ns-form-says-where-its-clauses-are-written
+  (let [source (written! "specs/a.clj"
+                         "(ns specs.a"
+                         "  (:require [clojure.string :as str :refer [join]]"
+                         "            (clojure [set :as set]))"
+                         "  (:import [java.io File]))"
+                         "(defn f [] (str/blank? \"\") (join []) (set/union) File)")]
+    (analysed! source)
+    (is (= [{:ns 'specs.a
+             :requires [{:lib 'clojure.string :clause :require
+                         :at {:line 2 :column 14 :end-line 2 :end-column 28}
+                         :as 'str :as-at {:line 2 :column 33 :end-line 2 :end-column 36}
+                         :refer [['join {:line 2 :column 45 :end-line 2 :end-column 49}]]}
+                        {:lib 'clojure.set :clause :require
+                         :at {:line 3 :column 23 :end-line 3 :end-column 26}
+                         :as 'set :as-at {:line 3 :column 31 :end-line 3 :end-column 34}}]
+             :imports [{:name 'File :class "java.io.File"
+                        :at {:line 4 :column 21 :end-line 4 :end-column 25}}]}]
+           (:ns-specs (an/file-facts source))))))
+
+(deftest what-the-compiler-warned-about-is-a-fact-of-the-form
+  (let [source (written! "warned/a.clj"
+                         "(ns warned.a)"
+                         "(set! *warn-on-reflection* true)"
+                         "(defn f [x] (.length x))"
+                         "(def *earmuffed* 1)")]
+    (binding [*err* (java.io.StringWriter.)]
+      (analysed! source))
+    (is (= [[:reflection 3 13 "reference to field length can't be resolved."]
+            [:earmuffed-var-not-dynamic 4 6 "*earmuffed*"]]
+           (mapv (juxt :kind :line :column :message) (:warnings (an/file-facts source)))))
+    (testing "and goes with the form: the file loaded again without it has none"
+      (written! "warned/a.clj"
+                "(ns warned.a)"
+                "(set! *warn-on-reflection* true)"
+                "(defn f [^String x] (.length x))")
+      (binding [*err* (java.io.StringWriter.)]
+        (an/load-file! source))
+      (is (= [] (:warnings (an/file-facts source)))))))
+
+(deftest a-file-that-fails-says-where-and-why-until-it-loads
+  (let [source (written! "failed/a.clj"
+                         "(ns failed.a)"
+                         "(def ok 1)")]
+    (analysed! source)
+    (is (nil? (an/file-failure source)))
+    (written! "failed/a.clj"
+              "(ns failed.a)"
+              "(def ok 1)"
+              "(defn f [] (nope 1))")
+    (is (thrown? Exception (an/load-file! source)))
+    (let [failure (an/file-failure source)]
+      (is (= [3 12] [(:line failure) (:column failure)]))
+      (is (str/starts-with? (:message failure) "Unable to resolve symbol: nope"))
+      (testing "about the version on disk that failed"
+        (is (= (.lastModified (io/file @root source)) (:mtime failure))))
+      (testing "and not the version the model is about, which is the one before"
+        (is (not= (:mtime failure) (an/file-mtime source)))))
+    (written! "failed/a.clj" "(ns failed.a)" "(def ok 2)")
+    (an/load-file! source)
+    (is (nil? (an/file-failure source)))))
+
+(deftest the-model-says-when-it-has-changed
+  (let [before (an/version)
+        source (written! "versioned/a.clj" "(ns versioned.a)" "(def x 1)")]
+    (is (identical? before (an/version)))
+    (analysed! source)
+    (is (not (identical? before (an/version))))))

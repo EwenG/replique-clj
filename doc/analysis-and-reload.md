@@ -834,3 +834,28 @@ Replace read-time resolution in `sinkSyntaxQuoteRef` with **deferred resolution*
 - **Leftovers are the payoff:** a pending ref that still won't resolve is an
   **unresolved-symbol / undefined-reference diagnostic** — a clj-kondo-style lint the same
   mechanism gives for free. Build this when we do diagnostics; the forward-ref fix falls out.
+
+## 13. What a lint is made of
+
+Three more facts per form, and one per file, so that a tool can answer clj-kondo's
+questions out of what the compiler resolved - replique's `:lints` op is the first such
+tool.
+
+- **Calls** (`IAnalysisSink.invokeUsage`) - every call of a var the source wrote, with its
+  argument count *after* macroexpansion and the span of the list as written: `(-> x (f 1))`
+  is a call of `f` with two arguments at `(f 1)`. The arity check is not made here. It is
+  the caller's to make, against the var's `:arglists` as they are when it asks, so a caller
+  is wrong the moment its callee changes and not only when the caller compiles again.
+- **Warnings** (`IAnalysisSink.warning`) - the reflection, boxed-math and performance
+  warnings the compiler prints, and the earmuffed-but-not-dynamic one, filed under the form
+  that caused them. Told only where they are printed, so a sink hears what
+  `*warn-on-reflection*` / `*unchecked-math*` asked for and nothing more. The printed text
+  is unchanged; both go through `Compiler.compilerWarning`.
+- **Failures** - the file whose load threw, where (the compiler's line and column, or the
+  form being compiled) and why (the deepest cause's message), against the on-disk mtime of
+  the version that failed. Kept until the file next loads to the end: `file-failure`.
+
+All read through `file-facts`, one file's facts in form order, plus `file-mtime` (the
+version they are about) and `version` (a token `identical?` to an earlier one exactly while
+nothing has changed - what a tool compares around an evaluation to know whether to ask
+again).

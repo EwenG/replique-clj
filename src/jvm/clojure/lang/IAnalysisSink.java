@@ -69,15 +69,30 @@ void endForm();
  * precise: {@code line}/{@code column} at the symbol and {@code endLine}/
  * {@code endColumn} just past it. When it does not, positions fall back to the
  * enclosing form's line/column and {@code endLine}/{@code endColumn} are -1.
+ *
+ * {@code written} is the symbol the source wrote - {@code str/join}, a referred
+ * {@code join}, a renamed one - with its reader metadata. It is the one thing
+ * about the reference the resolved var no longer says: the alias it went
+ * through, and the name it was spelled by.
+ *
+ * {@code varForm} is true for a reference through the {@code var} special form:
+ * a {@code #'name}, or a symbol a macro var-ized ({@code binding} does). It names
+ * the var rather than taking its value, which is what makes it legal of a private
+ * var of another namespace, and the compiler says so nowhere else.
  */
-void varUsage(Var target, Namespace fromNs, String source,
+void varUsage(Var target, Symbol written, boolean varForm, Namespace fromNs, String source,
               int line, int column, int endLine, int endColumn);
 
 /**
  * A var defined by a top-level def form. The defining namespace is
  * {@code var.ns}. Positions follow the same convention as {@link #varUsage}.
+ *
+ * {@code declared} is true for a def that only declares the name - what {@code
+ * declare} expands to, a {@code def} of a name marked {@code :declared}. The
+ * mark is on the def's symbol, and gone from the var the moment the definition
+ * that follows replaces its metadata, so this is the one moment it can be told.
  */
-void varDef(Var var, String source,
+void varDef(Var var, boolean declared, String source,
             int line, int column, int endLine, int endColumn);
 
 /**
@@ -154,6 +169,11 @@ void macroExpansion(Var macro, Namespace fromNs, String source,
  * of the unused-* lints: a refer kept alive by its own {@code :refer} would be a
  * refer nothing could ever report.
  *
+ * The same goes for the rest of what the clauses write - the library names, their
+ * {@code :as} aliases, the classes an {@code :import} names: the namespace they
+ * make knows its aliases, refers and imports, and nothing about where the form
+ * wrote them. {@code clojure.analysis/ns-specs} reads the form for that.
+ *
  * A default method, so a sink with no use for declarations need not implement it.
  */
 default void nsForm(Object form, Symbol name, String source){
@@ -174,6 +194,43 @@ default void nsForm(Object form, Symbol name, String source){
  * A default method, for {@link #referUsage}'s reason.
  */
 default void importUsage(Class c, Namespace fromNs, String source,
+                         int line, int column, int endLine, int endColumn){
+}
+
+/**
+ * A warning the compiler printed about the form being analysed: {@code kind} is
+ * {@code :reflection}, {@code :boxed-math}, {@code :performance} or {@code
+ * :earmuffed-var-not-dynamic}, and {@code message} what the printed line says after
+ * its position ({@code "call to method foo can't be resolved (target class is
+ * unknown)."}) - or, for the last kind, the var's name.
+ *
+ * Told only when it is printed, so a sink hears what the developer asked to be
+ * warned about ({@code *warn-on-reflection*}, {@code *unchecked-math*
+ * :warn-on-boxed}) and nothing more. Filed under the form being analysed like any
+ * other fact, so a warning goes away with the form that caused it. {@code endLine}
+ * and {@code endColumn} are -1 where only the start is known, which is most of them:
+ * the compiler knows the line and column of the call.
+ *
+ * A default method, so a sink with no use for warnings need not implement it.
+ */
+default void warning(Keyword kind, String message, Namespace ns, String source,
+                     int line, int column, int endLine, int endColumn){
+}
+
+/**
+ * A call of the var {@code target} with {@code argc} arguments, written in source:
+ * the var's symbol at the head of the list carries a reader position. The span is
+ * the call's - the list as it was written - where the reader gave it one, and the
+ * symbol's otherwise. Told after macroexpansion, so {@code (-> x (f 1))} is a call
+ * of {@code f} with two arguments at the place {@code (f 1)} is written.
+ *
+ * What an arity check is made of; the check itself belongs to whoever asks, against
+ * the var's {@code :arglists} as they are when it is asked, which is what makes a
+ * caller wrong the moment its callee changes and not only when it is compiled again.
+ *
+ * A default method, so a sink with no use for calls need not implement it.
+ */
+default void invokeUsage(Var target, int argc, Namespace fromNs, String source,
                          int line, int column, int endLine, int endColumn){
 }
 
