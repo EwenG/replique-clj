@@ -180,10 +180,11 @@ default void nsForm(Object form, Symbol name, String source){
 }
 
 /**
- * A call of {@code clojure.core/require} or {@code clojure.core/use} the source
- * wrote, anywhere - at the top level or in the body of a function - handed over
- * as it was written: {@code fn} is the var's name ({@code require} or {@code
- * use}), {@code fromNs} the namespace the call is compiled in.
+ * A call of {@code clojure.core/require}, {@code clojure.core/use} or {@code
+ * clojure.core/requiring-resolve} the source wrote, anywhere - at the top level or
+ * in the body of a function - handed over as it was written: {@code fn} is the
+ * var's name, {@code fromNs} the namespace the call is compiled in. A
+ * requiring-resolve names a var by its quoted name, and loads its namespace.
  *
  * {@link #nsForm}'s reason, for a function: what the call names is quoted, and a
  * quoted symbol's position does not survive the form being compiled - by the time
@@ -196,6 +197,41 @@ default void nsForm(Object form, Symbol name, String source){
  * A default method, for {@link #nsForm}'s reason.
  */
 default void requireCall(Object form, Symbol fn, Namespace fromNs, String source){
+}
+
+/**
+ * A keyword a {@code :keys} destructuring names by the local it binds: {@code
+ * {:keys [id]}} is a use of {@code :id} that the source spells {@code id}, and the
+ * span is that symbol's. {@code ::keys} and {@code :my.ns/keys} give the keyword
+ * their namespace, as destructuring does. A keyword written as one in a {@code
+ * :keys} vector is read, and reported, as the keyword it is - {@link
+ * #keywordUsage} - and is not reported here too.
+ *
+ * {@link #nsForm}'s reason: the keyword exists only in the expansion, built from
+ * the symbol, and the symbol's position is gone once the form is compiled.
+ *
+ * A default method, for {@link #nsForm}'s reason.
+ */
+default void destructuredKeyword(Keyword kw, Namespace fromNs, String source,
+                                 int line, int column, int endLine, int endColumn){
+}
+
+/**
+ * A Java member the source names and the compiler resolved: a method, a field, or
+ * a constructor ({@code member} {@code "new"}), keyed by {@code declaring}, the
+ * class that declares it. {@code (.length s)} with {@code s} known to be a String
+ * is a use of {@code String}'s {@code length}; {@code (.size l)} on a List hint is
+ * one of {@code List}'s. A method value, {@code String/valueOf} not called, names
+ * every overload of that name, and is reported once per class declaring one.
+ *
+ * The span is the member's name as written - past a {@code Classname/}, and past
+ * the {@code .} or {@code -} in front of it. A call the compiler resolves only by
+ * reflection when it runs names no member it can say, and is not reported.
+ *
+ * A default method, for {@link #nsForm}'s reason.
+ */
+default void memberUsage(Class declaring, String member, Namespace fromNs, String source,
+                         int line, int column, int endLine, int endColumn){
 }
 
 /**

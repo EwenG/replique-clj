@@ -403,7 +403,7 @@ static void sinkInvoke(Var v, ISeq form){
 		sink.requireCall(form, v.sym, currentNS(), (String) SOURCE_PATH.deref());
 }
 
-// Whether V is clojure.core's require or use: a call of either written in the
+// Whether V is clojure.core's require, use or requiring-resolve: a call of one written in the
 // source is handed to the sink whole (IAnalysisSink.requireCall), because what it
 // is called with is quoted, and a quoted name keeps the reader's position only
 // until the form is compiled - this is the one point every call passes through
@@ -413,7 +413,7 @@ static boolean isLoadingCall(Var v){
 	if(v.ns == null || !"clojure.core".equals(v.ns.name.getName()))
 		return false;
 	String n = v.sym.getName();
-	return n.equals("require") || n.equals("use");
+	return n.equals("require") || n.equals("use") || n.equals("requiring-resolve");
 }
 
 // True when positions should be recorded: either explicitly requested, or implied
@@ -492,6 +492,68 @@ static Symbol carryClassPosition(Symbol orig, Symbol cls){
 	return (Symbol) cls.withMeta(nm);
 }
 
+// A Java member the source names - a method, a field, a constructor - as the
+// compiler resolved it, positioned at the member's name where SYM writes it:
+// past a Classname/ qualifier and a leading . or - (String/.length, .-x), which
+// are how the name is written and not the name. The member is keyed by the class
+// that declares it, which is what a method written on a subclass or through an
+// interface resolves to; a constructor by its class and "new". Nothing where the
+// compiler could not tell which member it is - a reflective call - or where the
+// name is no source symbol.
+static void sinkMemberUsage(Class declaring, String member, Object sym){
+	IAnalysisSink sink = analysisSink();
+	if(sink == null || declaring == null || !(sym instanceof Symbol) || !isSourceSymbol((Symbol) sym))
+		return;
+	Symbol s = (Symbol) sym;
+	int[] pos = symbolPosition(s);
+	if(pos[2] == pos[0])
+		{
+		int skip = (s.ns != null ? s.ns.length() + 1 : 0)
+		           + (s.name.startsWith(".") || s.name.startsWith("-") ? 1 : 0);
+		if(pos[1] + skip < pos[3])
+			pos[1] += skip;
+		}
+	sink.memberUsage(declaring, member, currentNS(), (String) SOURCE_PATH.deref(),
+	                 pos[0], pos[1], pos[2], pos[3]);
+}
+
+static void sinkMemberUsage(java.lang.reflect.Member m, Object sym){
+	if(m != null)
+		sinkMemberUsage(m.getDeclaringClass(),
+		                m instanceof Constructor ? "new" : m.getName(), sym);
+}
+
+// What a host expression the source wrote resolved to, at SYM - see
+// sinkMemberUsage. Anything else, and a member resolved by reflection at run
+// time, is nothing to record.
+static Expr sinkHostExpr(Expr e, Object sym){
+	if(analysisSink() == null)
+		return e;
+	if(e instanceof InstanceMethodExpr)
+		sinkMemberUsage(((InstanceMethodExpr) e).method, sym);
+	else if(e instanceof StaticMethodExpr)
+		sinkMemberUsage(((StaticMethodExpr) e).method, sym);
+	else if(e instanceof InstanceFieldExpr)
+		sinkMemberUsage(((InstanceFieldExpr) e).field, sym);
+	else if(e instanceof StaticFieldExpr)
+		sinkMemberUsage(((StaticFieldExpr) e).field, sym);
+	else if(e instanceof NewExpr)
+		sinkMemberUsage(((NewExpr) e).ctor, sym);
+	return e;
+}
+
+// Carry orig's reader position onto meth, the method symbol split out of a
+// (.method target) form, past the dot - see carryClassPosition.
+static Symbol carryMemberPosition(Symbol orig, Symbol meth){
+	IPersistentMap m = orig.meta();
+	if(m == null || !m.containsKey(RT.LINE_KEY) || !(m.valAt(RT.COLUMN_KEY) instanceof Number))
+		return meth;
+	return (Symbol) meth.withMeta(RT.map(RT.LINE_KEY, m.valAt(RT.LINE_KEY),
+	                                     RT.COLUMN_KEY, ((Number) m.valAt(RT.COLUMN_KEY)).intValue() + 1,
+	                                     LispReader.END_LINE_KEY, m.valAt(LispReader.END_LINE_KEY),
+	                                     LispReader.END_COLUMN_KEY, m.valAt(LispReader.END_COLUMN_KEY)));
+}
+
 // Emit a class-usage event positioned at sym, when analysis is on and sym is
 // source-written.
 static void sinkClassUsage(Class c, Symbol sym){
@@ -514,6 +576,23 @@ public static void sinkNsForm(Object form, Object name){
 	IAnalysisSink sink = analysisSink();
 	if(sink != null && name instanceof Symbol)
 		sink.nsForm(form, (Symbol) name, (String) SOURCE_PATH.deref());
+}
+
+// A keyword a :keys destructuring names by the local it binds - {:keys [id]} takes
+// :id out of the map, and the source never writes :id. clojure.core/destructure
+// calls this from its own body, while the binding form still carries the reader's
+// positions: the expansion it returns builds the keyword afresh, and the local's
+// symbol is all that says where it was written. WRITTEN is that symbol; one a
+// macro made carries no position and is no place in anybody's file.
+public static void sinkDestructuredKeyword(Object kw, Object written){
+	IAnalysisSink sink = analysisSink();
+	if(sink != null && kw instanceof Keyword && written instanceof Symbol
+	   && isSourceSymbol((Symbol) written))
+		{
+		int[] pos = symbolPosition((Symbol) written);
+		sink.destructuredKeyword((Keyword) kw, currentNS(), (String) SOURCE_PATH.deref(),
+		                         pos[0], pos[1], pos[2], pos[3]);
+		}
 }
 
 // The classes an (import ...) names. clojure.core/import calls this from its own
@@ -1345,9 +1424,9 @@ static public abstract class HostExpr implements Expr, MaybePrimitiveExpr{
 						:(Symbol) RT.third(form);
 				Symbol tag = tagOf(form);
 				if(c != null) {
-					return new StaticFieldExpr(line, column, c, munge(sym.name), tag);
+					return sinkHostExpr(new StaticFieldExpr(line, column, c, munge(sym.name), tag), RT.third(form));
 				} else
-					return new InstanceFieldExpr(line, column, instance, munge(sym.name), tag, (((Symbol)RT.third(form)).name.charAt(0) == '-'));
+					return sinkHostExpr(new InstanceFieldExpr(line, column, instance, munge(sym.name), tag, (((Symbol)RT.third(form)).name.charAt(0) == '-')), RT.third(form));
 				}
 			else
 				{
@@ -1361,9 +1440,9 @@ static public abstract class HostExpr implements Expr, MaybePrimitiveExpr{
 				for(ISeq s = RT.next(call); s != null; s = s.next())
 					args = args.cons(analyze(context == C.EVAL ? context : C.EXPRESSION, s.first()));
 				if(c != null)
-					return new StaticMethodExpr(source, line, column, tag, c, munge(sym.name), args, tailPosition);
+					return sinkHostExpr(new StaticMethodExpr(source, line, column, tag, c, munge(sym.name), args, tailPosition), sym);
 				else
-					return new InstanceMethodExpr(source, line, column, tag, instance, null, munge(sym.name), args, tailPosition);
+					return sinkHostExpr(new InstanceMethodExpr(source, line, column, tag, instance, null, munge(sym.name), args, tailPosition), sym);
 				}
 		}
 	}
@@ -1532,6 +1611,28 @@ static class QualifiedMethodExpr implements Expr {
 
 	public QualifiedMethodExpr(Class methodClass, Symbol sym) {
 		this(methodClass, sym, null);
+	}
+
+	// Every member Classname/member can name, at the symbol: a method value is
+	// not one overload but all of them, and a call through it picks one only
+	// when it runs - or when it is compiled, where toHostExpr is told nothing of
+	// this and records nothing. So the name is a use of each method of that name
+	// it could be, keyed by the class declaring it (sinkMemberUsage); of the
+	// constructors, one use of the class's "new". Returns QME.
+	static QualifiedMethodExpr sinkUsage(QualifiedMethodExpr qme){
+		if(analysisSink() == null)
+			return qme;
+		if(qme.kind == MethodKind.CTOR)
+			sinkMemberUsage(qme.c, "new", qme.methodSymbol);
+		else
+			{
+			java.util.Set<Class> declaring = new java.util.LinkedHashSet<>();
+			for(Executable m : methodOverloads(qme.c, qme.methodName, qme.kind))
+				declaring.add(m.getDeclaringClass());
+			for(Class d : declaring)
+				sinkMemberUsage(d, qme.methodName, qme.methodSymbol);
+			}
+		return qme;
 	}
 
 	public QualifiedMethodExpr(Class methodClass, Symbol sym, StaticFieldExpr fieldOL) {
@@ -3511,7 +3612,7 @@ public static class NewExpr implements Expr{
 			PersistentVector args = PersistentVector.EMPTY;
 			for(ISeq s = RT.next(RT.next(form)); s != null; s = s.next())
 				args = args.cons(analyze(context == C.EVAL ? context : C.EXPRESSION, s.first()));
-			return new NewExpr(c, args, line, column);
+			return sinkHostExpr(new NewExpr(c, args, line, column), RT.second(form));
 		}
 	}
 
@@ -8031,7 +8132,7 @@ public static Object macroexpand1(Object x) {
 					if(RT.length(form) < 2)
 						throw new IllegalArgumentException(
 								"Malformed member expression, expecting (.member target ...)");
-					Symbol meth = Symbol.intern(sname.substring(1));
+					Symbol meth = carryMemberPosition(sym, Symbol.intern(sname.substring(1)));
 					Object target = RT.second(form);
 					if(HostExpr.maybeClass(target, false) != null)
 						{
@@ -8303,12 +8404,12 @@ private static Expr analyzeSymbol(Symbol sym) {
 					List<Executable> maybeOverloads = QualifiedMethodExpr.methodOverloads(c, sym.name, QualifiedMethodExpr.MethodKind.STATIC);
 
 					if(maybeOverloads.isEmpty())
-						return new StaticFieldExpr(lineDeref(), columnDeref(), c, sym.name, tag);
+						return sinkHostExpr(new StaticFieldExpr(lineDeref(), columnDeref(), c, sym.name, tag), sym);
 					else
-						return new QualifiedMethodExpr(c, sym, new StaticFieldExpr(lineDeref(), columnDeref(), c, sym.name, tag));
+						return QualifiedMethodExpr.sinkUsage(new QualifiedMethodExpr(c, sym, (StaticFieldExpr) sinkHostExpr(new StaticFieldExpr(lineDeref(), columnDeref(), c, sym.name, tag), sym)));
 					}
 				else
-					return new QualifiedMethodExpr(c, sym);
+					return QualifiedMethodExpr.sinkUsage(new QualifiedMethodExpr(c, sym));
 				}
 
 			}

@@ -1805,7 +1805,12 @@
   "Creates and installs a new method of multimethod associated with dispatch-value. "
   {:added "1.0"}
   [multifn dispatch-val & fn-tail]
-  `(. ~(with-meta multifn {:tag 'clojure.lang.MultiFn}) addMethod ~dispatch-val (fn ~@fn-tail)))
+  ;; vary-meta rather than with-meta: the reader's position on the name is what
+  ;; makes it a place the analysis records - the multimethod used where a method
+  ;; of it is written - and the mark says what kind of place (clojure.analysis's
+  ;; varUsage). Neither is emitted: a symbol's metadata is not part of a var.
+  `(. ~(vary-meta multifn assoc :tag 'clojure.lang.MultiFn :clojure.analysis/defmethod true)
+      addMethod ~dispatch-val (fn ~@fn-tail)))
 
 (defn remove-all-methods
   "Removes all of the methods of multimethod."
@@ -4492,7 +4497,13 @@
                                               (if (keyword? mk)
                                                 (let [mkns (namespace mk)
                                                       mkn (name mk)]
-                                                  (cond (= mkn "keys") (assoc transforms mk #(keyword (or mkns (namespace %)) (name %)))
+                                                  (cond (= mkn "keys") (assoc transforms mk #(let [k (keyword (or mkns (namespace %)) (name %))]
+                                                                                               ;; the keyword the source wrote as the
+                                                                                               ;; local - a use of it, recorded where
+                                                                                               ;; the local is written. See
+                                                                                               ;; Compiler.sinkDestructuredKeyword.
+                                                                                               (clojure.lang.Compiler/sinkDestructuredKeyword k %)
+                                                                                               k))
                                                         (= mkn "syms") (assoc transforms mk #(list `quote (symbol (or mkns (namespace %)) (name %))))
                                                         (= mkn "strs") (assoc transforms mk str)
                                                         :else transforms))

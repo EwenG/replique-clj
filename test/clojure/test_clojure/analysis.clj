@@ -2132,17 +2132,27 @@
                          "(require '[reqcall.lib :as l])"
                          "(defn lazy [] (require 'reqcall.lib) (use '(reqcall [lib])))"
                          "(defn computed [s] (require (symbol s)) (requiring-resolve 'reqcall.lib/f))"
-                         "(comment (require '[reqcall.lib :as l2]) (l/f))"
+                         "(comment (require '[reqcall.lib :as l2]) (l/f) (requiring-resolve 'reqcall.lib/f))"
                          "#_(use 'reqcall.lib)")]
     (analysed! source)
     (testing "at the top level and in a function body, each marked as a call and
-    by the function called; the computed one names nothing, and
-    requiring-resolve names a var"
+    by the function called; the computed one names nothing, and a
+    requiring-resolve is placed at the namespace part of the name it writes"
       (is (= [[2 12 23 :require nil] [3 25 36 :require nil] [3 54 57 :use nil]
-              [5 21 32 :require :comment] [6 9 20 :use :discard]]
+              [4 61 72 :requiring-resolve nil]
+              [5 21 32 :require :comment] [5 68 79 :requiring-resolve :comment]
+              [6 9 20 :use :discard]]
              (sort (map (juxt :line :column :end-column :declaration :dead)
                         (an/find-namespace-usages 'reqcall.lib)))))
       (is (every? :call (an/find-namespace-usages 'reqcall.lib))))
+    (testing "and requiring-resolve is a use of the var it names, all of the name,
+    spelled as it is written"
+      (is (= [[4 61 74 :requiring-resolve nil 'reqcall.lib/f]
+              [5 68 81 :requiring-resolve :comment 'reqcall.lib/f]]
+             (sort-by first
+                      (map (juxt :line :column :end-column :role :dead :written)
+                           (filter #(and (= source (:source %)) (:role %))
+                                   (an/find-usages 'reqcall.lib/f)))))))
     (testing "the ns form's own requires are reported once, as the ns form's:
     what it expands into is not the source calling require"
       (is (= [[1 26 nil]]
@@ -2152,9 +2162,83 @@
     (testing "and kept apart from the ns form's clauses"
       (is (= ['clojure.string] (map :lib (mapcat :requires (:ns-specs (an/file-facts source))))))
       (is (= [['reqcall.lib :require] ['reqcall.lib :require] ['reqcall.lib :use]
-              ['reqcall.lib :require] ['reqcall.lib :use]]
+              ['reqcall.lib :requiring-resolve]
+              ['reqcall.lib :require] ['reqcall.lib :requiring-resolve] ['reqcall.lib :use]]
              (map (juxt :lib :clause)
                   (mapcat :requires (:require-calls (an/file-facts source)))))))))
+
+(deftest a-defmethod-is-a-use-of-its-multimethod
+  (let [source (written! "multi/a.clj"
+                         "(ns multi.a)"
+                         "(defmulti area :shape)"
+                         "(defmethod area :square [{:keys [side]}] (* side side))"
+                         "(defn total [xs] (map area xs))"
+                         "(comment (defmethod area :circle [_] 0))")]
+    (analysed! source)
+    (is (= [[3 12 :defmethod nil] [4 23 nil nil] [5 21 :defmethod :comment]]
+           (sort (map (juxt :line :column :role :dead) (an/find-usages 'multi.a/area)))))))
+
+(deftest a-keys-destructuring-is-a-use-of-the-keywords-it-binds
+  (let [source (written! "destr/a.clj"
+                         "(ns destr.a (:require [clojure.string :as s]))"
+                         "(defn f [{:keys [id s/other] ::keys [mine] :destr.b/keys [theirs] :strs [nope]}]"
+                         "  [id other mine theirs nope])"
+                         "(let [{:keys [:written]} {}] written)")]
+    (analysed! source)
+    (let [at (fn [kw] (sort (map (juxt :line :column :end-column :role)
+                                 (filter #(= source (:source %)) (an/find-keyword-usages kw)))))]
+      (testing "a symbol of a :keys is the keyword, where the local is written -
+      s/other is :s/other, as destructuring reads it, and not an alias"
+        (is (= [[2 18 20 :destructuring]] (at :id)))
+        (is (= [[2 21 28 :destructuring]] (at :s/other))))
+      (testing "::keys and :ns/keys give it their namespace"
+        (is (= [[2 38 42 :destructuring]] (at :destr.a/mine)))
+        (is (= [[2 59 65 :destructuring]] (at :destr.b/theirs))))
+      (testing "a keyword written as one is read as one, once"
+        (is (= [[4 15 23 nil]] (at :written))))
+      (testing ":strs names strings, not keywords"
+        (is (empty? (at :nope)))))))
+
+(deftest a-local-is-found-from-any-place-it-is-written
+  (let [source (written! "loc/a.clj"
+                         "(ns loc.a)"
+                         "(defn f [x y]"
+                         "  (let [x (inc x)]"
+                         "    (+ x y)))")]
+    (analysed! source)
+    (let [places (fn [line column]
+                   (sort (map (juxt :line :column :declaration)
+                              (an/find-local-usages source line column))))]
+      (testing "the parameter x, from its binding and from its use"
+        (is (= [[2 10 :binding] [3 16 nil]] (places 2 10)))
+        (is (= [[2 10 :binding] [3 16 nil]] (places 3 17))))
+      (testing "the let's x shadows it"
+        (is (= [[3 9 :binding] [4 8 nil]] (places 4 8))))
+      (testing "and nowhere a local is written, nothing"
+        (is (nil? (an/find-local-usages source 1 1)))))))
+
+(deftest a-java-member-is-used-where-the-compiler-resolved-it
+  (let [source (written! "member/a.clj"
+                         "(ns member.a (:import [java.util ArrayList]))"
+                         "(defn f [^String s ^ArrayList l]"
+                         "  [(.length s) (. s length) (String/valueOf 1) String/.trim"
+                         "   (.size l) Integer/MAX_VALUE (ArrayList. 3) (.-x (java.awt.Point.))])")]
+    (binding [*err* (java.io.StringWriter.)]
+      (analysed! source))
+    (let [at (fn [c m] (sort (map (juxt :line :column :end-column)
+                                  (filter #(= source (:source %)) (an/find-member-usages c m)))))]
+      (testing "a method, whichever way it is written, at its name"
+        (is (= [[3 6 12] [3 21 27]] (at String "length")))
+        (is (= [[3 37 44]] (at "java.lang.String" "valueOf"))))
+      (testing "a method value is each method of that name"
+        (is (= [[3 56 60]] (at String "trim"))))
+      (testing "by the class declaring it"
+        (is (= [[4 6 10]] (at java.util.ArrayList "size"))))
+      (testing "a field, a constructor"
+        (is (= [[4 22 31]] (at Integer "MAX_VALUE")))
+        (is (= [[4 33 42]] (at java.util.ArrayList "new")))
+        (is (= [[4 50 51]] (at java.awt.Point "x")))
+        (is (= [[4 53 67]] (at java.awt.Point "new")))))))
 
 (deftest what-the-compiler-warned-about-is-a-fact-of-the-form
   (let [source (written! "warned/a.clj"

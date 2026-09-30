@@ -53,8 +53,8 @@ target can be written against this runtime.
 - **A compiler-integrated analysis & macro-aware reload subsystem** — the largest divergence by
   line count, and the one the two changes above don't mention: `clojure.analysis` (new),
   `clojure.lang.IAnalysisSink` (new), and gated taps in `Compiler.java` and `LispReader.java`. The
-  compiler emits typed semantic events (var / local / class / keyword usages, var defs,
-  macro-expansion edges) into a sink installed by binding `Compiler/ANALYSIS_SINK`; a Clojure-side
+  compiler emits typed semantic events (var / local / class / keyword / Java member usages, var
+  defs, macro-expansion edges, the clauses of an `ns` form and the calls of `require`) into a sink installed by binding `Compiler/ANALYSIS_SINK`; a Clojure-side
   model folds them into find-usages / jump-to-definition / unused-`require`-import-local queries and
   a **macro-aware stale reload** that recompiles the files a macro edit actually invalidates, in
   dependency order. It exists to let an in-process REPL tool inherit the *real* compiler's

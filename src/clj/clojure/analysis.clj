@@ -72,7 +72,8 @@
 ;;   :forms           {fid {:ns :source :line :column + one key per non-empty fact
 ;;                          category: :usages :defs :keyword-usages :class-usages
 ;;                          :locals :local-uses :macro-deps :invokes :warnings
-;;                          :ns-specs :require-calls, each a vector of facts}}
+;;                          :ns-specs :require-calls :member-usages, each a
+;;                          vector of facts}}
 ;;                                          Facts are stored BY CATEGORY rather than as
 ;;                                          tagged [op a b] tuples, so each fact is a
 ;;                                          single self-describing object (a Span /
@@ -97,6 +98,8 @@
 ;;   :locals          {binding {:ns :name ...span :uses #{span}}}
 ;;   :keyword-usages  {kw    #{span}}
 ;;   :class-usages    {class-name-string #{span}}  (keyed by name, not Class - see class-key)
+;;   :member-usages   {[class-name member] #{span}}  a Java method, field or constructor
+;;                                          ("new"), keyed by the class declaring it
 ;;   :macro-deps      {ns-sym {macro-qsym #{fid}}}   compile-time edges (§9); each fid
 ;;                                          carries the expanding form's file (:source)
 ;;   :ns-usages       {lib   #{span-map}}   where each ns form or require call loads
@@ -309,6 +312,27 @@
     (when (seq libs)
       (:requires (ns-specs (list 'ns 'call (cons (keyword (name f)) libs)))))))
 
+(defn requiring-resolve-names
+  "What a call of `requiring-resolve` the source wrote names, positioned: for each
+  var it names as a literal - (requiring-resolve 'my.lib/f) - {:var my.lib/f
+  :written the symbol as read :at its span :lib {:lib my.lib :at the span of the
+  namespace part :clause :requiring-resolve}}. The call loads the namespace and
+  resolves the var, and is a use of each; a name the source computes is neither
+  and is skipped, as require-call-specs skips one."
+  [form]
+  (for [arg (rest form)
+        :when (and (seq? arg) (= 'quote (first arg)) (next arg))
+        :let [sym (second arg)
+              at (when (qualified-symbol? sym) (written-span sym))]
+        :when at]
+    {:var (symbol (namespace sym) (name sym))
+     :written sym
+     :at at
+     :lib {:lib (symbol (namespace sym))
+           :at (assoc at :end-line (:line at)
+                      :end-column (+ (long (:column at)) (count (namespace sym))))
+           :clause :requiring-resolve}}))
+
 ;; A record with primitive int coordinates costs ~1/7th the bytes of the equivalent
 ;; array-map (measured), chiefly by not boxing the four coordinates into Integers.
 ;; The four coordinates are always ints at the sink boundary (IAnalysisSink passes
@@ -322,7 +346,12 @@
 ;; only where that is not the var's own name, unqualified: `str/join', a renamed
 ;; refer. The common spelling is implied by the key, and costs nothing. var-form is
 ;; true for a usage through the `var' special form - #'x, or a symbol a macro
-;; var-ized - else nil. Locals use their own record (LocalSpan) below.
+;; var-ized - else nil. role is what the name is written as a part of, where that is
+;; more than a use: :defmethod for the multimethod a defmethod adds a method to,
+;; :destructuring for a keyword a :keys writes as the local it binds,
+;; :requiring-resolve for a var a requiring-resolve names by its quoted name - else
+;; nil.
+;; Locals use their own record (LocalSpan) below.
 ;;
 ;; `entity` is the thing this span is ABOUT - the var key for a usage/def, the Keyword
 ;; for a keyword usage, the class-name string for a class usage. Carrying it on the
@@ -331,7 +360,7 @@
 ;; fewer object retained in the :forms log for the life of the code). span->map never
 ;; exposes it, so the public span shape is unchanged.
 (defrecord Span [entity source ^int line ^int column ^int end-line ^int end-column from-ns macro dead
-                 declaration written var-form])
+                 declaration written var-form role])
 
 (defn- norm-end [x] (if (nat-int? x) (int x) -1))
 
@@ -344,8 +373,10 @@
   ([entity source line column el ec from-ns macro dead declaration]
    (span entity source line column el ec from-ns macro dead declaration nil nil))
   ([entity source line column el ec from-ns macro dead declaration written var-form]
+   (span entity source line column el ec from-ns macro dead declaration written var-form nil))
+  ([entity source line column el ec from-ns macro dead declaration written var-form role]
    (->Span entity source (int line) (int column) (norm-end el) (norm-end ec)
-           from-ns (when macro true) dead declaration written (when var-form true))))
+           from-ns (when macro true) dead declaration written (when var-form true) role)))
 
 (defn- written-as
   "The spelling `written' of the var keyed `k' worth keeping on its span: nil
@@ -389,7 +420,7 @@
   "Normalise a Span record to the documented plain-map span shape, for the public
   query API - so results carry no record type and compare = to map literals. Omits
   an absent end-line/end-column (stored as -1) and a nil from-ns/macro/dead/
-  declaration/written/var-form, exactly reproducing the map the sink used to build."
+  declaration/written/var-form/role, exactly reproducing the map the sink used to build."
   [s]
   (cond-> {:source (:source s) :line (:line s) :column (:column s)}
     (nat-int? (:end-line s))   (assoc :end-line (:end-line s))
@@ -399,7 +430,8 @@
     (:dead s)                  (assoc :dead (:dead s))
     (:declaration s)           (assoc :declaration (:declaration s))
     (:written s)               (assoc :written (:written s))
-    (:var-form s)              (assoc :var-form true)))
+    (:var-form s)              (assoc :var-form true)
+    (:role s)                  (assoc :role (:role s))))
 
 (defn- spans->maps [spans]
   (when spans (into #{} (map span->map) spans)))
@@ -463,13 +495,14 @@
 (def ^:private ^:const CAT-WARNINGS 8)
 (def ^:private ^:const CAT-NSSPECS  9)
 (def ^:private ^:const CAT-REQCALLS 10)
-(def ^:private ^:const N-CATS       11)
+(def ^:private ^:const CAT-MEMBERS  11)
+(def ^:private ^:const N-CATS       12)
 
 ;; The model key each category is stored under on a committed form entry, indexed by
 ;; the constants above.
 (def ^:private cat-keys
   [:usages :defs :keyword-usages :class-usages :locals :local-uses :macro-deps
-   :invokes :warnings :ns-specs :require-calls])
+   :invokes :warnings :ns-specs :require-calls :member-usages])
 
 ;; An open form is buffered in a thread-local mutable holder, NOT written to the shared
 ;; model fact-by-fact. Facts accumulate in per-category ArrayLists (`cats`, allocated
@@ -721,7 +754,12 @@
       (clojure.core/defn clojure.core/defn- clojure.core/defmacro)
       (walk-fn-tail (drop-while #(or (string? %) (map? %)) (rest args)) env)
       def (walk-all (rest args) env)
-      clojure.core/defmethod (do (walk-dead (first args) env)
+      clojure.core/defmethod (do (walk-dead (let [m (first args)]
+                                              ;; as clojure.core/defmethod marks it
+                                              (cond-> m
+                                                (symbol? m)
+                                                (vary-meta assoc :clojure.analysis/defmethod true)))
+                                            env)
                                  (walk-dead (second args) env)
                                  (walk-named-fn-tail (drop 2 args) env))
       (letfn* clojure.core/letfn)
@@ -881,7 +919,9 @@
                              (when-let [k (var-key t)]
                                (.add uses (span k source line col el ec ns
                                                 (:macro (meta t)) kind nil
-                                                (written-as k sym) nil)))
+                                                (written-as k sym) nil
+                                                (when (:clojure.analysis/defmethod m)
+                                                  :defmethod))))
                              ;; Foo. records Foo, as the compiler does
                              (let [ec (if (and (nil? (namespace sym))
                                                (.endsWith (name sym) ".")
@@ -899,11 +939,24 @@
                                ;; of live code only
                                :on-call
                                (fn [op form]
-                                 (when (#{'clojure.core/require 'clojure.core/use} op)
+                                 (case op
+                                   (clojure.core/require clojure.core/use)
                                    (when-let [rs (seq (require-call-specs
                                                        form (symbol (name op))))]
                                      (.add reqs {:ns (ns-name ns)
-                                                 :requires (mapv #(assoc % :dead kind) rs)}))))})
+                                                 :requires (mapv #(assoc % :dead kind) rs)}))
+
+                                   clojure.core/requiring-resolve
+                                   (when-let [named (seq (requiring-resolve-names form))]
+                                     (doseq [{k :var :keys [written at]} named]
+                                       (.add uses (span k source (:line at) (:column at)
+                                                        (:end-line at) (:end-column at) ns
+                                                        nil kind nil (written-as k written)
+                                                        nil :requiring-resolve)))
+                                     (.add reqs {:ns (ns-name ns)
+                                                 :requires (mapv #(assoc (:lib %) :dead kind)
+                                                                 named)}))
+                                   nil))})
               (catch Exception _ nil))))
         (when-not (and (.isEmpty uses) (.isEmpty classes) (.isEmpty reqs))
           (let [^longs c (.counter fr)
@@ -1160,7 +1213,11 @@
     (when-let [of (current-form)]
       (when-let [k (var-key target)]
         (add-fact! of CAT-USAGES (span k source line column el ec from-ns nil nil nil
-                                       (written-as k written) var-form))))
+                                       (written-as k written) var-form
+                                       ;; clojure.core/defmethod marks the name it
+                                       ;; adds a method to - see its expansion
+                                       (when (:clojure.analysis/defmethod (meta written))
+                                         :defmethod)))))
     nil)
   (varDef [_ v declared source line column el ec]
     ;; OUTSIDE THE FORM WINDOW, and the only thing here that is: a def typed at a
@@ -1191,6 +1248,18 @@
     (when-let [of (when-not (RT/suppressRead) (current-form))]
       (add-fact! of CAT-KEYWORDS (span kw source line column el ec from-ns nil)))
     nil)
+  (memberUsage [_ c member from-ns source line column el ec]
+    (when-let [of (current-form)]
+      (add-fact! of CAT-MEMBERS (span [(class-key c) member] source line column el ec
+                                      from-ns nil)))
+    nil)
+  (destructuredKeyword [_ kw from-ns source line column el ec]
+    ;; with the keyword's other uses, marked for how it is written: a rename of the
+    ;; keyword renames the local with it, which is what makes it a place at all
+    (when-let [of (current-form)]
+      (add-fact! of CAT-KEYWORDS (span kw source line column el ec from-ns nil nil nil
+                                       nil nil :destructuring)))
+    nil)
   (classUsage [_ c from-ns source line column el ec]
     (when-let [of (current-form)]
       (add-fact! of CAT-CLASSES (span (class-key c) source line column el ec from-ns nil)))
@@ -1219,9 +1288,21 @@
     ;; top-level or in a function body alike. Kept apart from :ns-specs, which is
     ;; what the ns form is - a call is not the ns form, and a lint reading the
     ;; ns form's clauses must not be handed it as one.
+    ;;
+    ;; A requiring-resolve is both halves of what it does: a use of the var it
+    ;; names, where the source wrote it and marked :requiring-resolve, and a load
+    ;; of its namespace, at the namespace part of the name.
     (when-let [of (current-form)]
-      (when-let [requires (seq (require-call-specs form f))]
-        (add-fact! of CAT-REQCALLS {:ns (ns-name from-ns) :requires (vec requires)})))
+      (if (= "requiring-resolve" (name f))
+        (let [named (requiring-resolve-names form)]
+          (doseq [{k :var :keys [written at]} named]
+            (add-fact! of CAT-USAGES (span k source (:line at) (:column at) (:end-line at)
+                                           (:end-column at) from-ns nil nil nil
+                                           (written-as k written) nil :requiring-resolve)))
+          (when (seq named)
+            (add-fact! of CAT-REQCALLS {:ns (ns-name from-ns) :requires (mapv :lib named)})))
+        (when-let [requires (seq (require-call-specs form f))]
+          (add-fact! of CAT-REQCALLS {:ns (ns-name from-ns) :requires (vec requires)}))))
     nil)
   (invokeUsage [_ target argc from-ns source line column el ec]
     (when-let [of (current-form)]
@@ -1580,7 +1661,7 @@
 ;; the small one it uses and the rest are built again when somebody asks.
 (defonce ^:private index-caches
   (into {} (for [k [:usages :defs :keyword-usages :class-usages :locals :macro-deps
-                    :ns-usages]]
+                    :ns-usages :member-usages]]
              [k (atom {:forms nil :value nil})])))
 
 (defn- sorted-fids
@@ -1709,7 +1790,7 @@
 (defn- index
   "One derived index of model value `m`, built from its form log and cached until
   that log changes (`cached-by-forms`). `k` is one of :usages, :defs,
-  :keyword-usages, :class-usages, :locals, :macro-deps, :ns-usages.
+  :keyword-usages, :class-usages, :member-usages, :locals, :macro-deps, :ns-usages.
 
   Ask for the one that answers the question at hand: nothing here forces any of the
   others, which is the whole of why there is a cache each."
@@ -1722,6 +1803,7 @@
          :usages         (build-spans forms :usages)
          :keyword-usages (build-spans forms :keyword-usages)
          :class-usages   (build-spans forms :class-usages)
+         :member-usages  (build-spans forms :member-usages)
          :defs           (build-defs forms)
          :locals         (build-locals forms)
          :macro-deps     (build-macro-deps forms)
@@ -1887,6 +1969,48 @@
   [c]
   (spans->maps (get (index @model :class-usages) (if (class? c) (.getName ^Class c) (str c)))))
 
+(defn- covers?
+  "Does the span `s` - :line :column :end-line :end-column - hold position
+  line:column? The end counts: a cursor just past a name is still on it."
+  [s line column]
+  (let [l (:line s) c (:column s)
+        el (if (nat-int? (:end-line s)) (:end-line s) l)
+        ec (if (nat-int? (:end-column s)) (:end-column s) c)]
+    (and (not (neg? (compare [line column] [l c])))
+         (not (pos? (compare [line column] [el ec]))))))
+
+(defn find-member-usages
+  "Where the source names a Java member - `c` the class declaring it (a Class or its
+  name), `member` its name, or \"new\" for a constructor. A set of spans shaped like
+  find-usages', each at the member's name as it is written: `length` in (.length s),
+  in String/.length and in (. s length).
+
+  Only what the compiler resolved. A call through a target of no known type is
+  resolved by reflection when it runs, and names no member here; a method value
+  names every overload of its name, as each class declaring one of them.
+
+  By the DECLARING class, which is the one question with one answer: a method
+  written on a String and inherited from Object is Object's. Asking about a class
+  and a name is the caller's to turn into the classes declaring what it has of
+  that name - replique does, off the class's own methods."
+  [c member]
+  (spans->maps (get (index @model :member-usages)
+                    [(if (class? c) (.getName ^Class c) (str c)) (str member)])))
+
+(defn member-at
+  "The Java member the source names at `line`:`column` of file `source`, as the
+  compiler resolved it - [declaring-class-name member], what find-member-usages
+  takes - or nil where it names none there. What a name written .length is
+  cannot be said from the text, which does not say what it is called on, and the
+  compiler has said it already."
+  [source line column]
+  (let [m @model]
+    (some (fn [fid]
+            (some (fn [^Span s]
+                    (when (covers? (span->map s) line column) (.entity s)))
+                  (get-in m [:forms fid :member-usages])))
+          (get-in m [:source->forms source]))))
+
 (defn find-namespace-usages
   "Where a namespace is required - pass the Namespace or its name symbol. A set of
   {:from-ns :source :line :column :end-line :end-column :declaration [:call]}: the
@@ -1894,12 +2018,14 @@
   (:require or :use) as find-usages marks a :refer, and :from-ns the requiring
   namespace's name symbol.
 
-  A CALL of require or use is among them, carrying :call true, wherever it is
-  written - at the top level, or in a function that loads the library lazily - and
-  :declaration the function called. It is where the source says the namespace is
-  loaded, which is the same thing an ns form says, and it is recorded as the call
-  is compiled rather than as it runs: one in a function nobody has called is here
-  too. Only a library written as a literal is: see require-call-specs.
+  A CALL of require, use or requiring-resolve is among them, carrying :call true,
+  wherever it is written - at the top level, or in a function that loads the
+  library lazily - and :declaration the function called. It is where the source
+  says the namespace is loaded, which is the same thing an ns form says, and it is
+  recorded as the call is compiled rather than as it runs: one in a function
+  nobody has called is here too. Only a library written as a literal is: see
+  require-call-specs. A requiring-resolve is placed at the namespace part of the
+  name it writes - the rest is the var, a use of it (requiring-resolve-names).
 
   One in code the program does not run is here as well, as find-usages has it -
   a (require 'my.lib) in a (comment ...) carries :dead :comment, one in a #_
@@ -1940,6 +2066,42 @@
          :when (every? (comp empty? :uses) infos)
          :when (or (nil? ns-sym) (= ns-sym (ns-name (:ns info))))]
      (dissoc info :uses))))
+
+(defn find-local-usages
+  "Where the local written at `line`:`column` of file `source` is - its binding and
+  every use of it - or nil where no local is written there. The position may be
+  the binding's or any of its uses'. A set of {:source :line :column :end-line
+  :end-column :from-ns [:declaration :binding]}: the binding carries :declaration
+  :binding, which is a place a rename rewrites and not a use.
+
+  BY SITE, for unused-locals' reason: a macro may bind one written symbol more than
+  once - a destructuring `loop` binds its pattern outside the loop and again inside
+  it - and the programmer wrote one local. So the answer is every binding the
+  source wrote at the binding's place, and every use of any of them.
+
+  A local is lexically its form's, so this reads the forms of `source` and nothing
+  else. One in code the program does not run - a #_, a (comment ...) - is not
+  recorded, and is not found."
+  [source line column]
+  (let [m      @model
+        forms  (keep #(get-in m [:forms %]) (get-in m [:source->forms source]))
+        defs   (mapcat :locals forms)
+        uses   (mapcat :local-uses forms)
+        hit    (into #{} (comp (filter #(covers? % line column)) (map :binding))
+                     (concat defs uses))
+        site   (juxt :line :column)
+        sites  (into #{} (comp (filter #(hit (:binding %))) (map site)) defs)
+        bound  (into hit (comp (filter #(sites (site %))) (map :binding)) defs)
+        place  (fn [l] (cond-> {:source (:source l) :line (:line l) :column (:column l)
+                                :from-ns (some-> (:lns l) ns-name)}
+                         (nat-int? (:end-line l))   (assoc :end-line (:end-line l))
+                         (nat-int? (:end-column l)) (assoc :end-column (:end-column l))))]
+    (when (seq bound)
+      (into (into #{} (comp (filter #(bound (:binding %)))
+                            (map #(assoc (place %) :declaration :binding)))
+                  defs)
+            (comp (filter #(bound (:binding %))) (map place))
+            uses))))
 
 (defn file-forms
   "The fids currently attributed to file `source` (for inspection/tests)."
