@@ -408,10 +408,17 @@
       (testing "and none of them is a USE, so the lints that ask what a namespace
       does not need still answer - a refer kept alive by its own :refer would be a
       refer nothing could ever report"
+        ;; `thrice' is the one worth reading twice: it IS used, and through the
+        ;; alias, so the refer that names it is doing nothing and taking it out
+        ;; would change nothing. A refer is about how a name is spelled, which is
+        ;; why the answer is by the spelling and not by whether the var is used.
         (is (= {'only-named (resolve 'declared.lib/only-named)
                 'under-a-prefix (resolve 'declared.deep/under-a-prefix)
-                'local-name (resolve 'declared.lib/renamed)}
+                'local-name (resolve 'declared.lib/renamed)
+                'thrice (resolve 'declared.lib/thrice)}
                (an/unused-refers 'declared.a)))
+        (is (not (contains? (an/unused-refers 'declared.a) 'twice))
+            "and `twice', which the body writes short, is not one")
         (is (= {'StringWriter java.io.StringWriter, 'Date java.util.Date}
                (an/unused-imports 'declared.a)))))))
 
@@ -480,6 +487,89 @@
       (is (empty? (an/find-class-usages 'clojure.lang.IObj)))
       (is (empty? (an/find-class-usages 'clojure.lang.IRecord)))
       (is (empty? (an/find-class-usages 'java.util.Map))))))
+
+(deftest a-read-a-macro-left-nowhere-is-still-a-read
+  ;; The capture rule says a usage is recorded WHERE THE NAME IS WRITTEN, and a
+  ;; macro can destroy that without touching the reference: `with-meta' on a form it
+  ;; was handed replaces the reader's position wholesale. clojure.core/vswap! does
+  ;; it to its volatile, and every logging macro that tags an exception does it to
+  ;; the exception. What is left is a read with no place - which is exactly what
+  ;; unused-binding asks about, and no place is needed to answer it.
+  (let [m (written! "nowhere/m.clj"
+                    "(ns nowhere.m)"
+                    "(defmacro tagged [x] (with-meta x {:tag 'Object}))")
+        a (written! "nowhere/a.clj"
+                    "(ns nowhere.a (:require [nowhere.m :as m]))"
+                    "(defn read-through-a-macro [through] (m/tagged through))"
+                    "(defn read-plainly [plain] plain)"
+                    "(defn never-read [unread] :ok)")]
+    (analysed! m a)
+    (testing "a binding read only through a macro that replaced the metadata is read"
+      (is (= #{"unread"} (set (map :name (an/unused-locals 'nowhere.a))))))
+    (testing "and the read is still no place: there is nothing in the file to point
+              at, so the binding is all find-local-usages has to give"
+      (is (= [[2 29 :binding]]
+             (->> (an/find-local-usages a 2 29) (map (juxt :line :column :declaration))
+                  sort vec))))
+    (testing "while a read that IS somewhere is still a place"
+      (is (= [[3 21 :binding] [3 28 nil]]
+             (->> (an/find-local-usages a 3 21) (map (juxt :line :column :declaration))
+                  sort vec))))))
+
+(deftest a-require-is-used-by-how-the-source-spells-it
+  ;; Whether a require is needed is a question about SPELLING. A name reaching the
+  ;; compiler as `lib/f' resolves only because this namespace has that alias, so the
+  ;; alias is holding it up whatever else happened to the form on the way; one
+  ;; reaching it as `spelled.lib/f' needs nothing of the ns form - and that is also
+  ;; what macroexpansion leaves behind, since syntax-quote qualifies what it names.
+  (let [lib (written! "spelled/lib.clj"
+                      "(ns spelled.lib)"
+                      "(defn f [x] x)")
+        m   (written! "spelled/m.clj"
+                      "(ns spelled.m (:require [spelled.lib :as l] [clojure.walk]))"
+                      "(defmacro calls-lib [x] `(l/f ~x))"
+                      "(defmacro rebuilt [& body]"
+                      "  (clojure.walk/postwalk"
+                      "   #(if (instance? clojure.lang.IObj %) (with-meta % nil) %)"
+                      "   (cons 'do body)))")
+        ;; the alias is written here, and then the macro rebuilds the body it was
+        ;; given without the reader's metadata - what a core.async `go' does
+        a   (written! "spelled/a.clj"
+                      "(ns spelled.a (:require [spelled.lib :as lib]"
+                      "                        [spelled.m :as m]))"
+                      "(defn run [x] (m/rebuilt (lib/f x)))")
+        ;; and here the namespace is named nowhere at all - only the macro's body
+        ;; names it, and names it in full
+        b   (written! "spelled/b.clj"
+                      "(ns spelled.b (:require [spelled.lib :as lib]"
+                      "                        [spelled.m :as m]))"
+                      "(defn run [x] (m/calls-lib x))")]
+    (analysed! lib m a b)
+    (testing "an alias named through a macro that left the name nowhere is used"
+      (is (= {} (an/unused-aliases 'spelled.a))))
+    (testing "and a macro's own body naming the namespace in full does not make its
+              caller's alias used - the caller never wrote it"
+      (is (= {'lib 'spelled.lib} (an/unused-aliases 'spelled.b))))
+    (testing "what is nowhere is nowhere, and find-usages answers only the places"
+      (is (= #{[m 2 27]}
+             (set (map (juxt :source :line :column) (an/find-usages 'spelled.lib/f))))
+          "the macro's own body, which is a syntax-quoted reference the reader caught"))))
+
+(deftest a-namespaced-map-or-a-tag-does-not-move-the-form-it-is-in
+  ;; Both are read by a reader macro that reads a part of its own form - the
+  ;; namespace after #:, the tag after # - and a nested read that called itself
+  ;; top-level would report that part as the start of the whole form.
+  (let [a (written! "starts/a.clj"
+                    "(ns starts.a (:require [starts.a :as self]))"
+                    "(def plain 1)"
+                    "(def a-nsmap #::self{:k 1})"
+                    "(def an-auto-nsmap #::{:k 1})"
+                    "(def a-tag #inst \"2020-01-01\")"
+                    "(def after 2)")]
+    (analysed! a)
+    (is (= [[1 1] [2 1] [3 1] [4 1] [5 1] [6 1]]
+           (sort (map (juxt :line :column) (:forms (an/file-facts a)))))
+        "every form starts where it starts, and none of them in the middle of itself")))
 
 (deftest a-second-analysis-of-a-file-replaces-the-first
   (let [source (written! "again/a.clj"

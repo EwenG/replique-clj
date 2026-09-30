@@ -496,13 +496,21 @@
 (def ^:private ^:const CAT-NSSPECS  9)
 (def ^:private ^:const CAT-REQCALLS 10)
 (def ^:private ^:const CAT-MEMBERS  11)
-(def ^:private ^:const N-CATS       12)
+;; A REFERENCE THAT IS NOWHERE - see the sink's varUsage/localUsage. The two
+;; categories of their own, rather than the position sentinel loose in :usages and
+;; :local-uses, so that everything answering WHERE keeps reading exactly what it
+;; read before and cannot be given a place that is not one. Only the unused-*
+;; questions look here, and they ask whether a thing is referenced at all.
+(def ^:private ^:const CAT-REFS     12)
+(def ^:private ^:const CAT-LOCALREFS 13)
+(def ^:private ^:const N-CATS       14)
 
 ;; The model key each category is stored under on a committed form entry, indexed by
 ;; the constants above.
 (def ^:private cat-keys
   [:usages :defs :keyword-usages :class-usages :locals :local-uses :macro-deps
-   :invokes :warnings :ns-specs :require-calls :member-usages])
+   :invokes :warnings :ns-specs :require-calls :member-usages
+   :ref-usages :local-refs])
 
 ;; An open form is buffered in a thread-local mutable holder, NOT written to the shared
 ;; model fact-by-fact. Facts accumulate in per-category ArrayLists (`cats`, allocated
@@ -1212,12 +1220,26 @@
     ;; rather than write a nil key that would later NPE (namespace nil) in queries.
     (when-let [of (current-form)]
       (when-let [k (var-key target)]
-        (add-fact! of CAT-USAGES (span k source line column el ec from-ns nil nil nil
-                                       (written-as k written) var-form
-                                       ;; clojure.core/defmethod marks the name it
-                                       ;; adds a method to - see its expansion
-                                       (when (:clojure.analysis/defmethod (meta written))
-                                         :defmethod)))))
+        (let [w (written-as k written)]
+          (if (neg? line)
+            ;; NOWHERE, and kept only for what its SPELLING says. A reference this
+            ;; namespace could not have made without its own `ns' form - a bare name
+            ;; that a :refer supplies, a name through an alias - is what the unused-*
+            ;; questions are about, and it is load-bearing however it got here: if the
+            ;; refer or the alias went, this would not compile. One spelled in full is
+            ;; not: it needs nothing of the ns form, and it is also exactly what
+            ;; macroexpansion leaves behind, since syntax-quote qualifies everything
+            ;; it names. So the fully-spelled ones are dropped, and a macro's own body
+            ;; does not silently make its caller's requires look used.
+            (when (or (nil? w) (not= (namespace w) (namespace k)))
+              (add-fact! of CAT-REFS (span k source -1 -1 -1 -1 from-ns nil nil nil
+                                           w var-form)))
+            (add-fact! of CAT-USAGES (span k source line column el ec from-ns nil nil nil
+                                           w var-form
+                                           ;; clojure.core/defmethod marks the name it
+                                           ;; adds a method to - see its expansion
+                                           (when (:clojure.analysis/defmethod (meta written))
+                                             :defmethod)))))))
     nil)
   (varDef [_ v declared source line column el ec]
     ;; OUTSIDE THE FORM WINDOW, and the only thing here that is: a def typed at a
@@ -1238,7 +1260,11 @@
     nil)
   (localUsage [_ binding ns source line column el ec]
     (when-let [of (current-form)]
-      (add-fact! of CAT-LOCALUSE (local-span binding source line column el ec ns)))
+      (if (neg? line)
+        ;; NOWHERE: the binding is read and the read is no place. Only the token,
+        ;; because only the token is asked for - whether anything read this binding.
+        (add-fact! of CAT-LOCALREFS binding)
+        (add-fact! of CAT-LOCALUSE (local-span binding source line column el ec ns))))
     nil)
   (keywordUsage [_ kw from-ns source line column el ec]
     ;; The branch of a reader conditional this platform does not take is read with
@@ -1670,7 +1696,7 @@
 ;; the small one it uses and the rest are built again when somebody asks.
 (defonce ^:private index-caches
   (into {} (for [k [:usages :defs :keyword-usages :class-usages :locals :macro-deps
-                    :ns-usages :member-usages]]
+                    :ns-usages :member-usages :ref-usages]]
              [k (atom {:forms nil :value nil})])))
 
 (defn- sorted-fids
@@ -1722,11 +1748,17 @@
         (persistent! idx)))))
 
 (defn- build-locals
-  "{binding {:ns :name ...span :uses #{use}}} - two fact categories in one index,
-  since a local's uses belong to its entry. A form's bindings are folded before its
-  uses, so every binding is registered before a use can attach to it; a local is
-  lexically scoped to its own form, so that is exactly the right scope and the order
-  between forms does not come into it."
+  "{binding {:ns :name ...span :uses #{use} [:referenced true]}} - three fact
+  categories in one index, since a local's uses belong to its entry. A form's
+  bindings are folded before its uses, so every binding is registered before a use
+  can attach to it; a local is lexically scoped to its own form, so that is exactly
+  the right scope and the order between forms does not come into it.
+
+  `:uses` is the PLACES the binding is read, which is what a rename rewrites and
+  what find-local-usages answers. `:referenced` is the other fact: that something
+  read it from nowhere - a macro handed the symbol on with its position destroyed,
+  so there is a read and no place. A binding may have one, the other or both, and
+  unused-binding is about the two together; see the sink's localUsage."
   [forms]
   (persistent!
    (reduce-kv
@@ -1736,8 +1768,9 @@
         ;; map index entry, keeping any :uses already gathered.
         (reduce (fn [idx ^LocalSpan l]
                   (let [b (.binding l)]
-                    (assoc! idx b (assoc (local->map l)
-                                         :uses (get (get idx b) :uses #{})))))
+                    (assoc! idx b (cond-> (assoc (local->map l)
+                                                 :uses (get (get idx b) :uses #{}))
+                                    (:referenced (get idx b)) (assoc :referenced true)))))
                 idx (:locals fe))
         (reduce (fn [idx ^LocalSpan l]
                   (let [b   (.binding l)
@@ -1745,7 +1778,13 @@
                     (if cur
                       (assoc! idx b (update cur :uses (fnil conj #{}) (local->map l)))
                       idx)))
-                idx (:local-uses fe))))
+                idx (:local-uses fe))
+        ;; the bare token, which is the whole of what an unpositioned read has to say
+        (reduce (fn [idx b]
+                  (if-let [cur (get idx b)]
+                    (assoc! idx b (assoc cur :referenced true))
+                    idx))
+                idx (:local-refs fe))))
     (transient {}) forms)))
 
 (defn- build-macro-deps
@@ -1798,8 +1837,12 @@
 
 (defn- index
   "One derived index of model value `m`, built from its form log and cached until
-  that log changes (`cached-by-forms`). `k` is one of :usages, :defs,
+  that log changes (`cached-by-forms`). `k` is one of :usages, :ref-usages, :defs,
   :keyword-usages, :class-usages, :member-usages, :locals, :macro-deps, :ns-usages.
+
+  `:ref-usages` is the references that are NOWHERE - shaped like `:usages' and never
+  to be mistaken for it, since every span in it is at line -1. Only the unused-*
+  questions read it; see the sink's varUsage.
 
   Ask for the one that answers the question at hand: nothing here forces any of the
   others, which is the whole of why there is a cache each."
@@ -1810,6 +1853,7 @@
      (fn []
        (case k
          :usages         (build-spans forms :usages)
+         :ref-usages     (build-spans forms :ref-usages)
          :keyword-usages (build-spans forms :keyword-usages)
          :class-usages   (build-spans forms :class-usages)
          :member-usages  (build-spans forms :member-usages)
@@ -2066,15 +2110,22 @@
   in a `let` outside the loop and again inside it, and only the inner one is read
   - and a binding the macro never reads is not the programmer's to remove while
   another one at the same place is read. So a site is unused only when every
-  binding written there is."
+  binding written there is.
+
+  AND READ IS READ, whether or not the reading has a place. A macro that hands a
+  binding's symbol on with its metadata replaced - `clojure.core/vswap' does it to
+  the volatile, io.pedestal.log/error to its :exception - leaves a read that is
+  nowhere, and a binding read from nowhere is still not one to delete. So `:uses'
+  (the places) and `:referenced' (that something read it) are asked together; see
+  build-locals."
   ([] (unused-locals nil))
   ([ns-sym]
    (for [[_ infos] (group-by (juxt :source :line :column)
                              (vals (index @model :locals)))
          :let  [info (first infos)]
-         :when (every? (comp empty? :uses) infos)
+         :when (every? #(and (empty? (:uses %)) (not (:referenced %))) infos)
          :when (or (nil? ns-sym) (= ns-sym (ns-name (:ns info))))]
-     (dissoc info :uses))))
+     (dissoc info :uses :referenced))))
 
 (defn find-local-usages
   "Where the local written at `line`:`column` of file `source` is - its binding and
@@ -2171,7 +2222,13 @@
 (defn ns-referenced-namespaces
   "Namespace-name symbols whose vars or namespaced keywords are referenced from
   ns-sym, per the model. A var used only in a #_ does not count; one used in a
-  (comment ...) does - see counts-as-use?."
+  (comment ...) does - see counts-as-use?.
+
+  A reference that is NOWHERE counts, which is the whole reason `:ref-usages' is
+  kept: a use inside a macro that rebuilt the body it was given - a core.async `go'
+  block is the common one - has no place in the file, and the require it needs is
+  needed all the same. Only the ones spelled short enough to need this namespace's
+  ns form are there at all; see the sink's varUsage."
   [ns-sym]
   (let [m @model
         from? (fn [uses] (some #(and (counts-as-use? %)
@@ -2179,7 +2236,8 @@
                                uses))]
     (into #{}
           (concat
-           (for [[qsym uses] (index m :usages)
+           (for [idx   [(index m :usages) (index m :ref-usages)]
+                 [qsym uses] idx
                  :when (and (namespace qsym) (from? uses))]
              (symbol (namespace qsym)))
            (for [[kw uses] (index m :keyword-usages)
@@ -2205,20 +2263,40 @@
 (defn unused-refers
   "Non-core vars referred into ns-sym that are never used from it.
   Returns {referred-sym var}. clojure.core auto-refers are excluded. A use in a
-  (comment ...) counts, one in a #_ does not (counts-as-use?)."
+  (comment ...) counts, one in a #_ does not (counts-as-use?).
+
+  BY HOW THE NAME IS SPELLED, and not by whether the var is used at all, because
+  that is what a refer is: `(:require [a.b :as x :refer [f]])' and then only ever
+  `x/f' is a refer nothing needs, and taking it out changes nothing. So a use
+  counts for the refer only where the source wrote the short name - `:written' nil,
+  which is the span's way of saying the var's own name unqualified, or the local
+  name where a `:rename' gave it another one.
+
+  A reference that is nowhere counts too, spelling and all (`:ref-usages'): a bare
+  name that survived a macro's rebuilding still resolves through this refer, and
+  would stop compiling without it.
+
+  The protocol path is the exception and cannot be spelled at all: a protocol
+  implemented in a `deftype' reaches the model as its interface, a class usage with
+  no symbol on it, so implementing one counts however it was named."
   [ns-sym]
-  (let [m @model
-        uses (index m :usages)
+  (let [m          @model
+        uses       (index m :usages)
+        refs       (index m :ref-usages)
         class-uses (index m :class-usages)
-        core (the-ns 'clojure.core)
-        ;; a protocol is used where it is implemented too - see interface-protocol
-        used? (fn [^Var v] (some #(and (counts-as-use? %)
-                                       (= ns-sym (some-> (:from-ns %) ns-name)))
-                                 (concat (get uses (var-key v))
-                                         (some->> (protocol-interface (var-key v))
-                                                  (get class-uses)))))]
+        core       (the-ns 'clojure.core)
+        here?      (fn [s] (and (counts-as-use? s)
+                                (= ns-sym (some-> (:from-ns s) ns-name))))
+        short?     (fn [local s] (let [w (:written s)]
+                                   (or (nil? w) (= w local))))
+        used? (fn [local ^Var v]
+                (let [k (var-key v)]
+                  (or (some #(and (here? %) (short? local %))
+                            (concat (get uses k) (get refs k)))
+                      ;; a protocol is used where it is implemented too
+                      (some here? (some->> (protocol-interface k) (get class-uses))))))]
     (into {} (for [[sym ^Var v] (ns-refers ns-sym)
-                   :when (and (not (identical? core (.ns v))) (not (used? v)))]
+                   :when (and (not (identical? core (.ns v))) (not (used? sym v)))]
                [sym v]))))
 
 (defn unused-imports

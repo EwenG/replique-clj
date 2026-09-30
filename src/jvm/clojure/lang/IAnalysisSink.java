@@ -70,6 +70,18 @@ void endForm();
  * {@code endColumn} just past it. When it does not, positions fall back to the
  * enclosing form's line/column and {@code endLine}/{@code endColumn} are -1.
  *
+ * {@code line} -1 says something else again: that the reference is real and is
+ * NOWHERE. Being referenced and being written somewhere are two different facts,
+ * and a macro destroys the second without touching the first - by rebuilding the
+ * body it was given (a {@code go} block) or by replacing a form's metadata
+ * ({@code with-meta}, as {@code vswap!} and {@code io.pedestal.log/error} do).
+ * The unused-* questions want the first, so it is reported. A sink must keep
+ * these out of everything that answers WHERE - find-usages, a rename, a lint's
+ * span - and can read {@code written} to tell a spelling this namespace's own
+ * {@code ns} form is holding up ({@code str/join}, a bare {@code join}) from one
+ * that needs nothing of it ({@code clojure.string/join}, which is what
+ * macroexpansion produces).
+ *
  * {@code written} is the symbol the source wrote - {@code str/join}, a referred
  * {@code join}, a renamed one - with its reader metadata. It is the one thing
  * about the reference the resolved var no longer says: the alias it went
@@ -108,6 +120,11 @@ void localDef(Object binding, String name, Namespace ns, String source,
 /**
  * A reference to a local binding, keyed by the same {@code binding} identity
  * token as its {@link #localDef}.
+ *
+ * {@code line} -1 for a reference that is nowhere, {@link #varUsage}'s meaning
+ * and for its reason: the binding is read, and the symbol that reads it carries
+ * no position, so no place in the file is its. Whether a binding is read is what
+ * unused-binding asks, and it is answerable without a place.
  */
 void localUsage(Object binding, Namespace ns, String source,
                 int line, int column, int endLine, int endColumn);

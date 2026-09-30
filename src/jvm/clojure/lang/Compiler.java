@@ -8380,12 +8380,27 @@ private static Expr analyzeSymbol(Symbol sym) {
 		LocalBinding b = referenceLocal(sym);
 		if(b != null)
             {
+            // Reported whether or not the symbol says where it was written, and the
+            // two are different facts. A positioned one is a PLACE - somewhere a
+            // rename rewrites, somewhere find-local-usages takes you. An unpositioned
+            // one is only that the binding IS READ, which is what unused-binding
+            // asks and which no place has to exist for: a macro that hands a symbol
+            // on through with-meta - io.pedestal.log/error does it to its :exception,
+            // clojure.core/vswap! to its volatile - leaves the read with nowhere to
+            // point at, and it is still a read. Line -1 says so; see
+            // IAnalysisSink.localUsage.
             IAnalysisSink sink = analysisSink();
-            if(sink != null && isSourceSymbol(sym))
+            if(sink != null)
                 {
-                int[] pos = symbolPosition(sym);
-                sink.localUsage(b, currentNS(), (String) SOURCE_PATH.deref(),
-                                pos[0], pos[1], pos[2], pos[3]);
+                if(isSourceSymbol(sym))
+                    {
+                    int[] pos = symbolPosition(sym);
+                    sink.localUsage(b, currentNS(), (String) SOURCE_PATH.deref(),
+                                    pos[0], pos[1], pos[2], pos[3]);
+                    }
+                else
+                    sink.localUsage(b, currentNS(), (String) SOURCE_PATH.deref(),
+                                    -1, -1, -1, -1);
                 }
             return new LocalBindingExpr(b, tag);
             }
@@ -8424,19 +8439,37 @@ private static Expr analyzeSymbol(Symbol sym) {
 		Var v = (Var) o;
 		if(isMacro(v) != null)
 			throw Util.runtimeException("Can't take value of a macro: " + v);
-		// Only record references textually present in source (carrying a reader
-		// position). Symbols conjured by macroexpansion have no position; a
-		// syntax-quoted reference in a macro's *body* is captured at read time
-		// (sinkSyntaxQuoteRef) instead, so it isn't double-counted here.
+		// A reference textually present in source (carrying a reader position) is a
+		// PLACE, and is reported as one. A symbol conjured by macroexpansion has no
+		// position and is no place - but it is still a reference, and how it is
+		// SPELLED is a fact about the namespace being compiled: a symbol reaching
+		// here as str/join resolves only because this namespace has that alias, and
+		// one reaching here as clojure.string/join needs nothing of it. So the
+		// unpositioned reference is reported too, with line -1 to say it is nowhere
+		// (IAnalysisSink.varUsage), and the sink keeps the ones whose spelling the
+		// ns form is holding up. That is what lets a use inside a macro that rebuilt
+		// its body - a core.async go block, a with-meta'd form - still answer "is
+		// this require used".
+		//
+		// A syntax-quoted reference in a macro's *body* is captured at read time
+		// (sinkSyntaxQuoteRef) instead, so it isn't double-counted here; what the
+		// expansion carries back to the call site is fully qualified, which is
+		// exactly the spelling the sink drops.
 		//
 		// Before the ^:const branch: a const is compiled as its value, and the
 		// source that names it still names it.
 		IAnalysisSink sink = analysisSink();
-		if(sink != null && isSourceSymbol(sym))
+		if(sink != null)
 			{
-			int[] pos = symbolPosition(sym);
-			sink.varUsage(v, sym, false, currentNS(), (String) SOURCE_PATH.deref(),
-			              pos[0], pos[1], pos[2], pos[3]);
+			if(isSourceSymbol(sym))
+				{
+				int[] pos = symbolPosition(sym);
+				sink.varUsage(v, sym, false, currentNS(), (String) SOURCE_PATH.deref(),
+				              pos[0], pos[1], pos[2], pos[3]);
+				}
+			else
+				sink.varUsage(v, sym, false, currentNS(), (String) SOURCE_PATH.deref(),
+				              -1, -1, -1, -1);
 			}
 		if(RT.booleanCast(RT.get(v.meta(),RT.CONST_KEY)))
 			return analyze(C.EXPRESSION, RT.list(QUOTE, v.get()));

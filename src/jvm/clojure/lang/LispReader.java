@@ -351,6 +351,11 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 			// Compiler.readingTopLevelForm() gate confines this to that read: without
 			// it, any nested read from a LineNumbering reader during eval would fire
 			// here and clobber the open form's position.
+			// Which makes isRecursive load-bearing here, and not only a choice about
+			// how a reader error is wrapped: a reader macro that reads a part of its
+			// own form - the namespace of #:foo{...}, the tag of #inst "..." - must
+			// pass true, or that part reports here as if it were the top-level datum
+			// and moves the open form's start to the middle of itself.
 			// Known corner (accepted): a #=(...) read-eval whose evaluation itself
 			// reads from a LineNumberingPushbackReader runs while this flag is still
 			// true, so it too reports here and can shift the enclosing form's start.
@@ -814,7 +819,9 @@ public static class NamespaceMapReader extends AFn{
 			}
 		} else if(nextChar != '{') {  // #:foo { } or #::foo { }
 			unread(r, nextChar);
-			sym = read(r, true, null, false, opts, pendingForms);
+			// recursive: this symbol is a part of the map being read, not a datum of
+			// its own - see the formStart correction in read()
+			sym = read(r, true, null, true, opts, pendingForms);
 			nextChar = read1(r);
 			while(isWhitespace(nextChar))
 				nextChar = read1(r);
@@ -1612,7 +1619,9 @@ public static class CtorReader extends AFn{
 	public Object invoke(Object reader, Object firstChar, Object opts, Object pendingForms){
 		PushbackReader r = (PushbackReader) reader;
 		pendingForms = ensurePending(pendingForms);
-		Object name = read(r, true, null, false, opts, pendingForms);
+		// recursive: the tag is a part of the tagged literal, not a datum of its own
+		// - see the formStart correction in read()
+		Object name = read(r, true, null, true, opts, pendingForms);
 		if (!(name instanceof Symbol))
 			throw new RuntimeException("Reader tag must be a symbol");
 		Symbol sym = (Symbol)name;
