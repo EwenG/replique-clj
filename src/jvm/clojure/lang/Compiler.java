@@ -399,6 +399,21 @@ static void sinkInvoke(Var v, ISeq form){
 		}
 	sink.invokeUsage(v, RT.count(form.next()), currentNS(), (String) SOURCE_PATH.deref(),
 	                 pos[0], pos[1], pos[2], pos[3]);
+	if(isLoadingCall(v))
+		sink.requireCall(form, v.sym, currentNS(), (String) SOURCE_PATH.deref());
+}
+
+// Whether V is clojure.core's require or use: a call of either written in the
+// source is handed to the sink whole (IAnalysisSink.requireCall), because what it
+// is called with is quoted, and a quoted name keeps the reader's position only
+// until the form is compiled - this is the one point every call passes through
+// with it still there. By name rather than by Var, so that it is asked without
+// clojure.core having to be loaded yet.
+static boolean isLoadingCall(Var v){
+	if(v.ns == null || !"clojure.core".equals(v.ns.name.getName()))
+		return false;
+	String n = v.sym.getName();
+	return n.equals("require") || n.equals("use");
 }
 
 // True when positions should be recorded: either explicitly requested, or implied

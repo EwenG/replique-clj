@@ -2098,6 +2098,64 @@
                         :at {:line 4 :column 21 :end-line 4 :end-column 25}}]}]
            (:ns-specs (an/file-facts source))))))
 
+(deftest a-namespace-is-used-where-an-ns-form-requires-it
+  (let [_ (written! "nsused/lib.clj"
+                    "(ns nsused.lib)"
+                    "(defn f [] 1)")
+        a (written! "nsused/a.clj"
+                    "(ns nsused.a (:require [nsused.lib :as l]))"
+                    "(defn g [] (l/f) (nsused.lib/f))")
+        b (written! "nsused/b.clj"
+                    "(ns nsused.b"
+                    "  (:require (nsused [lib]))"
+                    "  (:use nsused.lib))")]
+    (analysed! a b)
+    (testing "each library an ns form writes, where it writes it, and nothing
+    else: nsused.lib/f is a use of f"
+      (is (= #{{:source a :line 1 :column 25 :end-line 1 :end-column 35
+                :from-ns 'nsused.a :declaration :require}
+               {:source b :line 2 :column 22 :end-line 2 :end-column 25
+                :from-ns 'nsused.b :declaration :require}
+               {:source b :line 3 :column 9 :end-line 3 :end-column 19
+                :from-ns 'nsused.b :declaration :use}}
+             (an/find-namespace-usages 'nsused.lib))))
+    (testing "asked with the namespace itself too"
+      (is (= (an/find-namespace-usages 'nsused.lib)
+             (an/find-namespace-usages (the-ns 'nsused.lib)))))))
+
+(deftest a-call-of-require-is-a-use-of-the-namespace-it-loads
+  (let [_ (written! "reqcall/lib.clj"
+                    "(ns reqcall.lib)"
+                    "(defn f [] 1)")
+        source (written! "reqcall/a.clj"
+                         "(ns reqcall.a (:require [clojure.string]))"
+                         "(require '[reqcall.lib :as l])"
+                         "(defn lazy [] (require 'reqcall.lib) (use '(reqcall [lib])))"
+                         "(defn computed [s] (require (symbol s)) (requiring-resolve 'reqcall.lib/f))"
+                         "(comment (require '[reqcall.lib :as l2]) (l/f))"
+                         "#_(use 'reqcall.lib)")]
+    (analysed! source)
+    (testing "at the top level and in a function body, each marked as a call and
+    by the function called; the computed one names nothing, and
+    requiring-resolve names a var"
+      (is (= [[2 12 23 :require nil] [3 25 36 :require nil] [3 54 57 :use nil]
+              [5 21 32 :require :comment] [6 9 20 :use :discard]]
+             (sort (map (juxt :line :column :end-column :declaration :dead)
+                        (an/find-namespace-usages 'reqcall.lib)))))
+      (is (every? :call (an/find-namespace-usages 'reqcall.lib))))
+    (testing "the ns form's own requires are reported once, as the ns form's:
+    what it expands into is not the source calling require"
+      (is (= [[1 26 nil]]
+             (->> (an/find-namespace-usages 'clojure.string)
+                  (filter #(= source (:source %)))
+                  (map (juxt :line :column :call))))))
+    (testing "and kept apart from the ns form's clauses"
+      (is (= ['clojure.string] (map :lib (mapcat :requires (:ns-specs (an/file-facts source))))))
+      (is (= [['reqcall.lib :require] ['reqcall.lib :require] ['reqcall.lib :use]
+              ['reqcall.lib :require] ['reqcall.lib :use]]
+             (map (juxt :lib :clause)
+                  (mapcat :requires (:require-calls (an/file-facts source)))))))))
+
 (deftest what-the-compiler-warned-about-is-a-fact-of-the-form
   (let [source (written! "warned/a.clj"
                          "(ns warned.a)"

@@ -72,7 +72,7 @@
 ;;   :forms           {fid {:ns :source :line :column + one key per non-empty fact
 ;;                          category: :usages :defs :keyword-usages :class-usages
 ;;                          :locals :local-uses :macro-deps :invokes :warnings
-;;                          :ns-specs, each a vector of facts}}
+;;                          :ns-specs :require-calls, each a vector of facts}}
 ;;                                          Facts are stored BY CATEGORY rather than as
 ;;                                          tagged [op a b] tuples, so each fact is a
 ;;                                          single self-describing object (a Span /
@@ -99,6 +99,9 @@
 ;;   :class-usages    {class-name-string #{span}}  (keyed by name, not Class - see class-key)
 ;;   :macro-deps      {ns-sym {macro-qsym #{fid}}}   compile-time edges (§9); each fid
 ;;                                          carries the expanding form's file (:source)
+;;   :ns-usages       {lib   #{span-map}}   where each ns form or require call loads
+;;                                          lib, read out of the :ns-specs and
+;;                                          :require-calls facts (see find-namespace-usages)
 (def ^:private empty-model
   {:forms {} :source->forms {} :next-fid 0 :file-mtime {} :non-files #{}})
 
@@ -290,6 +293,22 @@
                                  :else nil)]
                      entry))}))
 
+(defn require-call-specs
+  "What a call of `require` or `use` the source wrote says it loads, positioned -
+  `ns-specs`' :requires, read off the call's quoted arguments as the ns form's
+  clause would read them. `f` is which of the two was called, and is the :clause.
+
+  Only what is written as a literal: (require 'my.lib) and (require '[my.lib :as l])
+  name a library, and (require (symbol s)) names none the source can point at, so
+  it is skipped - as are the flags, :reload and :verbose, which name nothing."
+  [form f]
+  (let [libs (keep (fn [arg]
+                     (when (and (seq? arg) (= 'quote (first arg)) (next arg))
+                       (second arg)))
+                   (rest form))]
+    (when (seq libs)
+      (:requires (ns-specs (list 'ns 'call (cons (keyword (name f)) libs)))))))
+
 ;; A record with primitive int coordinates costs ~1/7th the bytes of the equivalent
 ;; array-map (measured), chiefly by not boxing the four coordinates into Integers.
 ;; The four coordinates are always ints at the sink boundary (IAnalysisSink passes
@@ -443,13 +462,14 @@
 (def ^:private ^:const CAT-INVOKES  7)
 (def ^:private ^:const CAT-WARNINGS 8)
 (def ^:private ^:const CAT-NSSPECS  9)
-(def ^:private ^:const N-CATS       10)
+(def ^:private ^:const CAT-REQCALLS 10)
+(def ^:private ^:const N-CATS       11)
 
 ;; The model key each category is stored under on a committed form entry, indexed by
 ;; the constants above.
 (def ^:private cat-keys
   [:usages :defs :keyword-usages :class-usages :locals :local-uses :macro-deps
-   :invokes :warnings :ns-specs])
+   :invokes :warnings :ns-specs :require-calls])
 
 ;; An open form is buffered in a thread-local mutable holder, NOT written to the shared
 ;; model fact-by-fact. Facts accumulate in per-category ArrayLists (`cats`, allocated
@@ -521,7 +541,9 @@
 ;; form bound before the dead symbol is taken to be that local.
 ;;
 ;; What comes out is var and class usages, marked :dead :discard or :dead :comment,
-;; filed on one extra form per file. Nothing else: no defs (a def in a comment defines
+;; filed on one extra form per file - and the libraries a call of require or use in
+;; it loads (:require-calls), marked the same way, since a comment block that
+;; requires what it plays with is the commonest dead code there is. Nothing else: no defs (a def in a comment defines
 ;; nothing, and must not keep a deleted var from being pruned), no locals, no macro
 ;; edges, no part in the compile graphs or the reload order. Whether a query counts
 ;; them is up to it - see counts-as-use?.
@@ -681,6 +703,8 @@
              (if (special-symbol? head)
                head
                ((:op env) head)))]
+    (when-let [on-call (when op (:on-call env))]
+      (on-call op form))
     (if (symbol? head)
       (when-not (special-symbol? head) (dead-symbol! head env true))
       (walk-dead head env))
@@ -756,10 +780,14 @@
              nil
     :outer   {name [line column]}, the locals the live code around `form` binds,
              each where it is first bound (locals-at), or nil
+    :on-call (fn [op form] ...) called with each call in it whose head names
+             something, `op` what :op named - for what a call says as a whole
+             rather than symbol by symbol, a (require 'my.lib) - or nil
 
   A form that cannot be walked throws; the caller skips it."
-  [form {:keys [target op emit outer]}]
-  (walk-dead form {:locals #{} :outer outer :target target :op op :emit emit}))
+  [form {:keys [target op emit outer on-call]}]
+  (walk-dead form {:locals #{} :outer outer :target target :op op :emit emit
+                   :on-call on-call}))
 
 (defn dead-body
   "What of dead `form` of `kind` is dead: all of a #_, and the arguments of a
@@ -842,7 +870,8 @@
     (when-not (.isEmpty dead)
       (let [source  (.source fr)
             uses    (java.util.ArrayList.)
-            classes (java.util.ArrayList.)]
+            classes (java.util.ArrayList.)
+            reqs    (java.util.ArrayList.)]
         (doseq [{:keys [form kind ns outer]} dead]
           (let [emit (fn [t sym]
                        (let [m  (meta sym) line (:line m) col (:column m)
@@ -865,18 +894,31 @@
               ;; a comment's body: the comment call itself is live, and recorded
               (walk-dead-code (dead-body form kind)
                               {:target (jvm-target ns) :op (jvm-op ns)
-                               :outer outer :emit emit})
+                               :outer outer :emit emit
+                               ;; requireCall's facts, which the compiler reports
+                               ;; of live code only
+                               :on-call
+                               (fn [op form]
+                                 (when (#{'clojure.core/require 'clojure.core/use} op)
+                                   (when-let [rs (seq (require-call-specs
+                                                       form (symbol (name op))))]
+                                     (.add reqs {:ns (ns-name ns)
+                                                 :requires (mapv #(assoc % :dead kind) rs)}))))})
               (catch Exception _ nil))))
-        (when-not (and (.isEmpty uses) (.isEmpty classes))
+        (when-not (and (.isEmpty uses) (.isEmpty classes) (.isEmpty reqs))
           (let [^longs c (.counter fr)
                 seq      (aget c 0)
-                ^Span s1 (first (concat uses classes))]
+                ;; the call's head is a use of require, so a require call is never
+                ;; alone - but a form needs a position whatever it holds
+                s1       (or (first (concat uses classes))
+                             (:at (first (:requires (first reqs)))))]
             (aset c 0 (inc seq))
             (.add ^java.util.ArrayList (.buffer fr)
-                  (cond-> {:seq seq :source source :line (.line s1) :column (.column s1)
+                  (cond-> {:seq seq :source source :line (:line s1) :column (:column s1)
                            :ns nil}
                     (not (.isEmpty uses))    (assoc :usages (vec uses))
-                    (not (.isEmpty classes)) (assoc :class-usages (vec classes))))))))
+                    (not (.isEmpty classes)) (assoc :class-usages (vec classes))
+                    (not (.isEmpty reqs))    (assoc :require-calls (vec reqs))))))))
     nil))
 
 ;; --- model mutators (called by the sink and by drivers) --------------------
@@ -1171,6 +1213,15 @@
                      (span qsym source (:line m) (:column m) (:end-line m) (:end-column m)
                            from-ns nil nil :refer)))
         (add-fact! of CAT-NSSPECS (assoc (ns-specs form) :ns nsym))))
+    nil)
+  (requireCall [_ form f from-ns source]
+    ;; nsForm's clauses, for a call: where the source says a library is loaded,
+    ;; top-level or in a function body alike. Kept apart from :ns-specs, which is
+    ;; what the ns form is - a call is not the ns form, and a lint reading the
+    ;; ns form's clauses must not be handed it as one.
+    (when-let [of (current-form)]
+      (when-let [requires (seq (require-call-specs form f))]
+        (add-fact! of CAT-REQCALLS {:ns (ns-name from-ns) :requires (vec requires)})))
     nil)
   (invokeUsage [_ target argc from-ns source line column el ec]
     (when-let [of (current-form)]
@@ -1528,7 +1579,8 @@
 ;; part of the reload reads. Each index cached on its own, the reload touches only
 ;; the small one it uses and the rest are built again when somebody asks.
 (defonce ^:private index-caches
-  (into {} (for [k [:usages :defs :keyword-usages :class-usages :locals :macro-deps]]
+  (into {} (for [k [:usages :defs :keyword-usages :class-usages :locals :macro-deps
+                    :ns-usages]]
              [k (atom {:forms nil :value nil})])))
 
 (defn- sorted-fids
@@ -1620,6 +1672,36 @@
                         idx (:macro-deps fe)))
               (transient {}) forms)))
 
+(defn- build-ns-usages
+  "{lib #{span}} - where each live form writes a library it loads: an ns form in a
+  :require or a :use (its :ns-specs facts), a call of require or use (its
+  :require-calls facts, each place marked :call true). Plain maps rather than
+  Spans: the facts are what `ns-specs` read off the form, and they are few - one
+  per library written - so there is nothing to save by packing them.
+
+  A library written with no position (one the reader gave none) is not a place
+  anybody can be sent to, and is left out."
+  [forms]
+  (let [add (fn [idx fe facts call?]
+              (reduce (fn [idx {:keys [ns requires]}]
+                        (reduce (fn [idx {:keys [lib at clause dead]}]
+                                  (if at
+                                    (assoc! idx lib (conj (get idx lib #{})
+                                                          (cond-> (assoc at :source (:source fe)
+                                                                         :from-ns ns
+                                                                         :declaration clause)
+                                                            call? (assoc :call true)
+                                                            dead (assoc :dead dead))))
+                                    idx))
+                                idx requires))
+                      idx facts))]
+    (persistent!
+     (reduce-kv (fn [idx _ fe]
+                  (-> idx
+                      (add fe (:ns-specs fe) false)
+                      (add fe (:require-calls fe) true)))
+                (transient {}) forms))))
+
 (def ^:private index-keys
   "The indexes `derived` is all of, which is what `snapshot` shows."
   [:usages :defs :keyword-usages :class-usages :locals :macro-deps])
@@ -1627,7 +1709,7 @@
 (defn- index
   "One derived index of model value `m`, built from its form log and cached until
   that log changes (`cached-by-forms`). `k` is one of :usages, :defs,
-  :keyword-usages, :class-usages, :locals, :macro-deps.
+  :keyword-usages, :class-usages, :locals, :macro-deps, :ns-usages.
 
   Ask for the one that answers the question at hand: nothing here forces any of the
   others, which is the whole of why there is a cache each."
@@ -1642,7 +1724,8 @@
          :class-usages   (build-spans forms :class-usages)
          :defs           (build-defs forms)
          :locals         (build-locals forms)
-         :macro-deps     (build-macro-deps forms))))))
+         :macro-deps     (build-macro-deps forms)
+         :ns-usages      (build-ns-usages forms))))))
 
 (defn- derived
   "Every by-entity index for model value `m` as one map, shaped as the one index
@@ -1803,6 +1886,34 @@
   nowhere else is still an unused import."
   [c]
   (spans->maps (get (index @model :class-usages) (if (class? c) (.getName ^Class c) (str c)))))
+
+(defn find-namespace-usages
+  "Where a namespace is required - pass the Namespace or its name symbol. A set of
+  {:from-ns :source :line :column :end-line :end-column :declaration [:call]}: the
+  library as an ns form's :require or :use writes it, :declaration the clause
+  (:require or :use) as find-usages marks a :refer, and :from-ns the requiring
+  namespace's name symbol.
+
+  A CALL of require or use is among them, carrying :call true, wherever it is
+  written - at the top level, or in a function that loads the library lazily - and
+  :declaration the function called. It is where the source says the namespace is
+  loaded, which is the same thing an ns form says, and it is recorded as the call
+  is compiled rather than as it runs: one in a function nobody has called is here
+  too. Only a library written as a literal is: see require-call-specs.
+
+  One in code the program does not run is here as well, as find-usages has it -
+  a (require 'my.lib) in a (comment ...) carries :dead :comment, one in a #_
+  :dead :discard. It is resolved rather than compiled, like the rest of the dead
+  code, so it is here although the compiler never saw the call.
+
+  That is the whole of what a namespace is used as. Its vars and its keywords are
+  things of their own, asked about with find-usages and find-keyword-usages: a
+  `my.lib/f` is a use of f, and answering it here as well would make every use of
+  every var of the namespace a use of the namespace. Nor is a (requiring-resolve
+  'my.lib/f), which names f."
+  [ns-or-sym]
+  (get (index @model :ns-usages)
+       (if (instance? clojure.lang.Namespace ns-or-sym) (ns-name ns-or-sym) ns-or-sym)))
 
 (defn macro-deps
   "Compile-time macro dependency edges. No arg: {ns-sym #{macro-qsym}}. With a
@@ -1969,9 +2080,11 @@
      :invokes  [{:var qsym :argc n ...span}]  every call of a var the file writes,
                                         with its argument count after macroexpansion
      :warnings [{:kind :message ...span}]     what the compiler warned about
-     :forms    [{:line :column :ns}]}  the top-level forms, in order
+     :forms    [{:line :column :ns}]   the top-level forms, in order
      :ns-specs [{:ns sym :requires [...] :imports [...]}]  what each ns form's
                                         clauses write, where - see ns-specs
+     :require-calls [{:ns sym :requires [...]}]  what each call of require or use
+                                        loads, where - see require-call-specs}
 
   Spans are plain maps as find-usages answers them, :from-ns a namespace SYMBOL.
 
@@ -1994,7 +2107,8 @@
                      forms)
      :warnings (into [] (mapcat :warnings) forms)
      :forms    (mapv #(select-keys % [:line :column :ns]) forms)
-     :ns-specs (into [] (mapcat :ns-specs) forms)}))
+     :ns-specs (into [] (mapcat :ns-specs) forms)
+     :require-calls (into [] (mapcat :require-calls) forms)}))
 
 (defn version
   "An opaque token for the model as it is now: `identical?' to one taken earlier

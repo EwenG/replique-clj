@@ -180,6 +180,25 @@ default void nsForm(Object form, Symbol name, String source){
 }
 
 /**
+ * A call of {@code clojure.core/require} or {@code clojure.core/use} the source
+ * wrote, anywhere - at the top level or in the body of a function - handed over
+ * as it was written: {@code fn} is the var's name ({@code require} or {@code
+ * use}), {@code fromNs} the namespace the call is compiled in.
+ *
+ * {@link #nsForm}'s reason, for a function: what the call names is quoted, and a
+ * quoted symbol's position does not survive the form being compiled - by the time
+ * {@code require} runs it is handed a bare symbol. So this fires as the call is
+ * analysed, which is before it is run and whether or not it ever is: it is where
+ * the source says a library is loaded, not a record of its having been. An {@code
+ * ns} form's own expansion into these calls is not reported - the head symbols it
+ * builds carry no reader position; {@link #nsForm} has said it already.
+ *
+ * A default method, for {@link #nsForm}'s reason.
+ */
+default void requireCall(Object form, Symbol fn, Namespace fromNs, String source){
+}
+
+/**
  * A class an {@code ns} form names in an {@code :import} - {@link #referUsage}'s
  * fact about a class, and unreachable for one more reason besides: {@code
  * clojure.core/import} turns each spec into the class's full name as a STRING
