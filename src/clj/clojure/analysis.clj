@@ -1302,7 +1302,16 @@
           (when (seq named)
             (add-fact! of CAT-REQCALLS {:ns (ns-name from-ns) :requires (mapv :lib named)})))
         (when-let [requires (seq (require-call-specs form f))]
-          (add-fact! of CAT-REQCALLS {:ns (ns-name from-ns) :requires (vec requires)}))))
+          ;; a call that is the whole top-level form is one the file makes as it
+          ;; loads - what a lint of the file's requires reads as a clause of its
+          ;; ns form, the way clj-kondo does; one in a function body loads when
+          ;; the function runs, which may be never
+          (let [{:keys [line column]} (written-span form)
+                ^longs pos (.pos ^OpenForm of)]
+            (add-fact! of CAT-REQCALLS
+                       (cond-> {:ns (ns-name from-ns) :requires (vec requires)}
+                         (and line (= (long line) (aget pos 0)) (= (long column) (aget pos 1)))
+                         (assoc :top-level true)))))))
     nil)
   (invokeUsage [_ target argc from-ns source line column el ec]
     (when-let [of (current-form)]
@@ -2246,7 +2255,9 @@
      :ns-specs [{:ns sym :requires [...] :imports [...]}]  what each ns form's
                                         clauses write, where - see ns-specs
      :require-calls [{:ns sym :requires [...]}]  what each call of require or use
-                                        loads, where - see require-call-specs}
+                                        loads, where - see require-call-specs -
+                                        :top-level where the call is the whole
+                                        top-level form}
 
   Spans are plain maps as find-usages answers them, :from-ns a namespace SYMBOL.
 

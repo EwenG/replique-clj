@@ -2165,7 +2165,11 @@
               ['reqcall.lib :requiring-resolve]
               ['reqcall.lib :require] ['reqcall.lib :requiring-resolve] ['reqcall.lib :use]]
              (map (juxt :lib :clause)
-                  (mapcat :requires (:require-calls (an/file-facts source)))))))))
+                  (mapcat :requires (:require-calls (an/file-facts source))))))
+      (testing "the one call that is its whole top-level form says so"
+        (is (= [[2 true]]
+               (for [c (:require-calls (an/file-facts source)) :when (:top-level c)]
+                 [(:line (:at (first (:requires c)))) true])))))))
 
 (deftest a-defmethod-is-a-use-of-its-multimethod
   (let [source (written! "multi/a.clj"
