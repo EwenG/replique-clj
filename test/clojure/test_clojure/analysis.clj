@@ -488,6 +488,32 @@
       (is (empty? (an/find-class-usages 'clojure.lang.IRecord)))
       (is (empty? (an/find-class-usages 'java.util.Map))))))
 
+(deftest a-proxy-names-the-classes-it-proxies
+  ;; `proxy' is the sharpest case of a name a macro eats: it RESOLVES its base
+  ;; classes while it expands and returns a form naming only the class it generated,
+  ;; so no class reference the source wrote is ever analysed. Without the hook in its
+  ;; body an import nothing but a proxy uses reads as unused - and that is the bad
+  ;; direction, since taking the import out stops the file compiling.
+  (let [a (written! "proxied/a.clj"
+                    "(ns proxied.a (:import [java.util.concurrent Callable]"
+                    "                       [java.io File]))"
+                    "(def called (proxy [Callable] [] (call [] 1)))"
+                    ;; a class vector a macro made up: nobody wrote that name here
+                    "(defmacro made []"
+                    "  (list 'proxy [(symbol \"java.lang.Runnable\")] [] '(run [] nil)))"
+                    "(def ran (made))")]
+    (analysed! a)
+    (testing "the class a proxy names is used where the proxy names it"
+      (let [uses (an/find-class-usages java.util.concurrent.Callable)]
+        (is (= #{1 3} (set (map :line uses)))
+            "line 1 being the :import that declares it, line 3 the proxy")
+        (is (= "Callable" (text-at (first (filter #(= 3 (:line %)) uses)))))))
+    (testing "so an import nothing but a proxy uses is not unused, and one nothing
+              uses at all still is"
+      (is (= {'File java.io.File} (an/unused-imports 'proxied.a))))
+    (testing "and the one a macro made up is nobody's: no position points at it"
+      (is (empty? (an/find-class-usages Runnable))))))
+
 (deftest a-read-a-macro-left-nowhere-is-still-a-read
   ;; The capture rule says a usage is recorded WHERE THE NAME IS WRITTEN, and a
   ;; macro can destroy that without touching the reference: `with-meta' on a form it
@@ -554,6 +580,89 @@
       (is (= #{[m 2 27]}
              (set (map (juxt :source :line :column) (an/find-usages 'spelled.lib/f))))
           "the macro's own body, which is a syntax-quoted reference the reader caught"))))
+
+(deftest a-var-of-its-own-namespace-left-nowhere-in-full-is-still-a-reference
+  ;; What a core.async `go' does to the vars of its body: each one comes back as a
+  ;; fresh symbol spelled in full, with no position. Spelled in full, it says
+  ;; nothing of the ns form - but named in its own namespace, it is still the only
+  ;; trace that a private helper is called at all.
+  (let [m (written! "selfref/m.clj"
+                    "(ns selfref.m (:require [clojure.walk]))"
+                    "(defmacro requalified [& body]"
+                    "  (clojure.walk/postwalk"
+                    "   #(if-let [v (and (symbol? %) (resolve %))]"
+                    "      (if (var? v)"
+                    "        (let [mt (meta v)]"
+                    "          (symbol (str (ns-name (:ns mt))) (str (:name mt))))"
+                    "        %)"
+                    "      %)"
+                    "   (cons 'do body)))")
+        lib (written! "selfref/lib.clj"
+                      "(ns selfref.lib)"
+                      "(defn f [x] x)")
+        a (written! "selfref/a.clj"
+                    "(ns selfref.a (:require [selfref.m :as m] [selfref.lib :as lib]))"
+                    "(defn- helper [x] x)"
+                    "(defn run [x] (m/requalified (helper (lib/f x))))")]
+    (analysed! m lib a)
+    (testing "the var of its own namespace is a reference, at the form it is in"
+      (is (= [['selfref.a/helper 3 1]]
+             (mapv (juxt :var :line :column)
+                   (filter #(= 'selfref.a/helper (:var %)) (:refs (an/file-facts a)))))))
+    (testing "and one of another namespace, spelled in full, is still not kept"
+      (is (empty? (filter #(= 'selfref.lib/f (:var %)) (:refs (an/file-facts a))))))
+    (testing "and it is still no place"
+      (is (empty? (an/find-usages 'selfref.a/helper))))))
+
+(deftest an-alias-is-used-where-the-text-spells-it
+  ;; The two the compiler cannot answer for, because what the file wrote never
+  ;; reaches it as what the file wrote: a symbol a macro EATS at expansion time, and
+  ;; one a macro re-emits FULLY QUALIFIED - which is what core.async's `go' does to
+  ;; every name in its body. Both are the alias doing its job all the same: take the
+  ;; :as out and the file stops reading. Only the reader ever saw it; see the sink's
+  ;; qualifierUsage.
+  (let [lib  (written! "spelt/lib.clj"
+                       "(ns spelt.lib)"
+                       "(defn f [x] x)")
+        m    (written! "spelt/m.clj"
+                       "(ns spelt.m (:require [clojure.walk]))"
+                       ;; eats it: what it is given is read and nothing of it emitted
+                       "(defmacro eaten [sym] (name sym))"
+                       ;; re-emits it in full, as a `go' block does
+                       "(defmacro requalified [& body]"
+                       "  (clojure.walk/postwalk"
+                       "   #(if-let [v (and (symbol? %) (namespace %) (resolve %))]"
+                       "      (let [mt (meta v)]"
+                       "        (symbol (str (ns-name (:ns mt))) (str (:name mt))))"
+                       "      %)"
+                       "   (cons 'do body)))")
+        eats (written! "spelt/a.clj"
+                       "(ns spelt.a (:require [spelt.lib :as lib] [spelt.m :as m]))"
+                       "(def what (m/eaten lib/f))")
+        reqs (written! "spelt/b.clj"
+                       "(ns spelt.b (:require [spelt.lib :as lib] [spelt.m :as m]))"
+                       "(defn run [x] (m/requalified (lib/f x)))")
+        full (written! "spelt/c.clj"
+                       "(ns spelt.c (:require [spelt.lib :as lib] [spelt.m :as m]))"
+                       "(def what (m/eaten spelt.lib/f))")
+        gone (written! "spelt/d.clj"
+                       "(ns spelt.d (:require [spelt.lib :as lib]))"
+                       "(defn run [x] #_(lib/f x) x)")
+        rich (written! "spelt/e.clj"
+                       "(ns spelt.e (:require [spelt.lib :as lib]))"
+                       "(comment (lib/f 1))")]
+    (analysed! lib m eats reqs full gone rich)
+    (testing "a symbol a macro ate is written where it is written"
+      (is (= {} (an/unused-aliases 'spelt.a))))
+    (testing "and so is one a macro handed back in full"
+      (is (= {} (an/unused-aliases 'spelt.b))))
+    (testing "but writing the namespace is not writing the alias"
+      (is (= {'lib 'spelt.lib} (an/unused-aliases 'spelt.c))
+          "the require is needed and the :as is not - two questions, two answers"))
+    (testing "a spelling in a #_ is a spelling of code that is gone"
+      (is (= {'lib 'spelt.lib} (an/unused-aliases 'spelt.d))))
+    (testing "one in a (comment ...) is not: the block is meant to be run"
+      (is (= {} (an/unused-aliases 'spelt.e))))))
 
 (deftest a-namespaced-map-or-a-tag-does-not-move-the-form-it-is-in
   ;; Both are read by a reader macro that reads a part of its own form - the

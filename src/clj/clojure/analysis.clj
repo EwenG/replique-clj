@@ -72,8 +72,8 @@
 ;;   :forms           {fid {:ns :source :line :column + one key per non-empty fact
 ;;                          category: :usages :defs :keyword-usages :class-usages
 ;;                          :locals :local-uses :macro-deps :invokes :warnings
-;;                          :ns-specs :require-calls :member-usages, each a
-;;                          vector of facts}}
+;;                          :ns-specs :require-calls :member-usages :ref-usages
+;;                          :local-refs :qualifiers, each a vector of facts}}
 ;;                                          Facts are stored BY CATEGORY rather than as
 ;;                                          tagged [op a b] tuples, so each fact is a
 ;;                                          single self-describing object (a Span /
@@ -100,6 +100,12 @@
 ;;   :class-usages    {class-name-string #{span}}  (keyed by name, not Class - see class-key)
 ;;   :member-usages   {[class-name member] #{span}}  a Java method, field or constructor
 ;;                                          ("new"), keyed by the class declaring it
+;;   :ref-usages      {qsym  #{span}}       references that are NOWHERE - every span at
+;;                                          line -1, read by the unused-* questions only
+;;   :qualifiers      {sym   #{span}}       the namespace part of every qualified symbol
+;;                                          the READER read, at the place it is written:
+;;                                          what the text spells, which is all there is
+;;                                          of an alias a macro ate or re-spelled
 ;;   :macro-deps      {ns-sym {macro-qsym #{fid}}}   compile-time edges (§9); each fid
 ;;                                          carries the expanding form's file (:source)
 ;;   :ns-usages       {lib   #{span-map}}   where each ns form or require call loads
@@ -503,14 +509,19 @@
 ;; questions look here, and they ask whether a thing is referenced at all.
 (def ^:private ^:const CAT-REFS     12)
 (def ^:private ^:const CAT-LOCALREFS 13)
-(def ^:private ^:const N-CATS       14)
+;; WHAT THE TEXT SPELLS, from the reader and not from the compiler: the namespace
+;; part of every qualified symbol read. Its own category because it is its own
+;; question - a name's prefix, resolved against nothing - and because the compiler
+;; answers it for no symbol a macro eats or rewrites. See the sink's qualifierUsage.
+(def ^:private ^:const CAT-QUALIFIERS 14)
+(def ^:private ^:const N-CATS       15)
 
 ;; The model key each category is stored under on a committed form entry, indexed by
 ;; the constants above.
 (def ^:private cat-keys
   [:usages :defs :keyword-usages :class-usages :locals :local-uses :macro-deps
    :invokes :warnings :ns-specs :require-calls :member-usages
-   :ref-usages :local-refs])
+   :ref-usages :local-refs :qualifiers])
 
 ;; An open form is buffered in a thread-local mutable holder, NOT written to the shared
 ;; model fact-by-fact. Facts accumulate in per-category ArrayLists (`cats`, allocated
@@ -902,7 +913,7 @@
     (when-not (.isEmpty spans)
       (let [^objects cats (.cats of)
             spans (vec spans)]
-        (doseq [cat [CAT-USAGES CAT-CLASSES CAT-KEYWORDS]]
+        (doseq [cat [CAT-USAGES CAT-CLASSES CAT-KEYWORDS CAT-QUALIFIERS]]
           (mark-dead! (aget cats cat) spans)))))
   nil)
 
@@ -1231,7 +1242,14 @@
             ;; macroexpansion leaves behind, since syntax-quote qualifies everything
             ;; it names. So the fully-spelled ones are dropped, and a macro's own body
             ;; does not silently make its caller's requires look used.
-            (when (or (nil? w) (not= (namespace w) (namespace k)))
+            ;;
+            ;; Except a var of the very namespace being compiled, spelled however:
+            ;; no require holds that up, so it cannot make one look used, and it is
+            ;; the only trace left of a private helper called from inside a `go'
+            ;; block - which re-emits every var it rewrites as a fresh, qualified,
+            ;; positionless symbol. See file-facts' :refs.
+            (when (or (nil? w) (not= (namespace w) (namespace k))
+                      (and from-ns (= (namespace k) (name (ns-name from-ns)))))
               (add-fact! of CAT-REFS (span k source -1 -1 -1 -1 from-ns nil nil nil
                                            w var-form)))
             (add-fact! of CAT-USAGES (span k source line column el ec from-ns nil nil nil
@@ -1265,6 +1283,14 @@
         ;; because only the token is asked for - whether anything read this binding.
         (add-fact! of CAT-LOCALREFS binding)
         (add-fact! of CAT-LOCALUSE (local-span binding source line column el ec ns))))
+    nil)
+  (qualifierUsage [_ qualifier from-ns source line column el ec]
+    ;; The reader's, so the same line as keywordUsage's: another platform's branch
+    ;; of a reader conditional is not this program's text, and a #_ discard is -
+    ;; recorded, and marked :dead by close-dead! like everything else written
+    ;; inside one.
+    (when-let [of (when-not (RT/suppressRead) (current-form))]
+      (add-fact! of CAT-QUALIFIERS (span qualifier source line column el ec from-ns nil)))
     nil)
   (keywordUsage [_ kw from-ns source line column el ec]
     ;; The branch of a reader conditional this platform does not take is read with
@@ -1696,7 +1722,7 @@
 ;; the small one it uses and the rest are built again when somebody asks.
 (defonce ^:private index-caches
   (into {} (for [k [:usages :defs :keyword-usages :class-usages :locals :macro-deps
-                    :ns-usages :member-usages :ref-usages]]
+                    :ns-usages :member-usages :ref-usages :qualifiers]]
              [k (atom {:forms nil :value nil})])))
 
 (defn- sorted-fids
@@ -1838,7 +1864,8 @@
 (defn- index
   "One derived index of model value `m`, built from its form log and cached until
   that log changes (`cached-by-forms`). `k` is one of :usages, :ref-usages, :defs,
-  :keyword-usages, :class-usages, :member-usages, :locals, :macro-deps, :ns-usages.
+  :keyword-usages, :class-usages, :member-usages, :locals, :macro-deps, :ns-usages,
+  :qualifiers.
 
   `:ref-usages` is the references that are NOWHERE - shaped like `:usages' and never
   to be mistaken for it, since every span in it is at line -1. Only the unused-*
@@ -1854,6 +1881,7 @@
        (case k
          :usages         (build-spans forms :usages)
          :ref-usages     (build-spans forms :ref-usages)
+         :qualifiers     (build-spans forms :qualifiers)
          :keyword-usages (build-spans forms :keyword-usages)
          :class-usages   (build-spans forms :class-usages)
          :member-usages  (build-spans forms :member-usages)
@@ -2250,14 +2278,43 @@
                  :when k]
              (symbol (namespace k)))))))
 
+(defn- written-qualifiers
+  "The namespace parts the source of ns-sym writes, as a set of symbols - the
+  reader's record of what the text spells, aliases and full namespace names alike
+  (and whatever else was written in front of a /). One in a #_ does not count; one
+  in a (comment ...) does - see counts-as-use?."
+  [m ns-sym]
+  (into #{} (for [[q uses] (index m :qualifiers)
+                  :when (some #(and (counts-as-use? %)
+                                    (= ns-sym (some-> (:from-ns %) ns-name)))
+                              uses)]
+              q)))
+
 (defn unused-aliases
   "Aliases in ns-sym whose target namespace has no var or namespaced-keyword
-  reference from ns-sym. Returns {alias ns-sym}. A use in a (comment ...) counts, one
-  in a #_ does not (counts-as-use?)."
+  reference from ns-sym AND whose own name the source nowhere writes. Returns
+  {alias ns-sym}. A use in a (comment ...) counts, one in a #_ does not
+  (counts-as-use?).
+
+  THE SECOND QUESTION IS THE READER'S, and it is asked because the first cannot
+  always be answered. A macro that consumes a qualified symbol at expansion time -
+  `(sql/jsonb-build-object flags/k v)', where the key is read and something else is
+  emitted - compiles to nothing naming the target namespace at all; a macro that
+  rebuilds the body it was given - core.async's `go' - re-emits `json/f' as
+  `cheshire.core/f', so the alias is gone rather than merely unpositioned. In both
+  the alias is written and the file stops reading without it. See the sink's
+  qualifierUsage.
+
+  The union of the two, and not the spelling alone, because the spelling is not
+  always there either: `::flags/k' reaches the model as the keyword it auto-resolves
+  to and never as the alias token, and only the first question sees it."
   [ns-sym]
-  (let [used (ns-referenced-namespaces ns-sym)]
+  (let [m     @model
+        used  (ns-referenced-namespaces ns-sym)
+        spelt (written-qualifiers m ns-sym)]
     (into {} (for [[a ns] (ns-aliases ns-sym)
-                   :when (not (contains? used (ns-name ns)))]
+                   :when (and (not (contains? used (ns-name ns)))
+                              (not (contains? spelt a)))]
                [a (ns-name ns)]))))
 
 (defn unused-refers
@@ -2335,7 +2392,11 @@
      :require-calls [{:ns sym :requires [...]}]  what each call of require or use
                                         loads, where - see require-call-specs -
                                         :top-level where the call is the whole
-                                        top-level form}
+                                        top-level form
+     :refs     [{:var qsym :line :column ...}]  every use of a var the file makes
+                                        NOWHERE - see the sink's varUsage - at the
+                                        :line and :column of the top-level form it is
+                                        in, since it has no place of its own}
 
   Spans are plain maps as find-usages answers them, :from-ns a namespace SYMBOL.
 
@@ -2359,7 +2420,11 @@
      :warnings (into [] (mapcat :warnings) forms)
      :forms    (mapv #(select-keys % [:line :column :ns]) forms)
      :ns-specs (into [] (mapcat :ns-specs) forms)
-     :require-calls (into [] (mapcat :require-calls) forms)}))
+     :require-calls (into [] (mapcat :require-calls) forms)
+     :refs     (into [] (mapcat (fn [f]
+                                  (map #(merge (fact %) (select-keys f [:line :column]))
+                                       (:ref-usages f))))
+                     forms)}))
 
 (defn version
   "An opaque token for the model as it is now: `identical?' to one taken earlier

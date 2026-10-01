@@ -365,6 +365,11 @@
                             (clojure.lang.Compiler/writeClassFile cname bytecode)))
          pc-effect (apply get-proxy-class bases)
          pname (proxy-name super interfaces)]
+     ;; what the class vector names, which nothing downstream of here can say: the
+     ;; bases are resolved above and the expansion below names only the generated
+     ;; proxy class, so an :import used by nothing but a proxy would read as unused.
+     ;; See clojure.lang.Compiler/sinkProxyClasses.
+     (clojure.lang.Compiler/sinkProxyClasses bases class-and-interfaces)
      ;remember the class to prevent it from disappearing before use
      (intern *ns* (symbol pname) pc-effect)
      `(let [;pc# (get-proxy-class ~@class-and-interfaces)

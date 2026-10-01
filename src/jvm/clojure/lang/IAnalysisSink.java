@@ -306,6 +306,32 @@ default void invokeUsage(Var target, int argc, Namespace fromNs, String source,
                          int line, int column, int endLine, int endColumn){
 }
 
+/**
+ * The namespace part of a symbol the READER read, reported where it is written:
+ * {@code str} of {@code str/join}, {@code clojure.string} of {@code
+ * clojure.string/join}. Nothing is resolved - a qualifier that names no namespace
+ * arrives too ({@code Math} of {@code Math/abs}), and so does one in a {@code #_}
+ * or a {@code (comment ...)}, which the sink tells apart by position.
+ *
+ * WHAT THE FILE SAYS, which is a different fact from what it compiles to and the
+ * only one left where the compiler never sees the symbol. A macro that reads a
+ * qualified symbol at expansion time and emits something else - a key built from
+ * it, a constant - reports no usage at all; one that rebuilds the body it was
+ * given, as core.async's {@code go} does, re-emits the symbol fully qualified, so
+ * the alias the source wrote is gone rather than merely unpositioned. In both the
+ * {@code :as} that made the name resolvable is doing its job, and this is the
+ * only record that it is.
+ *
+ * The span is the qualifier alone: the symbol's first character up to, not
+ * including, the {@code /}.
+ *
+ * A default method, so a sink with no use for what the text spells need not
+ * implement it.
+ */
+default void qualifierUsage(Symbol qualifier, Namespace fromNs, String source,
+                            int line, int column, int endLine, int endColumn){
+}
+
 /** The {@code kind} of dead code a {@code #_} discard is. */
 Keyword DISCARD = Keyword.intern(null, "discard");
 

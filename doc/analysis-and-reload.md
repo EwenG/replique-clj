@@ -29,6 +29,10 @@ Implementation progress (see §10 for the full sequence):
     `:on-interface`, so "who implements this" is answered by the same query as "who calls it".
     The interfaces an expansion added - `reify`'s `IObj`, `defrecord`'s `IRecord` and the rest -
     carry no position and are not recorded, by the capture rule below.
+    `proxy` is the one class reference no capture point can reach: it `resolve`s its bases
+    while it expands and returns a form naming only the proxy class it generated, so it reports
+    them itself from its own body (`Compiler/sinkProxyClasses`), the way `ns`, `import` and
+    `destructure` do - otherwise an `:import` nothing but a `proxy` uses reads as unused.
   - **D. Macro edges** — `macroexpand1` tap emits `macroExpansion`, always feeding the
     `:macro-deps` compile-time dependency graph that drives §9 stale reload, and feeding
     `:usages` (macro calls bypass `analyzeSymbol`) only for source-written calls. `:inline`
@@ -40,7 +44,15 @@ Implementation progress (see §10 for the full sequence):
   - **E. Requires/imports** — query-side, read from live namespace state (`ns-aliases`/
     `ns-refers`/`ns-imports`) combined with the usage model: `unused-aliases`, `unused-refers`,
     `unused-imports`. Bare `(require 'x)` with no `:as`/`:refer` leaves no per-ns trace, so it is
-    not covered (documented limitation).
+    not covered (documented limitation). An `:as` is asked of the **reader** as well
+    (`qualifierUsage`, the `:qualifiers` facts): the namespace part of every qualified symbol
+    read, at the place it is written. A macro that *eats* a qualified symbol at expansion time
+    emits nothing naming the target, and one that rebuilds the body it was given (core.async's
+    `go`) re-emits it fully qualified, so the alias reaches the compiler as something else or
+    not at all — what the compiler can still say of such a name, that it is read and is
+    *nowhere*, is the position-free `:ref-usages`/`:local-refs`. `unused-aliases` is the union
+    of the two questions and not the spelling alone, because `::alias/k` is resolved in the
+    reader and is only ever the keyword afterwards.
 
   Not yet done at that point: collection spans, `:inline`-fn compile-time edges.
 - **§7 (provenance + retraction) — done, form-based.** Per-top-level-form provenance via

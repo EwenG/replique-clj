@@ -419,6 +419,20 @@ static private Object read(PushbackReader r, boolean eofIsError, Object eofValue
 				LineNumberingPushbackReader lr = (LineNumberingPushbackReader) r;
 				ret = attachSourcePosition((IObj) ret, startLine, startColumn,
 				                           lr.getEndLineNumber(), lr.getEndColumnNumber());
+				// The namespace this token spells, which is a fact of the text and of
+				// nothing else: whether the symbol ever reaches the compiler, and
+				// whether it still spells this when it does, is up to the macros it
+				// passes through. See IAnalysisSink.qualifierUsage.
+				String qualifier = ((Symbol) ret).ns;
+				if(qualifier != null)
+					{
+					IAnalysisSink sink = Compiler.analysisSink();
+					if(sink != null)
+						sink.qualifierUsage(Symbol.intern(null, qualifier), Compiler.currentNS(),
+						                    (String) Compiler.SOURCE_PATH.deref(),
+						                    startLine, startColumn,
+						                    startLine, startColumn + qualifier.length());
+					}
 				}
 			else if(recordPos && ret instanceof Keyword)
 				{

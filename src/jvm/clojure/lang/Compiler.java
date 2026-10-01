@@ -639,6 +639,22 @@ private static void sinkImportUsage(Symbol sym, String className){
 	                           pos[0], pos[1], pos[2], pos[3]);
 }
 
+// The classes a (proxy [Super Iface] ...) names. clojure.core/proxy calls this from
+// its own body, for sinkImportSpecs' reason in its sharpest form: proxy RESOLVES its
+// bases itself, while it expands, and what it returns names only the proxy class it
+// generated - so no class reference the source wrote is ever analysed, and without
+// this an import used by nothing but a proxy reads as unused. Each base is paired
+// with the symbol the source spelled it as; one a macro made up carries no reader
+// position and is recorded nowhere, by the capture rule.
+public static void sinkProxyClasses(Object classes, Object written){
+	if(analysisSink() == null)
+		return;
+	ISeq cs = RT.seq(classes), ws = RT.seq(written);
+	for(; cs != null && ws != null; cs = cs.next(), ws = ws.next())
+		if(cs.first() instanceof Class && ws.first() instanceof Symbol)
+			sinkClassUsage((Class) cs.first(), (Symbol) ws.first());
+}
+
 // [line, column, endLine, endColumn] for a source symbol. Prefers the precise
 // span the reader attached (Layer 1); falls back to the enclosing form's
 // line/column with -1 ends when the symbol carries no reader position.
