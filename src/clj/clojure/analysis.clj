@@ -1615,6 +1615,36 @@
   (doseq [source (keys (:source->forms @model))] (record-file-mtime! source))
   nil)
 
+(defn rebaseline!
+  "Take the file now on disk as the version loaded, for the analysed files
+  `same?` vouches for, and answer the sources it did so for.
+
+  `same?` is called with the File a source resolves to now and the mtime baseline
+  it has, and answers whether what is in that file is what was loaded. Only files
+  are asked about: a jar entry has no baseline, and a source nothing answers to has
+  no file to take.
+
+  FOR WHAT AN MTIME CANNOT SAY. A file is changed when its mtime differs from the
+  baseline (`changed-files`), and the mtime of a file is a fact about the copy of
+  it: a directory swapped for a checkout of another branch - a link under a
+  classpath root pointed at another worktree - gives every file another mtime,
+  whatever is in it, and every file reads as edited. Whoever moved the files can
+  say which of them are the same, and this is how they say it. Unlike
+  `snapshot-mtimes!`, which takes every file, it takes only those - so a file
+  edited and not reloaded before the swap, which `same?` has no reason to vouch
+  for, stays changed."
+  [same?]
+  (let [taken (into {} (for [[source t] (:file-mtime @model)
+                             :when t
+                             :let [^java.net.URL u (io/resource source)]
+                             :when (and u (= "file" (.getProtocol u)))
+                             :let [f (resource->file u)
+                                   now (.lastModified f)]
+                             :when (and (pos? now) (not= now t) (same? f t))]
+                         [source now]))]
+    (swap! model update :file-mtime merge taken)
+    (set (keys taken))))
+
 (defn- strip-ext [^String source]
   (cond (.endsWith source ".cljc") (subs source 0 (- (count source) 5))
         (.endsWith source ".clj")  (subs source 0 (- (count source) 4))

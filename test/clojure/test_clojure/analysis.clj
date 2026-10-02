@@ -945,6 +945,30 @@
       (an/snapshot-mtimes!)
       (is (empty? (an/changed-files))))))
 
+(deftest a-file-vouched-for-is-taken-as-loaded-and-only-that-one
+  (let [a (written! "vouched/a.clj" "(ns vouched.a)" "(def x 1)")
+        b (written! "vouched/b.clj" "(ns vouched.b)" "(def y 1)")]
+    (analysed! a b)
+    (let [was (an/file-mtime a)
+          asked (atom [])]
+      (testing "the same content written again is another mtime, and so a change"
+        (written! "vouched/a.clj" "(ns vouched.a)" "(def x 1)")
+        (written! "vouched/b.clj" "(ns vouched.b)" "(def y 2)")
+        (is (= #{a b} (an/changed-files))))
+      (testing "rebaseline! takes what it is told is the same, and nothing else"
+        (is (= #{a} (an/rebaseline!
+                     (fn [f t]
+                       (swap! asked conj [(.getName ^java.io.File f) t])
+                       (= "a.clj" (.getName ^java.io.File f))))))
+        (is (= #{b} (an/changed-files)))
+        (is (= (.lastModified (io/file @root a)) (an/file-mtime a))))
+      (testing "and is told the baseline it is moving off"
+        (is (some #{["a.clj" was]} @asked)))
+      (testing "a file whose mtime has not moved is not asked about"
+        (reset! asked [])
+        (an/rebaseline! (fn [f _] (swap! asked conj (.getName ^java.io.File f)) false))
+        (is (= ["b.clj"] @asked))))))
+
 (deftest a-file-that-is-gone-is-not-changed-and-one-that-comes-back-is
   (let [source (written! "vanishing/a.clj"
                          "(ns vanishing.a)"
