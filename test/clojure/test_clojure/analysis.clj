@@ -1516,6 +1516,38 @@
     (testing "and the reference the edit introduced resolves"
       (is (= :fresh @(resolve 'newreq.u/v))))))
 
+(deftest a-require-through-a-file-not-reloaded-orders-the-reload
+  ;; a branch switch: a now requires m, which was never loaded and is therefore not
+  ;; in the reload - and m requires z for a var z has only on this branch. Loading
+  ;; a loads m on the way, so z has to come first although neither file it is
+  ;; reloaded with requires it.
+  (let [z (written! "viamid/z.clj"
+                    "(ns viamid.z)"
+                    "(clojure.test-clojure.analysis/loaded! 'z)"
+                    "(def a 1)")
+        a (written! "viamid/a.clj"
+                    "(ns viamid.a)"
+                    "(clojure.test-clojure.analysis/loaded! 'a)"
+                    "(def b 2)")]
+    (analysed! z a)
+    (written! "viamid/z.clj"
+              "(ns viamid.z)"
+              "(clojure.test-clojure.analysis/loaded! 'z)"
+              "(defn fresh [] :fresh)")
+    (written! "viamid/m.clj"
+              "(ns viamid.m (:require [viamid.z]))"
+              "(def u (viamid.z/fresh))")
+    (written! "viamid/a.clj"
+              "(ns viamid.a (:require [viamid.m]))"
+              "(clojure.test-clojure.analysis/loaded! 'a)"
+              "(def v viamid.m/u)")
+    (testing "the edge goes through the file nobody is reloading"
+      (is (= {a #{z}} (require-graph z a))))
+    (reset! trace [])
+    (is (= [z a] (an/stale-reload!)))
+    (is (= '[z a] @trace))
+    (is (= :fresh @(resolve 'viamid.a/v)))))
+
 (deftest a-var-reference-does-not-put-a-file-in-a-reload
   ;; The other half of the same rule: ordering by var references must not turn into
   ;; reloading by them. A call re-resolves its var every time it runs, so a file that

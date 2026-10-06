@@ -2858,8 +2858,15 @@
 
   A namespace is matched to a file the way `require` matches one - the name, with
   dashes to underscores and dots to slashes - and also through the model, for a
-  file whose namespace is not named after it. Neither has to find anything: a
-  require of something not being reloaded says nothing about the order of what is."
+  file whose namespace is not named after it.
+
+  AND THROUGH A FILE THAT IS NOT BEING RELOADED, which is where the edge most often
+  is after a branch switch. a.clj is changed and now requires b, which was never
+  loaded - or did not change - and b requires c, which did: loading a loads b on the
+  way, against the c that is still the old one, and that is `No such var` in b,
+  reported against a. So a require of something not among `files` is followed,
+  through that file's own ns form on disk, until it reaches one that is - an edge
+  from a to c - or nothing on disk at all. Each ns form is read once."
   [m files]
   (let [nodes    (set files)
         ns->srcs (reduce-kv (fn [acc _ fe]
@@ -2867,19 +2874,33 @@
                                 (update acc n (fnil conj #{}) (:source fe))
                                 acc))
                             {} (:forms m))
-        sources  (fn [n] (filter nodes (into (set (ns-sources n)) (get ns->srcs n))))
+        files-of (fn [n] (into (set (ns-sources n)) (get ns->srcs n)))
         clause?  (fn [x] (and (sequential? x)
-                              (#{:require :use :require-macros} (first x))))]
+                              (#{:require :use :require-macros} (first x))))
+        requires (memoize
+                  (fn [source]
+                    (when-let [form (ns-declaration source)]
+                      (into #{} (comp (filter clause?) (mapcat #(lib-names (rest %))))
+                            (rest form)))))
+        ;; the files `source` reaches, stopping at each: what is behind one is
+        ;; that one's to order, and its own edges say so
+        reached  (fn [source]
+                   (loop [todo (vec (requires source)), seen #{}, deps #{}]
+                     (if-let [n (peek todo)]
+                       (let [todo (pop todo)]
+                         (if (seen n)
+                           (recur todo seen deps)
+                           (let [files (files-of n)
+                                 hit   (filter nodes files)]
+                             (if (seq hit)
+                               (recur todo (conj seen n) (into deps hit))
+                               (recur (into todo (mapcat requires) files)
+                                      (conj seen n) deps)))))
+                       (disj deps source))))]
     (reduce
      (fn [g source]
-       (if-let [form (ns-declaration source)]
-         (let [deps (into #{} (comp (filter clause?)
-                                    (mapcat #(lib-names (rest %)))
-                                    (mapcat sources)
-                                    (remove #(= source %)))
-                          (rest form))]
-           (if (seq deps) (update g source (fnil into #{}) deps) g))
-         g))
+       (let [deps (reached source)]
+         (if (seq deps) (update g source (fnil into #{}) deps) g)))
      {} nodes)))
 
 (defn- topo-order
