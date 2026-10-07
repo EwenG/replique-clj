@@ -353,6 +353,28 @@ static IAnalysisSink analysisSink(){
 
 static final public Var RECORD_POSITIONS = Var.create(null).setDynamic();
 
+//IPersistentMap or null - bound while compiling code that is to be stepped
+//through. Every form the source wrote - a seq read with its span - is compiled
+//to hand its value to a function once it has one, and every fn to say it was
+//called: see StepExpr and EnterExpr. The map holds
+//  :site  a function called at compile time with what a site is - {:kind :value
+//         or :enter, :form, :line, :column, :end-line, :end-column, and for an
+//         :enter whether it is :outermost} - answering a number naming it, or
+//         nil for no site there
+//  :hook  a Var whose function the compiled code calls: (f id value) once a form
+//         has its value, (f id) once a fn is entered. What it answers is ignored.
+//Positions come from the reader, so the code has to have been read with
+//RECORD_POSITIONS on. Nil, the default, compiles what it always has.
+static final public Var INSTRUMENT = Var.create(null).setDynamic();
+
+static final Keyword INSTRUMENT_SITE_KEY = Keyword.intern(null, "site");
+static final Keyword INSTRUMENT_HOOK_KEY = Keyword.intern(null, "hook");
+static final Keyword INSTRUMENT_KIND_KEY = Keyword.intern(null, "kind");
+static final Keyword INSTRUMENT_VALUE_KEY = Keyword.intern(null, "value");
+static final Keyword INSTRUMENT_ENTER_KEY = Keyword.intern(null, "enter");
+static final Keyword INSTRUMENT_FORM_KEY = Keyword.intern(null, "form");
+static final Keyword INSTRUMENT_OUTERMOST_KEY = Keyword.intern(null, "outermost");
+
 // The kinds of warning the compiler prints while it analyses a form, as the sink is
 // told them (IAnalysisSink.warning).
 static final Keyword REFLECTION_WARNING = Keyword.intern(null, "reflection");
@@ -6388,6 +6410,9 @@ public static class FnMethod extends ObjMethod{
 		return null;
 	}
 
+	// Whether the body says it was entered - see EnterExpr
+	boolean instrumented = false;
+
 	static FnMethod parse(ObjExpr objx, ISeq form, Object rettag) {
 		//([args] body...)
 		IPersistentVector parms = (IPersistentVector) RT.first(form);
@@ -6518,7 +6543,11 @@ public static class FnMethod extends ObjMethod{
 						getAndIncLocalNum();
 					}
 				}
+			// before the body, whose fns are inside this one
+			boolean outermost = isOutermostInstrumented(method);
+			method.instrumented = INSTRUMENT.deref() != null;
 			method.body = (new BodyExpr.Parser()).parse(C.RETURN, body);
+			method.body = instrumentEntry(method, form, method.body, outermost);
 			return method;
 			}
 		finally
@@ -7614,6 +7643,186 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 
 }
 
+// What a form compiled to be stepped through compiles to - see INSTRUMENT. The
+// form's own Expr, and once it has its value, a call of the hook with the
+// number of the site and the value: (f id value). Leaves the value where it
+// was, boxed or not, so that the code around it compiles as it would have.
+static Expr instrumentValue(ISeq form, Expr e){
+	IPersistentMap ins = (IPersistentMap) INSTRUMENT.deref();
+	if(ins == null)
+		return e;
+	// What has no value to report, or is not one to the code around it: a
+	// function as a value is its class, a recur and a throw do not come back,
+	// what set! assigns to has to stay what it is, a constant is looked at by
+	// what is around it. And a form whose expansion already reports - a macro
+	// handing back a form the source wrote, `->' rebuilding one - once.
+	if(e instanceof StepExpr || e instanceof ObjExpr || e instanceof RecurExpr
+	   || e instanceof ThrowExpr || e instanceof AssignableExpr || e instanceof LiteralExpr
+	   || e instanceof DefExpr || e instanceof ImportExpr || e instanceof TheVarExpr
+	   || e instanceof MonitorEnterExpr || e instanceof MonitorExitExpr
+	   // a fn carrying the metadata of its form, the span among it
+	   || (e instanceof MetaExpr && ((MetaExpr) e).expr instanceof ObjExpr))
+		return e;
+	Object id = instrumentSite(ins, INSTRUMENT_VALUE_KEY, form, false);
+	return id == null ? e : new StepExpr(e, (Var) ins.valAt(INSTRUMENT_HOOK_KEY), ((Number) id).longValue());
+}
+
+// The body of the fn method METHOD, read from FORM, saying it was entered
+// first - (f id) - where the code is compiled to be stepped through.
+static Expr instrumentEntry(FnMethod method, ISeq form, Expr body, boolean outermost){
+	IPersistentMap ins = (IPersistentMap) INSTRUMENT.deref();
+	if(ins == null)
+		return body;
+	Object id = instrumentSite(ins, INSTRUMENT_ENTER_KEY, form, outermost);
+	if(id == null)
+		return body;
+	return new EnterExpr(body, (Var) ins.valAt(INSTRUMENT_HOOK_KEY), ((Number) id).longValue());
+}
+
+// Whether METHOD is inside no fn compiled to be stepped through: the fn the
+// source is about, rather than one written inside it.
+static boolean isOutermostInstrumented(FnMethod method){
+	for(ObjMethod p = method.parent; p != null; p = p.parent)
+		if(p instanceof FnMethod && ((FnMethod) p).instrumented)
+			return false;
+	return true;
+}
+
+// The number of the site of FORM, from the :site function - or nil, where it
+// says there is none. A form written in the source is one read with its span:
+// one a macro made has no end, and is not a site of its own.
+static Object instrumentSite(IPersistentMap ins, Keyword kind, ISeq form, boolean outermost){
+	IPersistentMap m = RT.meta(form);
+	boolean written = m != null && m.valAt(RT.LINE_KEY) instanceof Number
+	                  && m.valAt(LispReader.END_LINE_KEY) instanceof Number;
+	if(!written && kind == INSTRUMENT_VALUE_KEY)
+		return null;
+	IPersistentMap site = RT.map(INSTRUMENT_KIND_KEY, kind,
+	                             INSTRUMENT_FORM_KEY, form,
+	                             INSTRUMENT_OUTERMOST_KEY, outermost);
+	if(written)
+		site = site.assoc(RT.LINE_KEY, m.valAt(RT.LINE_KEY))
+		           .assoc(RT.COLUMN_KEY, m.valAt(RT.COLUMN_KEY))
+		           .assoc(LispReader.END_LINE_KEY, m.valAt(LispReader.END_LINE_KEY))
+		           .assoc(LispReader.END_COLUMN_KEY, m.valAt(LispReader.END_COLUMN_KEY));
+	return ((IFn) ins.valAt(INSTRUMENT_SITE_KEY)).invoke(site);
+}
+
+// Calls the function of HOOK with ID and, WITH-VALUE, what is on top of the
+// stack, which it takes: [v] -> []. The root of the Var rather than the Var,
+// so that no frame of Var's is between the code and the hook.
+static void emitHookCall(ObjExpr objx, GeneratorAdapter gen, Var hook, long id, boolean withValue){
+	objx.emitVar(gen, hook);
+	gen.invokeVirtual(VAR_TYPE, ObjExpr.varGetRawMethod);
+	gen.checkCast(IFN_TYPE);
+	if(withValue)
+		gen.swap();                                   // [fn v]
+	gen.push(id);
+	gen.valueOf(Type.LONG_TYPE);                      // [fn v id]
+	if(withValue)
+		{
+		gen.swap();                                   // [fn id v]
+		gen.invokeInterface(IFN_TYPE, new Method("invoke", OBJECT_TYPE, new Type[]{OBJECT_TYPE, OBJECT_TYPE}));
+		}
+	else
+		gen.invokeInterface(IFN_TYPE, new Method("invoke", OBJECT_TYPE, new Type[]{OBJECT_TYPE}));
+	gen.pop();
+}
+
+static class StepExpr implements Expr, MaybePrimitiveExpr{
+	final Expr expr;
+	final Var hook;
+	final long id;
+
+	StepExpr(Expr expr, Var hook, long id){
+		this.expr = expr;
+		this.hook = hook;
+		this.id = id;
+		registerVar(hook);
+	}
+
+	public Object eval() {
+		Object v = expr.eval();
+		((IFn) hook.getRawRoot()).invoke(id, v);
+		return v;
+	}
+
+	public void emit(C context, ObjExpr objx, GeneratorAdapter gen){
+		// In a statement the form leaves nothing, and its value is wanted here
+		expr.emit(context == C.STATEMENT ? C.EXPRESSION : context, objx, gen);
+		gen.dup();
+		emitHookCall(objx, gen, hook, id, true);
+		if(context == C.STATEMENT)
+			gen.pop();
+	}
+
+	public boolean canEmitPrimitive(){
+		return expr instanceof MaybePrimitiveExpr && ((MaybePrimitiveExpr) expr).canEmitPrimitive();
+	}
+
+	public void emitUnboxed(C context, ObjExpr objx, GeneratorAdapter gen){
+		Class c = expr.getJavaClass();
+		((MaybePrimitiveExpr) expr).emitUnboxed(context, objx, gen);
+		if(c == long.class || c == double.class)
+			gen.dup2();
+		else
+			gen.dup();
+		HostExpr.emitBoxReturn(objx, gen, c);
+		emitHookCall(objx, gen, hook, id, true);
+	}
+
+	public boolean hasJavaClass() {
+		return expr.hasJavaClass();
+	}
+
+	public Class getJavaClass() {
+		return expr.getJavaClass();
+	}
+}
+
+// The body of a fn method compiled to be stepped through: says it was entered,
+// (f id), and is the body. After the loop label of the method, so that a recur
+// to the top of the fn enters it again.
+static class EnterExpr implements Expr, MaybePrimitiveExpr{
+	final Expr body;
+	final Var hook;
+	final long id;
+
+	EnterExpr(Expr body, Var hook, long id){
+		this.body = body;
+		this.hook = hook;
+		this.id = id;
+		registerVar(hook);
+	}
+
+	public Object eval() {
+		((IFn) hook.getRawRoot()).invoke(id);
+		return body.eval();
+	}
+
+	public void emit(C context, ObjExpr objx, GeneratorAdapter gen){
+		emitHookCall(objx, gen, hook, id, false);
+		body.emit(context, objx, gen);
+	}
+
+	public boolean canEmitPrimitive(){
+		return body instanceof MaybePrimitiveExpr && ((MaybePrimitiveExpr) body).canEmitPrimitive();
+	}
+
+	public void emitUnboxed(C context, ObjExpr objx, GeneratorAdapter gen){
+		emitHookCall(objx, gen, hook, id, false);
+		((MaybePrimitiveExpr) body).emitUnboxed(context, objx, gen);
+	}
+
+	public boolean hasJavaClass() {
+		return body.hasJavaClass();
+	}
+
+	public Class getJavaClass() {
+		return body.getJavaClass();
+	}
+}
+
 public static class RecurExpr implements Expr, MaybePrimitiveExpr{
 	public final IPersistentVector args;
 	public final IPersistentVector loopLocals;
@@ -8199,21 +8408,21 @@ private static Expr analyzeSeq(C context, ISeq form, String name) {
 		{
 		Object me = macroexpand1(form);
 		if(me != form)
-			return analyze(context, me, name);
+			return instrumentValue(form, analyze(context, me, name));
 
 		op = RT.first(form);
 		if(op == null)
 			throw new IllegalArgumentException("Can't call nil, form: " + form);
 		IFn inline = isInline(op, RT.count(RT.next(form)));
 		if(inline != null)
-			return analyze(context, preserveTag(form, inline.applyTo(RT.next(form))));
+			return instrumentValue(form, analyze(context, preserveTag(form, inline.applyTo(RT.next(form)))));
 		IParser p;
 		if(op.equals(FN))
 			return FnExpr.parse(context, form, name);
 		else if((p = (IParser) specials.valAt(op)) != null)
-			return p.parse(context, form);
+			return instrumentValue(form, p.parse(context, form));
 		else
-			return InvokeExpr.parse(context, form);
+			return instrumentValue(form, InvokeExpr.parse(context, form));
 		}
 	catch(Throwable e)
 		{

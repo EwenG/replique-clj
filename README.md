@@ -23,10 +23,10 @@ class files; it is `clojure.lang.*` itself that is built for 21.
 
 ## Divergence from upstream
 
-`git diff clojure-1.12.5 -- src test` lists it; `test` is untouched. Three divergences in `src`:
+`git diff clojure-1.12.5 -- src test` lists it; `test` is untouched. Four divergences in `src`:
 one small, measured compiler change; one larger — a gated, off-by-default analysis subsystem
-(the bulk of the diff by line count); and three hooks that exist only so a compiler for another
-target can be written against this runtime.
+(the bulk of the diff by line count); three hooks that exist only so a compiler for another
+target can be written against this runtime; and code compiled to be stepped through.
 
 - **`Reflector.getMethods` caches `Class.getMethods()` in a `ClassValue`.** `Class.getMethods()`
   copies the whole public-method array *and every `Method` object in it* on every call, and the
@@ -133,6 +133,19 @@ dump is not — the archive is then rejected at startup and you silently get no 
   installed. Positions were already recorded whenever analysis was on; this separates *wanting the
   positions* from *having somewhere to report events*, which is what a front end needs — it reads
   with this runtime's reader and keeps the positions for its own source maps.
+
+- **`Compiler.INSTRUMENT`: code compiled to be stepped through.** Off by default — unbound, the
+  compiler emits what it always did, at the cost of one null check per analysed seq form. Bound
+  to `{:site f :hook #'v}`, every seq form the source wrote (one read with its span, so the code
+  must be read with `RECORD_POSITIONS` on) compiles to its own `Expr` wrapped in a `StepExpr`,
+  which hands its value to `(v id value)` once it has one, and every fn method body to an
+  `EnterExpr`, which calls `(v id)` first. `f` is called at compile time with what each site is
+  (`:kind`, the `:form` and its span, whether an `:enter` is `:outermost`) and answers the number
+  the code is compiled to pass. A `StepExpr` keeps a primitive primitive (`emitUnboxed` boxes a
+  copy for the hook), and what has no value to report or must stay what it is to the code around
+  it — fns, `recur`, `throw`, constants, `set!` targets, `def` — is left alone. The consumer is
+  replique's stepping debugger (`replique.debug` in replique-2). `test/clojure/test_clojure/instrument.clj`
+  covers it; the suite is green with it in.
 
 ## Build
 
