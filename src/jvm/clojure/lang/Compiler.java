@@ -359,10 +359,15 @@ static final public Var RECORD_POSITIONS = Var.create(null).setDynamic();
 //called: see StepExpr and EnterExpr. The map holds
 //  :site  a function called at compile time with what a site is - {:kind :value
 //         or :enter, :form, :line, :column, :end-line, :end-column, and for an
-//         :enter whether it is :outermost} - answering a number naming it, or
-//         nil for no site there
+//         :enter whether it is :outermost and the :params it was written with}
+//         - answering a number naming it, or nil for no site there
 //  :hook  a Var whose function the compiled code calls: (f id value) once a form
-//         has its value, (f id) once a fn is entered. What it answers is ignored.
+//         has its value, and (f id) once a fn is entered - unless there is an
+//         :enter. What it answers is ignored.
+//  :enter optional, a Var whose function the compiled code calls once a fn is
+//         entered, with what it was called with: (f id args), ARGS a vector of
+//         the value of each param, the rest param's last.
+//A fn is entered once a call: a recur to its top is not another entry.
 //Positions come from the reader, so the code has to have been read with
 //RECORD_POSITIONS on. Nil, the default, compiles what it always has.
 static final public Var INSTRUMENT = Var.create(null).setDynamic();
@@ -374,6 +379,7 @@ static final Keyword INSTRUMENT_VALUE_KEY = Keyword.intern(null, "value");
 static final Keyword INSTRUMENT_ENTER_KEY = Keyword.intern(null, "enter");
 static final Keyword INSTRUMENT_FORM_KEY = Keyword.intern(null, "form");
 static final Keyword INSTRUMENT_OUTERMOST_KEY = Keyword.intern(null, "outermost");
+static final Keyword INSTRUMENT_PARAMS_KEY = Keyword.intern(null, "params");
 
 // The kinds of warning the compiler prints while it analyses a form, as the sink is
 // told them (IAnalysisSink.warning).
@@ -6413,6 +6419,16 @@ public static class FnMethod extends ObjMethod{
 	// Whether the body says it was entered - see EnterExpr
 	boolean instrumented = false;
 
+	// Say the method was entered, where its body is an EnterExpr, and answer
+	// the body to emit after - before the loop label, which a recur jumps to.
+	Expr emitEntered(ObjExpr fn, GeneratorAdapter gen){
+		if(!(body instanceof EnterExpr))
+			return body;
+		gen.visitLineNumber(line, gen.mark());
+		((EnterExpr) body).emitEntered(fn, gen);
+		return ((EnterExpr) body).body;
+	}
+
 	static FnMethod parse(ObjExpr objx, ISeq form, Object rettag) {
 		//([args] body...)
 		IPersistentVector parms = (IPersistentVector) RT.first(form);
@@ -6590,6 +6606,9 @@ public static class FnMethod extends ObjMethod{
 		                                            EXCEPTION_TYPES,
 		                                            cv);
 		gen.visitCode();
+		// said once a call, rather than again on each recur to the top
+		Label start = gen.mark();
+		Expr body = emitEntered(objx, gen);
 		Label loopLabel = gen.mark();
 		gen.visitLineNumber(line, loopLabel);
 		try
@@ -6601,7 +6620,7 @@ public static class FnMethod extends ObjMethod{
 			for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next())
 				{
 				LocalBinding lb = (LocalBinding) lbs.first();
-				gen.visitLocalVariable(lb.name, argtypes[lb.idx].getDescriptor(), null, loopLabel, end, lb.idx);
+				gen.visitLocalVariable(lb.name, argtypes[lb.idx].getDescriptor(), null, start, end, lb.idx);
 				}
 			}
 		finally
@@ -6697,6 +6716,9 @@ public static class FnMethod extends ObjMethod{
 		                                            cv);
 		gen.visitCode();
 
+		// said once a call, rather than again on each recur to the top
+		Label start = gen.mark();
+		Expr body = emitEntered(objx, gen);
 		Label loopLabel = gen.mark();
 		gen.visitLineNumber(line, loopLabel);
 		try
@@ -6705,11 +6727,11 @@ public static class FnMethod extends ObjMethod{
 			emitBody(objx, gen, retClass, body);
 
 			Label end = gen.mark();
-			gen.visitLocalVariable("this", "Ljava/lang/Object;", null, loopLabel, end, 0);
+			gen.visitLocalVariable("this", "Ljava/lang/Object;", null, start, end, 0);
 			for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next())
 				{
 				LocalBinding lb = (LocalBinding) lbs.first();
-				gen.visitLocalVariable(lb.name, argtypes[lb.idx-1].getDescriptor(), null, loopLabel, end, lb.idx);
+				gen.visitLocalVariable(lb.name, argtypes[lb.idx-1].getDescriptor(), null, start, end, lb.idx);
 				}
 			}
 		finally
@@ -6762,6 +6784,9 @@ public static class FnMethod extends ObjMethod{
 		                                            cv);
 		gen.visitCode();
 
+		// said once a call, rather than again on each recur to the top
+		Label start = gen.mark();
+		Expr body = emitEntered(fn, gen);
 		Label loopLabel = gen.mark();
 		gen.visitLineNumber(line, loopLabel);
 		try
@@ -6771,11 +6796,11 @@ public static class FnMethod extends ObjMethod{
 			body.emit(C.RETURN, fn, gen);
 			Label end = gen.mark();
 
-			gen.visitLocalVariable("this", "Ljava/lang/Object;", null, loopLabel, end, 0);
+			gen.visitLocalVariable("this", "Ljava/lang/Object;", null, start, end, 0);
 			for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next())
 				{
 				LocalBinding lb = (LocalBinding) lbs.first();
-				gen.visitLocalVariable(lb.name, "Ljava/lang/Object;", null, loopLabel, end, lb.idx);
+				gen.visitLocalVariable(lb.name, "Ljava/lang/Object;", null, start, end, lb.idx);
 				}
 			}
 		finally
@@ -7663,20 +7688,24 @@ static Expr instrumentValue(ISeq form, Expr e){
 	   // a fn carrying the metadata of its form, the span among it
 	   || (e instanceof MetaExpr && ((MetaExpr) e).expr instanceof ObjExpr))
 		return e;
-	Object id = instrumentSite(ins, INSTRUMENT_VALUE_KEY, form, false);
+	Object id = instrumentSite(ins, INSTRUMENT_VALUE_KEY, form, false, null);
 	return id == null ? e : new StepExpr(e, (Var) ins.valAt(INSTRUMENT_HOOK_KEY), ((Number) id).longValue());
 }
 
 // The body of the fn method METHOD, read from FORM, saying it was entered
-// first - (f id) - where the code is compiled to be stepped through.
+// first - (f id args), or (f id) without an :enter - where the code is
+// compiled to be stepped through.
 static Expr instrumentEntry(FnMethod method, ISeq form, Expr body, boolean outermost){
 	IPersistentMap ins = (IPersistentMap) INSTRUMENT.deref();
 	if(ins == null)
 		return body;
-	Object id = instrumentSite(ins, INSTRUMENT_ENTER_KEY, form, outermost);
+	Object id = instrumentSite(ins, INSTRUMENT_ENTER_KEY, form, outermost, RT.first(form));
 	if(id == null)
 		return body;
-	return new EnterExpr(body, (Var) ins.valAt(INSTRUMENT_HOOK_KEY), ((Number) id).longValue());
+	Var enter = (Var) ins.valAt(INSTRUMENT_ENTER_KEY);
+	return enter == null
+	       ? new EnterExpr(body, (Var) ins.valAt(INSTRUMENT_HOOK_KEY), ((Number) id).longValue(), null)
+	       : new EnterExpr(body, enter, ((Number) id).longValue(), method.argLocals);
 }
 
 // Whether METHOD is inside no fn compiled to be stepped through: the fn the
@@ -7691,7 +7720,7 @@ static boolean isOutermostInstrumented(FnMethod method){
 // The number of the site of FORM, from the :site function - or nil, where it
 // says there is none. A form written in the source is one read with its span:
 // one a macro made has no end, and is not a site of its own.
-static Object instrumentSite(IPersistentMap ins, Keyword kind, ISeq form, boolean outermost){
+static Object instrumentSite(IPersistentMap ins, Keyword kind, ISeq form, boolean outermost, Object params){
 	IPersistentMap m = RT.meta(form);
 	boolean written = m != null && m.valAt(RT.LINE_KEY) instanceof Number
 	                  && m.valAt(LispReader.END_LINE_KEY) instanceof Number;
@@ -7700,6 +7729,8 @@ static Object instrumentSite(IPersistentMap ins, Keyword kind, ISeq form, boolea
 	IPersistentMap site = RT.map(INSTRUMENT_KIND_KEY, kind,
 	                             INSTRUMENT_FORM_KEY, form,
 	                             INSTRUMENT_OUTERMOST_KEY, outermost);
+	if(params != null)
+		site = site.assoc(INSTRUMENT_PARAMS_KEY, params);
 	if(written)
 		site = site.assoc(RT.LINE_KEY, m.valAt(RT.LINE_KEY))
 		           .assoc(RT.COLUMN_KEY, m.valAt(RT.COLUMN_KEY))
@@ -7781,27 +7812,56 @@ static class StepExpr implements Expr, MaybePrimitiveExpr{
 }
 
 // The body of a fn method compiled to be stepped through: says it was entered,
-// (f id), and is the body. After the loop label of the method, so that a recur
-// to the top of the fn enters it again.
+// (f id args) - or (f id), without ARGS, the LocalBindings of its params - and
+// is the body. Emitted by the method before its loop label - see
+// FnMethod.emitEntered - so that a recur to the top of the fn is not another
+// call: it is said once, with what the fn was called with.
 static class EnterExpr implements Expr, MaybePrimitiveExpr{
 	final Expr body;
 	final Var hook;
 	final long id;
+	final IPersistentVector args;
 
-	EnterExpr(Expr body, Var hook, long id){
+	EnterExpr(Expr body, Var hook, long id, IPersistentVector args){
 		this.body = body;
 		this.hook = hook;
 		this.id = id;
+		this.args = args;
 		registerVar(hook);
 	}
 
 	public Object eval() {
-		((IFn) hook.getRawRoot()).invoke(id);
+		// a fn's body is emitted, never evaluated: there are no args here
+		if(args == null)
+			((IFn) hook.getRawRoot()).invoke(id);
+		else
+			((IFn) hook.getRawRoot()).invoke(id, PersistentVector.EMPTY);
 		return body.eval();
 	}
 
+	// The hook told the fn was entered, before anything of the body ran: no
+	// param was cleared yet, and none is here - the body is what uses them.
+	void emitEntered(ObjExpr objx, GeneratorAdapter gen){
+		if(args == null)
+			{
+			emitHookCall(objx, gen, hook, id, false);
+			return;
+			}
+		gen.push(args.count());
+		gen.newArray(OBJECT_TYPE);
+		for(int i = 0; i < args.count(); i++)
+			{
+			gen.dup();
+			gen.push(i);
+			objx.emitLocal(gen, (LocalBinding) args.nth(i), false);
+			gen.arrayStore(OBJECT_TYPE);
+			}
+		gen.invokeStatic(RT_TYPE, VectorExpr.vectorMethod);
+		emitHookCall(objx, gen, hook, id, true);
+	}
+
 	public void emit(C context, ObjExpr objx, GeneratorAdapter gen){
-		emitHookCall(objx, gen, hook, id, false);
+		emitEntered(objx, gen);
 		body.emit(context, objx, gen);
 	}
 
@@ -7810,7 +7870,7 @@ static class EnterExpr implements Expr, MaybePrimitiveExpr{
 	}
 
 	public void emitUnboxed(C context, ObjExpr objx, GeneratorAdapter gen){
-		emitHookCall(objx, gen, hook, id, false);
+		emitEntered(objx, gen);
 		((MaybePrimitiveExpr) body).emitUnboxed(context, objx, gen);
 	}
 
