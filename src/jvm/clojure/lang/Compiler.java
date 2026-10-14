@@ -367,6 +367,13 @@ static final public Var RECORD_POSITIONS = Var.create(null).setDynamic();
 //  :enter optional, a Var whose function the compiled code calls once a fn is
 //         entered, with what it was called with: (f id args), ARGS a vector of
 //         the value of each param, the rest param's last.
+//  :locals optional, true for the locals a let or a loop binds to be sites of
+//         their own too - {:kind :local, :form the name} - each telling the
+//         hook what it is bound to, (f id value): a let's once bound, a
+//         loop's at the top of each time round. The names the source wrote
+//         only, read with their span, which is what a macro binding one the
+//         source wrote binds: the element of a doseq or a for, a name a
+//         destructuring binds.
 //A fn is entered once a call: a recur to its top is not another entry.
 //Positions come from the reader, so the code has to have been read with
 //RECORD_POSITIONS on. Nil, the default, compiles what it always has.
@@ -380,6 +387,8 @@ static final Keyword INSTRUMENT_ENTER_KEY = Keyword.intern(null, "enter");
 static final Keyword INSTRUMENT_FORM_KEY = Keyword.intern(null, "form");
 static final Keyword INSTRUMENT_OUTERMOST_KEY = Keyword.intern(null, "outermost");
 static final Keyword INSTRUMENT_PARAMS_KEY = Keyword.intern(null, "params");
+static final Keyword INSTRUMENT_LOCAL_KEY = Keyword.intern(null, "local");
+static final Keyword INSTRUMENT_LOCALS_KEY = Keyword.intern(null, "locals");
 
 // The kinds of warning the compiler prints while it analyses a form, as the sink is
 // told them (IAnalysisSink.warning).
@@ -7292,6 +7301,10 @@ public static class BodyExpr implements Expr, MaybePrimitiveExpr{
 public static class BindingInit{
 	LocalBinding binding;
 	Expr init;
+	// where the local is a site of code compiled to be stepped through - see
+	// INSTRUMENT's :locals - the hook told its value, and the site's number
+	Var hook;
+	long site;
 
 	public final LocalBinding binding(){
 		return binding;
@@ -7524,6 +7537,7 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 								}
 							LocalBinding lb = registerLocal(sym, tagOf(sym), init,false);
 							BindingInit bi = new BindingInit(lb, init);
+							instrumentLocal(bi, sym);
 							bindingInits = bindingInits.cons(bi);
 							if(isLoop)
 								loopLocals = loopLocals.cons(lb);
@@ -7590,15 +7604,33 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 	}
 
 
+	// Whether the local of BI is stored, rather than its init evaluated for
+	// nothing: one unused, that can be cleared.
+	static boolean isKept(BindingInit bi){
+		return maybePrimitiveType(bi.init) != null || bi.binding.used || !bi.binding.canBeCleared;
+	}
+
 	public void doEmit(C context, ObjExpr objx, GeneratorAdapter gen, boolean emitUnboxed){
 		HashMap<BindingInit, Label> bindingLabels = new HashMap();
 		for(int i = 0; i < bindingInits.count(); i++)
 			{
 			BindingInit bi = (BindingInit) bindingInits.nth(i);
 			Class primc = maybePrimitiveType(bi.init);
+			// a loop's local is told at the top of each time round, below -
+			// where it is kept
+			boolean tell = bi.hook != null && !(isLoop && isKept(bi));
 			if(primc != null)
 				{
 				((MaybePrimitiveExpr) bi.init).emitUnboxed(C.EXPRESSION, objx, gen);
+				if(tell)
+					{
+					if(primc == long.class || primc == double.class)
+						gen.dup2();
+					else
+						gen.dup();
+					HostExpr.emitBoxReturn(objx, gen, primc);
+					emitHookCall(objx, gen, bi.hook, bi.site, true);
+					}
 				gen.visitVarInsn(Type.getType(primc).getOpcode(Opcodes.ISTORE), bi.binding.idx);
 				}
 			else
@@ -7606,8 +7638,13 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 				Class bindingClass = HostExpr.maybeClass(bi.binding.tag, true);
 				if(!FISupport.maybeEmitFIAdapter(objx, gen, bi.init, bindingClass))
 					bi.init.emit(C.EXPRESSION, objx, gen);
+				if(tell)
+					{
+					gen.dup();
+					emitHookCall(objx, gen, bi.hook, bi.site, true);
+					}
 
-				if (!bi.binding.used && bi.binding.canBeCleared)
+				if (!isKept(bi))
 					gen.pop();
 				else
 					gen.visitVarInsn(OBJECT_TYPE.getOpcode(Opcodes.ISTORE), bi.binding.idx);
@@ -7615,6 +7652,22 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 			bindingLabels.put(bi, gen.mark());
 			}
 		Label loopLabel = gen.mark();
+		if(isLoop)
+			for(int i = 0; i < bindingInits.count(); i++)
+				{
+				BindingInit bi = (BindingInit) bindingInits.nth(i);
+				if(bi.hook == null || !isKept(bi))
+					continue;
+				Class primc = maybePrimitiveType(bi.init);
+				if(primc != null)
+					{
+					gen.visitVarInsn(Type.getType(primc).getOpcode(Opcodes.ILOAD), bi.binding.idx);
+					HostExpr.emitBoxReturn(objx, gen, primc);
+					}
+				else
+					gen.visitVarInsn(OBJECT_TYPE.getOpcode(Opcodes.ILOAD), bi.binding.idx);
+				emitHookCall(objx, gen, bi.hook, bi.site, true);
+				}
 		if(isLoop)
 			{
 			try
@@ -7708,6 +7761,20 @@ static Expr instrumentEntry(FnMethod method, ISeq form, Expr body, boolean outer
 	       : new EnterExpr(body, enter, ((Number) id).longValue(), method.argLocals);
 }
 
+// The binding BI of a let or a loop, to SYM, made a site of its own where the
+// code is compiled to be stepped through with its :locals - see INSTRUMENT.
+static void instrumentLocal(BindingInit bi, Symbol sym){
+	IPersistentMap ins = (IPersistentMap) INSTRUMENT.deref();
+	if(ins == null || !RT.booleanCast(ins.valAt(INSTRUMENT_LOCALS_KEY)))
+		return;
+	Object id = instrumentSite(ins, INSTRUMENT_LOCAL_KEY, sym, false, null);
+	if(id == null)
+		return;
+	bi.hook = (Var) ins.valAt(INSTRUMENT_HOOK_KEY);
+	bi.site = ((Number) id).longValue();
+	registerVar(bi.hook);
+}
+
 // Whether METHOD is inside no fn compiled to be stepped through: the fn the
 // source is about, rather than one written inside it.
 static boolean isOutermostInstrumented(FnMethod method){
@@ -7720,11 +7787,11 @@ static boolean isOutermostInstrumented(FnMethod method){
 // The number of the site of FORM, from the :site function - or nil, where it
 // says there is none. A form written in the source is one read with its span:
 // one a macro made has no end, and is not a site of its own.
-static Object instrumentSite(IPersistentMap ins, Keyword kind, ISeq form, boolean outermost, Object params){
+static Object instrumentSite(IPersistentMap ins, Keyword kind, Object form, boolean outermost, Object params){
 	IPersistentMap m = RT.meta(form);
 	boolean written = m != null && m.valAt(RT.LINE_KEY) instanceof Number
 	                  && m.valAt(LispReader.END_LINE_KEY) instanceof Number;
-	if(!written && kind == INSTRUMENT_VALUE_KEY)
+	if(!written && kind != INSTRUMENT_ENTER_KEY)
 		return null;
 	IPersistentMap site = RT.map(INSTRUMENT_KIND_KEY, kind,
 	                             INSTRUMENT_FORM_KEY, form,

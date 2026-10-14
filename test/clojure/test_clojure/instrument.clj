@@ -18,7 +18,7 @@
   (:import [clojure.lang Compiler LineNumberingPushbackReader]))
 
 (declare inst-f inst-t inst-m inst-p inst-c inst-r inst-s inst-n
-         inst-a inst-q inst-k inst-kp inst-l)
+         inst-a inst-q inst-k inst-kp inst-l inst-lc inst-lu)
 
 (def ^:private sites (atom {}))
 (def ^:private told (atom []))
@@ -44,11 +44,13 @@
 
 (defn- instrumented-eval
   "Evaluate the code S, compiled to be stepped through - telling `enter' the
-  args of the fns it enters, WITH-ARGS."
-  [s & {:keys [with-args]}]
+  args of the fns it enters, WITH-ARGS, and the hook what its LOCALS are
+  bound to."
+  [s & {:keys [with-args locals]}]
   (let [form (read-with-positions s)]
     (with-bindings {Compiler/INSTRUMENT (cond-> {:site site :hook #'hook}
-                                          with-args (assoc :enter #'enter))}
+                                          with-args (assoc :enter #'enter)
+                                          locals (assoc :locals true))}
       (binding [*ns* (the-ns 'clojure.test-clojure.instrument)]
         (eval form)))))
 
@@ -187,3 +189,40 @@
 (deftest a-form-evaluated-at-the-top-is-entered-with-no-args
   (is (= [:enter true []]
          (first (second (told-of #(instrumented-eval "(inc 1)" :with-args true)))))))
+
+(deftest a-local-says-what-it-is-bound-to
+  (instrumented-eval "(defn inst-lc [m xs]
+                        (let [{:keys [a]} m
+                              n (count xs)]
+                          (doseq [x xs] (inc x))
+                          (loop [i 0 acc []]
+                            (if (< i 2) (recur (inc i) (conj acc i)) acc))
+                          (dotimes [j 2] j)
+                          (+ a n)))"
+                     :locals true)
+  (let [[v said] (told-of #(inst-lc {:a 1} [10 20]))
+        locals (filter (fn [[text]] (contains? #{"a" "n" "x" "i" "acc" "j"} text)) said)]
+    (is (= 3 v))
+    (testing "a let's once, a destructured name too, and a loop's at the top of each time round, the last one too"
+      (is (= [["a" 1] ["n" 2] ["x" 10] ["x" 20]
+              ["i" 0] ["acc" []] ["i" 1] ["acc" [0]] ["i" 2] ["acc" [0 1]]
+              ["j" 0] ["j" 1] ["j" 2]]
+             locals)))
+    (testing "a local site is the name, with its span"
+      (is (every? #(and (= :local (:kind %)) (:line %) (:end-column %))
+                  (filter #(#{"a" "n" "x" "i" "acc" "j"} (:text %)) (vals @sites)))))
+    (testing "and nothing a macro named is one"
+      (is (every? #(#{"a" "n" "x" "i" "acc" "j"} (:text %))
+                  (filter #(= :local (:kind %)) (vals @sites)))))))
+
+(deftest a-local-is-said-whatever-it-is
+  (instrumented-eval "(defn inst-lu ^long [^long k]
+                        (let [p (* k 2)
+                              d (double k)
+                              unused (inc k)]
+                          (loop [q 0.5] (if (< q 1.0) (recur (+ q 0.5)) (+ p (long q))))))"
+                     :locals true)
+  (let [[v said] (told-of #(inst-lu 3))]
+    (is (= 7 v))
+    (is (= [["p" 6] ["d" 3.0] ["unused" 4] ["q" 0.5] ["q" 1.0]]
+           (filter (fn [[text]] (contains? #{"p" "d" "unused" "q"} text)) said)))))
