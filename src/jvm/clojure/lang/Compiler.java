@@ -368,7 +368,9 @@ static final public Var RECORD_POSITIONS = Var.create(null).setDynamic();
 //         - answering a number naming it, or nil for no site there
 //  :hook  a Var whose function the compiled code calls: (f id value) once a form
 //         has its value, and (f id) once a fn is entered - unless there is an
-//         :enter. What it answers is ignored.
+//         :enter. What it answers is ignored. Its function is read once at
+//         the start of each call of a fn, for every site in it - a Var set to
+//         another function during a call is told from the next one on.
 //  :enter optional, a Var whose function the compiled code calls once a fn is
 //         entered, with what it was called with: (f id args), ARGS a vector of
 //         the value of each param, the rest param's last.
@@ -6445,6 +6447,20 @@ public static class FnMethod extends ObjMethod{
 	// The local the call an EnterExpr was told is kept in, to say it is over -
 	// see INSTRUMENT's :exit - or -1
 	int callLocal = -1;
+	// The local the function of the Var HOOK-VAR - INSTRUMENT's :hook - is kept
+	// in from the start of each call, for the sites of the method to call
+	// without reading the Var each - see HookSite - or -1
+	int hookLocal = -1;
+	Var hookVar;
+
+	// Keep the function of the hook in its local, where there is one: read
+	// once a call, a recur to the top keeping it.
+	void emitHookKept(ObjExpr fn, GeneratorAdapter gen){
+		if(hookLocal < 0)
+			return;
+		emitRoot(fn, gen, hookVar);
+		gen.visitVarInsn(OBJECT_TYPE.getOpcode(Opcodes.ISTORE), hookLocal);
+	}
 
 	// Say the method was entered, where its body is an EnterExpr, and answer
 	// the body to emit after - before the loop label, which a recur jumps to.
@@ -6614,6 +6630,12 @@ public static class FnMethod extends ObjMethod{
 			if(method.instrumented
 			   && ((IPersistentMap) INSTRUMENT.deref()).valAt(INSTRUMENT_EXIT_KEY) != null)
 				method.callLocal = getAndIncLocalNum();
+			if(method.instrumented)
+				{
+				method.hookVar = (Var) ((IPersistentMap) INSTRUMENT.deref()).valAt(INSTRUMENT_HOOK_KEY);
+				registerVar(method.hookVar);
+				method.hookLocal = getAndIncLocalNum();
+				}
 			method.body = (new BodyExpr.Parser()).parse(C.RETURN, body);
 			if(!wraps)
 				method.body = instrumentEntry(method, form, method.body, outermost);
@@ -6661,6 +6683,7 @@ public static class FnMethod extends ObjMethod{
 		gen.visitCode();
 		// said once a call, rather than again on each recur to the top
 		Label start = gen.mark();
+		emitHookKept(objx, gen);
 		Expr body = emitEntered(objx, gen);
 		Label loopLabel = gen.mark();
 		gen.visitLineNumber(line, loopLabel);
@@ -6772,6 +6795,7 @@ public static class FnMethod extends ObjMethod{
 
 		// said once a call, rather than again on each recur to the top
 		Label start = gen.mark();
+		emitHookKept(objx, gen);
 		Expr body = emitEntered(objx, gen);
 		Label loopLabel = gen.mark();
 		gen.visitLineNumber(line, loopLabel);
@@ -6841,6 +6865,7 @@ public static class FnMethod extends ObjMethod{
 
 		// said once a call, rather than again on each recur to the top
 		Label start = gen.mark();
+		emitHookKept(fn, gen);
 		Expr body = emitEntered(fn, gen);
 		Label loopLabel = gen.mark();
 		gen.visitLineNumber(line, loopLabel);
@@ -7349,9 +7374,8 @@ public static class BindingInit{
 	LocalBinding binding;
 	Expr init;
 	// where the local is a site of code compiled to be stepped through - see
-	// INSTRUMENT's :locals - the hook told its value, and the site's number
-	Var hook;
-	long site;
+	// INSTRUMENT's :locals - the hook told its value
+	HookSite hook;
 
 	public final LocalBinding binding(){
 		return binding;
@@ -7676,7 +7700,7 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 					else
 						gen.dup();
 					HostExpr.emitBoxReturn(objx, gen, primc);
-					emitHookCall(objx, gen, bi.hook, bi.site, true);
+					emitHookCall(objx, gen, bi.hook, true);
 					}
 				gen.visitVarInsn(Type.getType(primc).getOpcode(Opcodes.ISTORE), bi.binding.idx);
 				}
@@ -7688,7 +7712,7 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 				if(tell)
 					{
 					gen.dup();
-					emitHookCall(objx, gen, bi.hook, bi.site, true);
+					emitHookCall(objx, gen, bi.hook, true);
 					}
 
 				if (!isKept(bi))
@@ -7713,7 +7737,7 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 					}
 				else
 					gen.visitVarInsn(OBJECT_TYPE.getOpcode(Opcodes.ILOAD), bi.binding.idx);
-				emitHookCall(objx, gen, bi.hook, bi.site, true);
+				emitHookCall(objx, gen, bi.hook, true);
 				}
 		if(isLoop)
 			{
@@ -7792,7 +7816,7 @@ static Expr instrumentValue(ISeq form, Expr e){
 	       && ((FnExpr) ((InvokeExpr) e).fexpr).wraps))
 		return e;
 	Object id = instrumentSite(ins, INSTRUMENT_VALUE_KEY, form, false, null);
-	return id == null ? e : new StepExpr(e, (Var) ins.valAt(INSTRUMENT_HOOK_KEY), ((Number) id).longValue());
+	return id == null ? e : new StepExpr(e, new HookSite((Var) ins.valAt(INSTRUMENT_HOOK_KEY), id));
 }
 
 // The body of the fn method METHOD, read from FORM, saying it was entered
@@ -7808,8 +7832,8 @@ static Expr instrumentEntry(FnMethod method, ISeq form, Expr body, boolean outer
 	Var enter = (Var) ins.valAt(INSTRUMENT_ENTER_KEY);
 	Var exit = method.callLocal < 0 ? null : (Var) ins.valAt(INSTRUMENT_EXIT_KEY);
 	return enter == null
-	       ? new EnterExpr(body, (Var) ins.valAt(INSTRUMENT_HOOK_KEY), ((Number) id).longValue(), null, exit)
-	       : new EnterExpr(body, enter, ((Number) id).longValue(), method.argLocals, exit);
+	       ? new EnterExpr(body, new HookSite((Var) ins.valAt(INSTRUMENT_HOOK_KEY), id), null, exit)
+	       : new EnterExpr(body, new HookSite(enter, id), method.argLocals, exit);
 }
 
 // The binding BI of a let or a loop, to SYM, made a site of its own where the
@@ -7821,9 +7845,7 @@ static void instrumentLocal(BindingInit bi, Symbol sym){
 	Object id = instrumentSite(ins, INSTRUMENT_LOCAL_KEY, sym, false, null);
 	if(id == null)
 		return;
-	bi.hook = (Var) ins.valAt(INSTRUMENT_HOOK_KEY);
-	bi.site = ((Number) id).longValue();
-	registerVar(bi.hook);
+	bi.hook = new HookSite((Var) ins.valAt(INSTRUMENT_HOOK_KEY), id);
 }
 
 // Whether METHOD is inside no fn compiled to be stepped through: the fn the
@@ -7857,22 +7879,68 @@ static Object instrumentSite(IPersistentMap ins, Keyword kind, Object form, bool
 	return ((IFn) ins.valAt(INSTRUMENT_SITE_KEY)).invoke(site);
 }
 
-// Calls the function of HOOK with ID and, WITH-VALUE, what is on top of the
-// stack, which it takes: [v] -> []. The root of the Var rather than the Var,
-// so that no frame of Var's is between the code and the hook.
-static void emitHookCall(ObjExpr objx, GeneratorAdapter gen, Var hook, long id, boolean withValue){
-	emitHookCall(objx, gen, hook, id, withValue, -1);
+// A site of code compiled to be stepped through: the Var whose function is
+// told about it, and its number - boxed once, a constant of the class, rather
+// than a Long made at every call past the ones Long caches. And the fn method
+// it is in, where it is one, which keeps the function of its hook in a local
+// from the start of each call - see FnMethod.hookLocal - rather than reading
+// the Var at every site.
+static class HookSite{
+	final Var hook;
+	final long id;
+	final int idConstant;
+	final FnMethod method;
+
+	HookSite(Var hook, Object id){
+		this.hook = hook;
+		this.id = ((Number) id).longValue();
+		registerVar(hook);
+		this.idConstant = registerConstant(Long.valueOf(this.id));
+		Object m = METHOD.deref();
+		this.method = m instanceof FnMethod ? (FnMethod) m : null;
+	}
+
+	// The function of the hook, on the stack: [] -> [fn]
+	void emitHook(ObjExpr objx, GeneratorAdapter gen){
+		if(method != null && method.hookLocal >= 0 && method.hookVar == hook)
+			gen.visitVarInsn(OBJECT_TYPE.getOpcode(Opcodes.ILOAD), method.hookLocal);
+		else
+			emitRoot(objx, gen, hook);
+	}
+
+	// The number, boxed: [] -> [id]
+	void emitId(ObjExpr objx, GeneratorAdapter gen){
+		if(idConstant >= 0)
+			objx.emitConstant(gen, idConstant);
+		else
+			{
+			gen.push(id);
+			gen.valueOf(Type.LONG_TYPE);
+			}
+	}
+}
+
+// The function of the Var V, on the stack: [] -> [fn]. The root of the Var
+// rather than the Var, so that no frame of Var's is between the code and the
+// hook.
+static void emitRoot(ObjExpr objx, GeneratorAdapter gen, Var v){
+	objx.emitVar(gen, v);
+	gen.invokeVirtual(VAR_TYPE, ObjExpr.varGetRawMethod);
+	gen.checkCast(IFN_TYPE);
+}
+
+// Calls the function of the hook of SITE with its number and, WITH-VALUE, what
+// is on top of the stack, which it takes: [v] -> [].
+static void emitHookCall(ObjExpr objx, GeneratorAdapter gen, HookSite site, boolean withValue){
+	emitHookCall(objx, gen, site, withValue, -1);
 }
 
 // The same, keeping what the hook answers in the local KEEP, where it is one.
-static void emitHookCall(ObjExpr objx, GeneratorAdapter gen, Var hook, long id, boolean withValue, int keep){
-	objx.emitVar(gen, hook);
-	gen.invokeVirtual(VAR_TYPE, ObjExpr.varGetRawMethod);
-	gen.checkCast(IFN_TYPE);
+static void emitHookCall(ObjExpr objx, GeneratorAdapter gen, HookSite site, boolean withValue, int keep){
+	site.emitHook(objx, gen);
 	if(withValue)
 		gen.swap();                                   // [fn v]
-	gen.push(id);
-	gen.valueOf(Type.LONG_TYPE);                      // [fn v id]
+	site.emitId(objx, gen);                           // [fn v id]
 	if(withValue)
 		{
 		gen.swap();                                   // [fn id v]
@@ -7888,19 +7956,16 @@ static void emitHookCall(ObjExpr objx, GeneratorAdapter gen, Var hook, long id, 
 
 static class StepExpr implements Expr, MaybePrimitiveExpr{
 	final Expr expr;
-	final Var hook;
-	final long id;
+	final HookSite site;
 
-	StepExpr(Expr expr, Var hook, long id){
+	StepExpr(Expr expr, HookSite site){
 		this.expr = expr;
-		this.hook = hook;
-		this.id = id;
-		registerVar(hook);
+		this.site = site;
 	}
 
 	public Object eval() {
 		Object v = expr.eval();
-		((IFn) hook.getRawRoot()).invoke(id, v);
+		((IFn) site.hook.getRawRoot()).invoke(site.id, v);
 		return v;
 	}
 
@@ -7908,7 +7973,7 @@ static class StepExpr implements Expr, MaybePrimitiveExpr{
 		// In a statement the form leaves nothing, and its value is wanted here
 		expr.emit(context == C.STATEMENT ? C.EXPRESSION : context, objx, gen);
 		gen.dup();
-		emitHookCall(objx, gen, hook, id, true);
+		emitHookCall(objx, gen, site, true);
 		if(context == C.STATEMENT)
 			gen.pop();
 	}
@@ -7925,7 +7990,7 @@ static class StepExpr implements Expr, MaybePrimitiveExpr{
 		else
 			gen.dup();
 		HostExpr.emitBoxReturn(objx, gen, c);
-		emitHookCall(objx, gen, hook, id, true);
+		emitHookCall(objx, gen, site, true);
 	}
 
 	public boolean hasJavaClass() {
@@ -7946,18 +8011,15 @@ static class StepExpr implements Expr, MaybePrimitiveExpr{
 // FnMethod.emitExited.
 static class EnterExpr implements Expr, MaybePrimitiveExpr{
 	final Expr body;
-	final Var hook;
-	final long id;
+	final HookSite site;
 	final IPersistentVector args;
 	final Var exit;
 
-	EnterExpr(Expr body, Var hook, long id, IPersistentVector args, Var exit){
+	EnterExpr(Expr body, HookSite site, IPersistentVector args, Var exit){
 		this.body = body;
-		this.hook = hook;
-		this.id = id;
+		this.site = site;
 		this.args = args;
 		this.exit = exit;
-		registerVar(hook);
 		if(exit != null)
 			registerVar(exit);
 	}
@@ -7965,9 +8027,9 @@ static class EnterExpr implements Expr, MaybePrimitiveExpr{
 	public Object eval() {
 		// a fn's body is emitted, never evaluated: there are no args here
 		if(args == null)
-			((IFn) hook.getRawRoot()).invoke(id);
+			((IFn) site.hook.getRawRoot()).invoke(site.id);
 		else
-			((IFn) hook.getRawRoot()).invoke(id, PersistentVector.EMPTY);
+			((IFn) site.hook.getRawRoot()).invoke(site.id, PersistentVector.EMPTY);
 		return body.eval();
 	}
 
@@ -7982,7 +8044,7 @@ static class EnterExpr implements Expr, MaybePrimitiveExpr{
 		int keep = exit == null ? -1 : call;
 		if(args == null)
 			{
-			emitHookCall(objx, gen, hook, id, false, keep);
+			emitHookCall(objx, gen, site, false, keep);
 			return;
 			}
 		gen.push(args.count());
@@ -7995,15 +8057,13 @@ static class EnterExpr implements Expr, MaybePrimitiveExpr{
 			gen.arrayStore(OBJECT_TYPE);
 			}
 		gen.invokeStatic(RT_TYPE, VectorExpr.vectorMethod);
-		emitHookCall(objx, gen, hook, id, true, keep);
+		emitHookCall(objx, gen, site, true, keep);
 	}
 
 	// Tell the exit the call kept in the local CALL is over, leaving the stack
 	// as it was.
 	void emitExit(ObjExpr objx, GeneratorAdapter gen, int call){
-		objx.emitVar(gen, exit);
-		gen.invokeVirtual(VAR_TYPE, ObjExpr.varGetRawMethod);
-		gen.checkCast(IFN_TYPE);
+		emitRoot(objx, gen, exit);
 		gen.visitVarInsn(OBJECT_TYPE.getOpcode(Opcodes.ILOAD), call);
 		gen.invokeInterface(IFN_TYPE, new Method("invoke", OBJECT_TYPE, new Type[]{OBJECT_TYPE}));
 		gen.pop();

@@ -19,7 +19,7 @@
 
 (declare inst-f inst-t inst-m inst-p inst-c inst-r inst-s inst-n
          inst-a inst-q inst-k inst-kp inst-l inst-lc inst-lu inst-ld inst-w inst-wf
-         inst-d inst-df inst-x1 inst-x2 inst-x3 inst-x4 inst-x5 inst-x6 inst-x7)
+         inst-d inst-df inst-b inst-h inst-x1 inst-x2 inst-x3 inst-x4 inst-x5 inst-x6 inst-x7)
 
 (def ^:private sites (atom {}))
 (def ^:private told (atom []))
@@ -49,6 +49,26 @@
   [n]
   (swap! told conj [:exit n]))
 
+;; What the hook was told by number - the very objects
+(def ^:private ids (atom []))
+
+(defn id-hook
+  "A hook keeping the numbers it is told, as they are."
+  ([id] (swap! ids conj id))
+  ([id v] (swap! ids conj id)))
+
+(declare switching)
+
+(defn- switched [id & _] (swap! told conj [:switched id]))
+
+(defn- switching-first
+  "A hook that, told anything, has the Var it is the function of hold another."
+  [id & _]
+  (swap! told conj [:first id])
+  (alter-var-root #'switching (constantly switched)))
+
+(def switching switching-first)
+
 (defn- site [{:keys [form] :as s}]
   (let [id (count @sites)]
     (swap! sites assoc id (assoc (dissoc s :form) :text (pr-str form)))
@@ -62,9 +82,9 @@
   "Evaluate the code S, compiled to be stepped through - telling `enter' the
   args of the fns it enters, WITH-ARGS, and the hook what its LOCALS are
   bound to."
-  [s & {:keys [with-args locals with-exit]}]
+  [s & {:keys [with-args locals with-exit] the-hook :hook :or {the-hook #'hook}}]
   (let [form (read-with-positions s)]
-    (with-bindings {Compiler/INSTRUMENT (cond-> {:site site :hook #'hook}
+    (with-bindings {Compiler/INSTRUMENT (cond-> {:site site :hook the-hook}
                                           with-args (assoc :enter #'enter)
                                           locals (assoc :locals true)
                                           with-exit (assoc :enter #'enter-call :exit #'exit))}
@@ -313,3 +333,25 @@
   (testing "a definition's own"
     (instrumented-eval "(defn inst-x7 ([] (inst-x7 1)) ([x] (* 2 x)))" :with-exit true)
     (is (= [2 [[:enter 10] [:enter 11] [:exit 11] [:exit 10]]] (calls-told inst-x7)))))
+
+(deftest a-site-number-is-boxed-once
+  ;; past the numbers Long caches
+  (reset! sites (zipmap (range 200) (repeat {})))
+  (reset! ids [])
+  (instrumented-eval "(defn inst-b [x] (inc x))" :hook #'id-hook)
+  (inst-b 1)
+  (inst-b 2)
+  (let [[a b :as all] (partition 2 @ids)]
+    (is (= 2 (count all)))
+    (is (every? #(> % 127) (apply concat all)))
+    (is (every? true? (map identical? a b)))))
+
+(deftest the-hook-is-read-once-a-call
+  (alter-var-root #'switching (constantly switching-first))
+  (instrumented-eval "(defn inst-h [x] (inc (inc x)))" :hook #'switching)
+  (let [[v said] (told-of #(inst-h 1))]
+    (is (= 3 v))
+    (testing "the function it was when the call started, to its end"
+      (is (= [:first :first :first] (map first said)))))
+  (testing "and the one it is when the next starts"
+    (is (= [:switched :switched :switched] (map first (second (told-of #(inst-h 1))))))))
