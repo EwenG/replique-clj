@@ -18,7 +18,8 @@
   (:import [clojure.lang Compiler LineNumberingPushbackReader]))
 
 (declare inst-f inst-t inst-m inst-p inst-c inst-r inst-s inst-n
-         inst-a inst-q inst-k inst-kp inst-l inst-lc inst-lu)
+         inst-a inst-q inst-k inst-kp inst-l inst-lc inst-lu inst-ld inst-w inst-wf
+         inst-d inst-df)
 
 (def ^:private sites (atom {}))
 (def ^:private told (atom []))
@@ -226,3 +227,36 @@
     (is (= 7 v))
     (is (= [["p" 6] ["d" 3.0] ["unused" 4] ["q" 0.5] ["q" 1.0]]
            (filter (fn [[text]] (contains? #{"p" "d" "unused" "q"} text)) said)))))
+
+(defn- load-with-positions
+  "Load the code S, read with positions on - as a file a form requires."
+  [s]
+  (with-bindings {Compiler/RECORD_POSITIONS true}
+    (load-string s)))
+
+(deftest a-file-loaded-is-not-the-form-that-loads-it
+  (instrumented-eval "(load-with-positions \"(defn inst-ld [x] (inc x))\")")
+  (is (= [2 []] (told-of #(inst-ld 1))))
+  ;; the sites of the form that loads it only
+  (is (every? #(re-find #"^\(\[\] \(load-with-positions|^\(load-with-positions" (:text %))
+              (vals @sites))))
+
+(deftest the-fn-a-try-as-a-value-is-wrapped-in-is-not-entered
+  (instrumented-eval "(defn inst-w [n] (let [v (try (inc n) (catch Exception e 2))] v))")
+  (is (= [2 [[:enter true]
+             ["(inc n)" 2]
+             ["(try (inc n) (catch Exception e 2))" 2]
+             ["(let [v (try (inc n) (catch Exception e 2))] v)" 2]]]
+         (told-of #(inst-w 1))))
+  (is (= 1 (count (filter #(= :enter (:kind %)) (vals @sites)))))
+  (testing "and a fn inside it is still inside the fn around it"
+    (instrumented-eval "(defn inst-wf [] (let [f (try (fn [x] x))] (f 1)))")
+    (is (= [[:enter true] [:enter false]]
+           (filter #(= :enter (first %)) (second (told-of inst-wf))))))
+  (testing "nor is it a definition's call"
+    (let [[_ said] (told-of #(instrumented-eval "(def inst-d (try (inc 1) (catch Exception e 0)))"))]
+      (is (= 2 inst-d))
+      (is (= [["(inc 1)" 2] ["(try (inc 1) (catch Exception e 0))" 2]] said)))
+    (testing "whose fn, there, is the outermost"
+      (instrumented-eval "(def inst-df (loop [] (fn [x] (inc x))))")
+      (is (= [2 [[:enter true] ["(inc x)" 2]]] (told-of #(inst-df 1)))))))

@@ -51,6 +51,11 @@ static final Symbol LETFN = Symbol.intern("letfn*");
 static final Symbol DO = Symbol.intern("do");
 static final Symbol FN = Symbol.intern("fn*");
 static final Symbol FNONCE = (Symbol) Symbol.intern("fn*").withMeta(RT.map(Keyword.intern(null, "once"), RT.T));
+// The fn* of the fn the compiler wraps a form in, to have it where it can only
+// compile it in a method of its own: a try or a loop as a value, a let, a letfn,
+// a throw or a case* evaluated on its own. Not a fn the source is about - see
+// INSTRUMENT - and told by being this one.
+static final Symbol FNWRAP = (Symbol) Symbol.intern("fn*").withMeta(RT.map(Keyword.intern(null, "once"), RT.T));
 static final Symbol QUOTE = Symbol.intern("quote");
 static final Symbol THE_VAR = Symbol.intern("var");
 static final Symbol DOT = Symbol.intern(".");
@@ -374,7 +379,9 @@ static final public Var RECORD_POSITIONS = Var.create(null).setDynamic();
 //         only, read with their span, which is what a macro binding one the
 //         source wrote binds: the element of a doseq or a for, a name a
 //         destructuring binds.
-//A fn is entered once a call: a recur to its top is not another entry.
+//A fn is entered once a call: a recur to its top is not another entry. The fn
+//the compiler wraps a form in - a try as a value - is not one the source wrote,
+//and has no entry: what is inside it is the fn's around it.
 //Positions come from the reader, so the code has to have been read with
 //RECORD_POSITIONS on. Nil, the default, compiles what it always has.
 static final public Var INSTRUMENT = Var.create(null).setDynamic();
@@ -3278,7 +3285,7 @@ public static class TryExpr implements Expr{
 			ISeq form = (ISeq) frm;
 //			if(context == C.EVAL || context == C.EXPRESSION)
 			if(context != C.RETURN)
-				return analyze(context, RT.list(RT.list(FNONCE, PersistentVector.EMPTY, form)));
+				return analyze(context, RT.list(RT.list(FNWRAP, PersistentVector.EMPTY, form)));
 
 			//(try try-expr* catch-expr* finally-expr?)
 			//catch-expr: (catch class sym expr*)
@@ -3459,7 +3466,7 @@ static class ThrowExpr extends UntypedExpr{
 	static class Parser implements IParser{
 		public Expr parse(C context, Object form) {
 			if(context == C.EVAL)
-				return analyze(context, RT.list(RT.list(FNONCE, PersistentVector.EMPTY, form)));
+				return analyze(context, RT.list(RT.list(FNWRAP, PersistentVector.EMPTY, form)));
 			else if(RT.count(form) == 1)
 				throw Util.runtimeException("Too few arguments to throw, throw expects a single Throwable instance");
 			else if(RT.count(form) > 2)
@@ -4981,6 +4988,8 @@ static public class FnExpr extends ObjExpr{
 	private boolean hasPrimSigs;
 	private boolean hasMeta;
     private boolean hasEnclosingMethod;
+	// Whether the compiler wrapped a form in it - see FNWRAP
+	boolean wraps = false;
 	//	String superName = null;
     Class jc;
 
@@ -5032,6 +5041,7 @@ static public class FnExpr extends ObjExpr{
 		fn.src = form;
 		ObjMethod enclosingMethod = (ObjMethod) METHOD.deref();
         fn.hasEnclosingMethod = enclosingMethod != null;
+		fn.wraps = form.first() == FNWRAP;
 		if(((IMeta) form.first()).meta() != null)
 			{
 			fn.onceOnly = RT.booleanCast(RT.get(RT.meta(form.first()), Keyword.intern(null, "once")));
@@ -6568,11 +6578,15 @@ public static class FnMethod extends ObjMethod{
 						getAndIncLocalNum();
 					}
 				}
-			// before the body, whose fns are inside this one
+			// before the body, whose fns are inside this one. The fn the compiler
+			// wrapped a form in is not entered: what is inside it is the call's
+			// it is in, and a fn inside it is as outermost as it would have been
 			boolean outermost = isOutermostInstrumented(method);
-			method.instrumented = INSTRUMENT.deref() != null;
+			boolean wraps = objx instanceof FnExpr && ((FnExpr) objx).wraps;
+			method.instrumented = INSTRUMENT.deref() != null && !wraps;
 			method.body = (new BodyExpr.Parser()).parse(C.RETURN, body);
-			method.body = instrumentEntry(method, form, method.body, outermost);
+			if(!wraps)
+				method.body = instrumentEntry(method, form, method.body, outermost);
 			return method;
 			}
 		finally
@@ -7343,7 +7357,7 @@ public static class LetFnExpr implements Expr{
 			ISeq body = RT.next(RT.next(form));
 
 			if(context == C.EVAL)
-				return analyze(context, RT.list(RT.list(FNONCE, PersistentVector.EMPTY, form)));
+				return analyze(context, RT.list(RT.list(FNWRAP, PersistentVector.EMPTY, form)));
 
 			IPersistentMap dynamicBindings = RT.map(LOCAL_ENV, LOCAL_ENV.deref(),
 			                                        NEXT_LOCAL_NUM, NEXT_LOCAL_NUM.deref());
@@ -7472,7 +7486,7 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 
 			if(context == C.EVAL
 			   || (context == C.EXPRESSION && isLoop))
-				return analyze(context, RT.list(RT.list(FNONCE, PersistentVector.EMPTY, form)));
+				return analyze(context, RT.list(RT.list(FNWRAP, PersistentVector.EMPTY, form)));
 
 			ObjMethod method = (ObjMethod) METHOD.deref();
 			IPersistentMap backupMethodLocals = method.locals;
@@ -7739,7 +7753,10 @@ static Expr instrumentValue(ISeq form, Expr e){
 	   || e instanceof DefExpr || e instanceof ImportExpr || e instanceof TheVarExpr
 	   || e instanceof MonitorEnterExpr || e instanceof MonitorExitExpr
 	   // a fn carrying the metadata of its form, the span among it
-	   || (e instanceof MetaExpr && ((MetaExpr) e).expr instanceof ObjExpr))
+	   || (e instanceof MetaExpr && ((MetaExpr) e).expr instanceof ObjExpr)
+	   // a form the compiler wrapped in a fn - see FNWRAP - reporting inside it
+	   || (e instanceof InvokeExpr && ((InvokeExpr) e).fexpr instanceof FnExpr
+	       && ((FnExpr) ((InvokeExpr) e).fexpr).wraps))
 		return e;
 	Object id = instrumentSite(ins, INSTRUMENT_VALUE_KEY, form, false, null);
 	return id == null ? e : new StepExpr(e, (Var) ins.valAt(INSTRUMENT_HOOK_KEY), ((Number) id).longValue());
@@ -9122,6 +9139,9 @@ public static Object load(Reader rdr, String sourcePath, String sourceName) {
 					LOOP_LOCALS, null,
 					NEXT_LOCAL_NUM, 0,
 					RT.READEVAL, RT.T,
+			       // a file loaded while a form is compiled to be stepped
+			       // through is not that form
+			       INSTRUMENT, null,
 			       RT.CURRENT_NS, RT.CURRENT_NS.deref(),
 			       LINE_BEFORE, pushbackReader.getLineNumber(),
 			       COLUMN_BEFORE, pushbackReader.getColumnNumber(),
@@ -9322,6 +9342,7 @@ public static Object compile(Reader rdr, String sourcePath, String sourceName) t
 					LOOP_LOCALS, null,
 					NEXT_LOCAL_NUM, 0,
 					RT.READEVAL, RT.T,
+					INSTRUMENT, null,
 					RT.CURRENT_NS, RT.CURRENT_NS.deref(),
 			       LINE_BEFORE, pushbackReader.getLineNumber(),
 			       COLUMN_BEFORE, pushbackReader.getColumnNumber(),
@@ -10589,7 +10610,7 @@ public static class CaseExpr implements Expr, MaybePrimitiveExpr{
 		public Expr parse(C context, Object frm) {
 			ISeq form = (ISeq) frm;
 			if(context == C.EVAL)
-				return analyze(context, RT.list(RT.list(FNONCE, PersistentVector.EMPTY, form)));
+				return analyze(context, RT.list(RT.list(FNWRAP, PersistentVector.EMPTY, form)));
 			IPersistentVector args = LazilyPersistentVector.create(form.next());
 
 			Object exprForm = args.nth(0);
