@@ -372,6 +372,10 @@ static final public Var RECORD_POSITIONS = Var.create(null).setDynamic();
 //  :enter optional, a Var whose function the compiled code calls once a fn is
 //         entered, with what it was called with: (f id args), ARGS a vector of
 //         the value of each param, the rest param's last.
+//  :exit  optional, a Var whose function the compiled code calls once the call
+//         of a fn it said was entered is over, by a return or a throw, from a
+//         finally around the whole method: (f call), CALL what the hook - or
+//         the :enter - answered when it was entered.
 //  :locals optional, true for the locals a let or a loop binds to be sites of
 //         their own too - {:kind :local, :form the name} - each telling the
 //         hook what it is bound to, (f id value): a let's once bound, a
@@ -391,6 +395,7 @@ static final Keyword INSTRUMENT_HOOK_KEY = Keyword.intern(null, "hook");
 static final Keyword INSTRUMENT_KIND_KEY = Keyword.intern(null, "kind");
 static final Keyword INSTRUMENT_VALUE_KEY = Keyword.intern(null, "value");
 static final Keyword INSTRUMENT_ENTER_KEY = Keyword.intern(null, "enter");
+static final Keyword INSTRUMENT_EXIT_KEY = Keyword.intern(null, "exit");
 static final Keyword INSTRUMENT_FORM_KEY = Keyword.intern(null, "form");
 static final Keyword INSTRUMENT_OUTERMOST_KEY = Keyword.intern(null, "outermost");
 static final Keyword INSTRUMENT_PARAMS_KEY = Keyword.intern(null, "params");
@@ -6437,6 +6442,9 @@ public static class FnMethod extends ObjMethod{
 
 	// Whether the body says it was entered - see EnterExpr
 	boolean instrumented = false;
+	// The local the call an EnterExpr was told is kept in, to say it is over -
+	// see INSTRUMENT's :exit - or -1
+	int callLocal = -1;
 
 	// Say the method was entered, where its body is an EnterExpr, and answer
 	// the body to emit after - before the loop label, which a recur jumps to.
@@ -6444,8 +6452,26 @@ public static class FnMethod extends ObjMethod{
 		if(!(body instanceof EnterExpr))
 			return body;
 		gen.visitLineNumber(line, gen.mark());
-		((EnterExpr) body).emitEntered(fn, gen);
+		((EnterExpr) body).emitEntered(fn, gen, callLocal);
 		return ((EnterExpr) body).body;
+	}
+
+	// Say the call is over, where it was said entered and is to exit: the body
+	// emitted from START, its value on the stack, is in a finally that says
+	// so, after the handlers of the trys inside it, which come first.
+	void emitExited(ObjExpr fn, GeneratorAdapter gen, Label start){
+		if(!(body instanceof EnterExpr) || ((EnterExpr) body).exit == null)
+			return;
+		EnterExpr entered = (EnterExpr) body;
+		Label end = gen.mark();
+		entered.emitExit(fn, gen, callLocal);
+		Label after = gen.newLabel();
+		gen.goTo(after);
+		Label thrown = gen.mark();
+		entered.emitExit(fn, gen, callLocal);
+		gen.throwException();
+		gen.visitTryCatchBlock(start, end, thrown, null);
+		gen.mark(after);
 	}
 
 	static FnMethod parse(ObjExpr objx, ISeq form, Object rettag) {
@@ -6584,6 +6610,10 @@ public static class FnMethod extends ObjMethod{
 			boolean outermost = isOutermostInstrumented(method);
 			boolean wraps = objx instanceof FnExpr && ((FnExpr) objx).wraps;
 			method.instrumented = INSTRUMENT.deref() != null && !wraps;
+			// before the body's own locals, which it is kept over
+			if(method.instrumented
+			   && ((IPersistentMap) INSTRUMENT.deref()).valAt(INSTRUMENT_EXIT_KEY) != null)
+				method.callLocal = getAndIncLocalNum();
 			method.body = (new BodyExpr.Parser()).parse(C.RETURN, body);
 			if(!wraps)
 				method.body = instrumentEntry(method, form, method.body, outermost);
@@ -6638,6 +6668,7 @@ public static class FnMethod extends ObjMethod{
 			{
 			Var.pushThreadBindings(RT.map(LOOP_LABEL, loopLabel, METHOD, this));
 			emitBody(objx, gen, retClass, body);
+			emitExited(objx, gen, loopLabel);
 
 			Label end = gen.mark();
 			for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next())
@@ -6748,6 +6779,7 @@ public static class FnMethod extends ObjMethod{
 			{
 			Var.pushThreadBindings(RT.map(LOOP_LABEL, loopLabel, METHOD, this));
 			emitBody(objx, gen, retClass, body);
+			emitExited(objx, gen, loopLabel);
 
 			Label end = gen.mark();
 			gen.visitLocalVariable("this", "Ljava/lang/Object;", null, start, end, 0);
@@ -6817,6 +6849,7 @@ public static class FnMethod extends ObjMethod{
 			Var.pushThreadBindings(RT.map(LOOP_LABEL, loopLabel, METHOD, this));
 
 			body.emit(C.RETURN, fn, gen);
+			emitExited(fn, gen, loopLabel);
 			Label end = gen.mark();
 
 			gen.visitLocalVariable("this", "Ljava/lang/Object;", null, start, end, 0);
@@ -7773,9 +7806,10 @@ static Expr instrumentEntry(FnMethod method, ISeq form, Expr body, boolean outer
 	if(id == null)
 		return body;
 	Var enter = (Var) ins.valAt(INSTRUMENT_ENTER_KEY);
+	Var exit = method.callLocal < 0 ? null : (Var) ins.valAt(INSTRUMENT_EXIT_KEY);
 	return enter == null
-	       ? new EnterExpr(body, (Var) ins.valAt(INSTRUMENT_HOOK_KEY), ((Number) id).longValue(), null)
-	       : new EnterExpr(body, enter, ((Number) id).longValue(), method.argLocals);
+	       ? new EnterExpr(body, (Var) ins.valAt(INSTRUMENT_HOOK_KEY), ((Number) id).longValue(), null, exit)
+	       : new EnterExpr(body, enter, ((Number) id).longValue(), method.argLocals, exit);
 }
 
 // The binding BI of a let or a loop, to SYM, made a site of its own where the
@@ -7827,6 +7861,11 @@ static Object instrumentSite(IPersistentMap ins, Keyword kind, Object form, bool
 // stack, which it takes: [v] -> []. The root of the Var rather than the Var,
 // so that no frame of Var's is between the code and the hook.
 static void emitHookCall(ObjExpr objx, GeneratorAdapter gen, Var hook, long id, boolean withValue){
+	emitHookCall(objx, gen, hook, id, withValue, -1);
+}
+
+// The same, keeping what the hook answers in the local KEEP, where it is one.
+static void emitHookCall(ObjExpr objx, GeneratorAdapter gen, Var hook, long id, boolean withValue, int keep){
 	objx.emitVar(gen, hook);
 	gen.invokeVirtual(VAR_TYPE, ObjExpr.varGetRawMethod);
 	gen.checkCast(IFN_TYPE);
@@ -7841,7 +7880,10 @@ static void emitHookCall(ObjExpr objx, GeneratorAdapter gen, Var hook, long id, 
 		}
 	else
 		gen.invokeInterface(IFN_TYPE, new Method("invoke", OBJECT_TYPE, new Type[]{OBJECT_TYPE}));
-	gen.pop();
+	if(keep < 0)
+		gen.pop();
+	else
+		gen.visitVarInsn(OBJECT_TYPE.getOpcode(Opcodes.ISTORE), keep);
 }
 
 static class StepExpr implements Expr, MaybePrimitiveExpr{
@@ -7899,19 +7941,25 @@ static class StepExpr implements Expr, MaybePrimitiveExpr{
 // (f id args) - or (f id), without ARGS, the LocalBindings of its params - and
 // is the body. Emitted by the method before its loop label - see
 // FnMethod.emitEntered - so that a recur to the top of the fn is not another
-// call: it is said once, with what the fn was called with.
+// call: it is said once, with what the fn was called with. With an EXIT, what
+// that answers is the call, which EXIT is told is over - see
+// FnMethod.emitExited.
 static class EnterExpr implements Expr, MaybePrimitiveExpr{
 	final Expr body;
 	final Var hook;
 	final long id;
 	final IPersistentVector args;
+	final Var exit;
 
-	EnterExpr(Expr body, Var hook, long id, IPersistentVector args){
+	EnterExpr(Expr body, Var hook, long id, IPersistentVector args, Var exit){
 		this.body = body;
 		this.hook = hook;
 		this.id = id;
 		this.args = args;
+		this.exit = exit;
 		registerVar(hook);
+		if(exit != null)
+			registerVar(exit);
 	}
 
 	public Object eval() {
@@ -7926,9 +7974,15 @@ static class EnterExpr implements Expr, MaybePrimitiveExpr{
 	// The hook told the fn was entered, before anything of the body ran: no
 	// param was cleared yet, and none is here - the body is what uses them.
 	void emitEntered(ObjExpr objx, GeneratorAdapter gen){
+		emitEntered(objx, gen, -1);
+	}
+
+	// The same, keeping the call in the local CALL, where there is an exit.
+	void emitEntered(ObjExpr objx, GeneratorAdapter gen, int call){
+		int keep = exit == null ? -1 : call;
 		if(args == null)
 			{
-			emitHookCall(objx, gen, hook, id, false);
+			emitHookCall(objx, gen, hook, id, false, keep);
 			return;
 			}
 		gen.push(args.count());
@@ -7941,7 +7995,18 @@ static class EnterExpr implements Expr, MaybePrimitiveExpr{
 			gen.arrayStore(OBJECT_TYPE);
 			}
 		gen.invokeStatic(RT_TYPE, VectorExpr.vectorMethod);
-		emitHookCall(objx, gen, hook, id, true);
+		emitHookCall(objx, gen, hook, id, true, keep);
+	}
+
+	// Tell the exit the call kept in the local CALL is over, leaving the stack
+	// as it was.
+	void emitExit(ObjExpr objx, GeneratorAdapter gen, int call){
+		objx.emitVar(gen, exit);
+		gen.invokeVirtual(VAR_TYPE, ObjExpr.varGetRawMethod);
+		gen.checkCast(IFN_TYPE);
+		gen.visitVarInsn(OBJECT_TYPE.getOpcode(Opcodes.ILOAD), call);
+		gen.invokeInterface(IFN_TYPE, new Method("invoke", OBJECT_TYPE, new Type[]{OBJECT_TYPE}));
+		gen.pop();
 	}
 
 	public void emit(C context, ObjExpr objx, GeneratorAdapter gen){

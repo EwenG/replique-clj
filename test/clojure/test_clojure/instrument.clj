@@ -19,7 +19,7 @@
 
 (declare inst-f inst-t inst-m inst-p inst-c inst-r inst-s inst-n
          inst-a inst-q inst-k inst-kp inst-l inst-lc inst-lu inst-ld inst-w inst-wf
-         inst-d inst-df)
+         inst-d inst-df inst-x1 inst-x2 inst-x3 inst-x4 inst-x5 inst-x6 inst-x7)
 
 (def ^:private sites (atom {}))
 (def ^:private told (atom []))
@@ -34,6 +34,21 @@
   [id args]
   (swap! told conj [:enter (get-in @sites [id :outermost]) args]))
 
+(def ^:private calls (atom 0))
+
+(defn enter-call
+  "What instrumented code calls on entering a fn, when there is an :exit too:
+  the call it answers is the one it is told is over."
+  [id args]
+  (let [n (swap! calls inc)]
+    (swap! told conj [:enter n])
+    n))
+
+(defn exit
+  "What instrumented code calls once a call is over, when there is an :exit."
+  [n]
+  (swap! told conj [:exit n]))
+
 (defn- site [{:keys [form] :as s}]
   (let [id (count @sites)]
     (swap! sites assoc id (assoc (dissoc s :form) :text (pr-str form)))
@@ -47,11 +62,12 @@
   "Evaluate the code S, compiled to be stepped through - telling `enter' the
   args of the fns it enters, WITH-ARGS, and the hook what its LOCALS are
   bound to."
-  [s & {:keys [with-args locals]}]
+  [s & {:keys [with-args locals with-exit]}]
   (let [form (read-with-positions s)]
     (with-bindings {Compiler/INSTRUMENT (cond-> {:site site :hook #'hook}
                                           with-args (assoc :enter #'enter)
-                                          locals (assoc :locals true))}
+                                          locals (assoc :locals true)
+                                          with-exit (assoc :enter #'enter-call :exit #'exit))}
       (binding [*ns* (the-ns 'clojure.test-clojure.instrument)]
         (eval form)))))
 
@@ -62,7 +78,7 @@
   (let [v (f)]
     [v @told]))
 
-(use-fixtures :each (fn [t] (reset! sites {}) (reset! told []) (t)))
+(use-fixtures :each (fn [t] (reset! sites {}) (reset! told []) (reset! calls 0) (t)))
 
 (deftest a-form-says-what-it-evaluated-to-in-the-order-it-did
   (instrumented-eval "(defn inst-f [m]
@@ -260,3 +276,40 @@
     (testing "whose fn, there, is the outermost"
       (instrumented-eval "(def inst-df (loop [] (fn [x] (inc x))))")
       (is (= [2 [[:enter true] ["(inc x)" 2]]] (told-of #(inst-df 1)))))))
+
+(defn- calls-told
+  "What running F told of the calls it entered and exited, with what F
+  returned - or what it threw."
+  [f]
+  (reset! told [])
+  (let [v (try (f) (catch Exception e (ex-message e)))]
+    [v (filterv #(#{:enter :exit} (first %)) @told)]))
+
+(deftest a-call-says-it-is-over
+  (instrumented-eval "(defn inst-x1 [x] x)" :with-exit true)
+  (is (= [1 [[:enter 1] [:exit 1]]] (calls-told #(inst-x1 1))) "with no form to have a value")
+  (testing "by a throw too"
+    (instrumented-eval "(defn inst-x2 [x] (inc (throw (ex-info \"no\" {}))))" :with-exit true)
+    (is (= ["no" [[:enter 2] [:exit 2]]] (calls-told #(inst-x2 1)))))
+  (testing "once, a recur to the top being the same call"
+    (instrumented-eval "(defn inst-x3 [n] (if (pos? n) (recur (dec n)) :done))" :with-exit true)
+    (is (= [:done [[:enter 3] [:exit 3]]] (calls-told #(inst-x3 3)))))
+  (testing "after what a try inside it caught"
+    (instrumented-eval "(defn inst-x4 [] (try (inst-x2 1) (catch Exception _ :caught)))" :with-exit true)
+    (is (= [:caught [[:enter 4] [:enter 5] [:exit 5] [:exit 4]]] (calls-told inst-x4)))
+    (is (= "(try (inst-x2 1) (catch Exception _ :caught))" (first (last (butlast @told))))
+        "its value before the call is over"))
+  (testing "taking and returning primitives"
+    (instrumented-eval "(defn inst-x5 ^long [^long x] (inc x))" :with-exit true)
+    (is (= [2 [[:enter 6] [:exit 6]]] (calls-told #(inst-x5 1)))))
+  (testing "before the fn it made is called"
+    (instrumented-eval "(defn inst-x6 [g] (fn [x] (g x)))" :with-exit true)
+    (let [[f said] (calls-told #(inst-x6 inc))]
+      (is (= [[:enter 7] [:exit 7]] said))
+      (is (= [2 [[:enter 8] [:exit 8]]] (calls-told #(f 1))))))
+  (testing "evaluated at the top"
+    (is (= [3 [[:enter 9] [:exit 9]]]
+           (calls-told #(instrumented-eval "(let [a 1] (+ a 2))" :with-exit true)))))
+  (testing "a definition's own"
+    (instrumented-eval "(defn inst-x7 ([] (inst-x7 1)) ([x] (* 2 x)))" :with-exit true)
+    (is (= [2 [[:enter 10] [:enter 11] [:exit 11] [:exit 10]]] (calls-told inst-x7)))))
