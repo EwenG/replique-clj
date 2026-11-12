@@ -143,3 +143,46 @@
 
   ;; now loaded!
   (is (not (nil? (resolve 'alias-now/example)))))
+;; Macro calls are checked against clojure.core.specs where the source is somebody's to
+;; fix, and not in a file read out of a jar - see RT.LOADING_JAR_ENTRY. (require x),
+;; a symbol where :require belongs, is the call to check with: the ns macro accepts it
+;; and the spec does not, which is what broke libraries on 1.9.
+
+(defn- spec-refused? [thunk]
+  (try (thunk) false
+       (catch Throwable t
+         (boolean (some #(re-find #"did not conform to spec" (str (.getMessage ^Throwable %)))
+                        (take-while some? (iterate #(.getCause ^Throwable %) t)))))))
+
+(defn- write-jar [^java.io.File jar entries]
+  (with-open [out (java.util.jar.JarOutputStream. (java.io.FileOutputStream. jar))]
+    (doseq [[path text] entries]
+      (.putNextEntry out (java.util.jar.JarEntry. ^String path))
+      (.write out (.getBytes ^String text "UTF-8"))
+      (.closeEntry out))))
+
+(deftest macro-specs-are-not-checked-in-a-jar
+  (let [dir (.toFile (java.nio.file.Files/createTempDirectory
+                      "jar-specs" (make-array java.nio.file.attribute.FileAttribute 0)))
+        src (java.io.File. dir "src")
+        jar (java.io.File. dir "lib.jar")
+        bad (fn [ns] (str "(ns " ns " (require clojure.string))\n(def ok true)\n"))
+        on-disk (java.io.File. src "jarspec/on_disk.clj")]
+    (.mkdirs (.getParentFile on-disk))
+    (spit on-disk (bad "jarspec.on-disk"))
+    (write-jar jar {"jarspec/in_jar.clj" (bad "jarspec.in-jar")
+                    "jarspec/jar_requires_disk.clj"
+                    "(ns jarspec.jar-requires-disk (:require jarspec.on-disk))"})
+    (let [cl (doto (clojure.lang.DynamicClassLoader. (clojure.lang.RT/baseLoader))
+               (.addURL (.toURL (.toURI jar)))
+               (.addURL (.toURL (.toURI src))))]
+      (with-bindings {clojure.lang.Compiler/LOADER cl}
+        (testing "a file out of a jar loads, its macro calls being its author's"
+          (require 'jarspec.in-jar)
+          (is (true? @(resolve 'jarspec.in-jar/ok))))
+        (testing "a file on disk is checked"
+          (is (spec-refused? #(require 'jarspec.on-disk))))
+        (testing "and so is one a jar's file requires: each load answers for itself"
+          (is (spec-refused? #(require 'jarspec.jar-requires-disk))))
+        (testing "and a file loaded by its path"
+          (is (spec-refused? #(load-file (str on-disk)))))))))

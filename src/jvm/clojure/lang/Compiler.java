@@ -8525,7 +8525,8 @@ private static Var ensureMacroCheck() throws ClassNotFoundException, IOException
 }
 
 public static void checkSpecs(Var v, ISeq form) {
-	if(RT.CHECK_SPECS && !MACRO_CHECK_LOADING) {
+	// not for a file read out of a jar - see RT.LOADING_JAR_ENTRY
+	if(RT.CHECK_SPECS && !MACRO_CHECK_LOADING && RT.LOADING_JAR_ENTRY.get() != Boolean.TRUE) {
 		try {
 			ensureMacroCheck().applyTo(RT.cons(v, RT.list(form.next())));
 		} catch(Exception e) {
@@ -9219,12 +9220,16 @@ public static Object loadFile(String file) throws IOException{
 //		return null;
 
 	FileInputStream f = new FileInputStream(file);
+	// a file named by its path is not a jar's, whatever loaded it - see RT.LOADING_JAR_ENTRY
+	Boolean outer = RT.LOADING_JAR_ENTRY.get();
+	RT.LOADING_JAR_ENTRY.set(Boolean.FALSE);
 	try
 		{
 		return load(new InputStreamReader(f, RT.UTF8), new File(file).getAbsolutePath(), (new File(file)).getName());
 		}
 	finally
 		{
+		RT.LOADING_JAR_ENTRY.set(outer);
 		f.close();
 		}
 }

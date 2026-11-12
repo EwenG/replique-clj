@@ -325,6 +325,15 @@ public static boolean checkSpecAsserts = Boolean.getBoolean("clojure.spec.check-
 public static boolean instrumentMacros = ! Boolean.getBoolean("clojure.spec.skip-macros");
 static volatile boolean CHECK_SPECS = false;
 
+// Whether the file this thread is compiling was read out of a jar: TRUE while `load`
+// compiles a jar entry, and set again by every load nested in it, so each file answers
+// for itself. Read by Compiler.checkSpecs, which skips a jar's macro calls: a library is
+// code somebody already compiled, its macro calls are its author's and nobody here can
+// fix them, and checking them against clojure.core.specs is a fifth of what loading one
+// from source costs. Unset - null - on a thread loading nothing, which is a REPL's form,
+// an eval at run time, and a file loaded by its path: all of them checked.
+static final ThreadLocal<Boolean> LOADING_JAR_ENTRY = new ThreadLocal<Boolean>();
+
 static{
 	Keyword arglistskw = Keyword.intern(null, "arglists");
 	Symbol namesym = Symbol.intern("name");
@@ -473,10 +482,17 @@ static public void load(String scriptbase, boolean failIfNotFound) throws IOExce
 		}
 	}
 	if(!loaded && cljURL != null) {
-		if(booleanCast(Compiler.COMPILE_FILES.deref()))
-			compile(scriptfile);
-		else
-			loadResourceScript(RT.class, scriptfile);
+		Boolean outer = LOADING_JAR_ENTRY.get();
+		LOADING_JAR_ENTRY.set("jar".equals(cljURL.getProtocol()));
+		try {
+			if(booleanCast(Compiler.COMPILE_FILES.deref()))
+				compile(scriptfile);
+			else
+				loadResourceScript(RT.class, scriptfile);
+		}
+		finally {
+			LOADING_JAR_ENTRY.set(outer);
+		}
 	}
 	else if(!loaded && failIfNotFound)
 		throw new FileNotFoundException(String.format("Could not locate %s, %s or %s on classpath.%s", classfile, cljfile, cljcfile,
